@@ -1,21 +1,18 @@
+# --- SMOKE TEST (kept on purpose) ---
 import streamlit as st
-st.title("✅ Streamlit entrypoint works")
+st.set_page_config(page_title="SE Autoforecasting — By Fluid", layout="wide")
+st.write("✅ app.py loaded (entrypoint OK)")
 
-
-
-from tc_tool.core import (
+# --- real app imports (from root-level core.py) ---
+import pandas as pd
+from io import BytesIO
+from core import (
     load_header, load_production, fill_lateral_by_geo,
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
     plot_one_well, forecast_one_well, _train_rf,
     compute_eur_stats, probit_plot, eur_summary_table
 )
-import streamlit as st
-import pandas as pd
-from io import BytesIO
 
-
-
-st.set_page_config(page_title="SE Autoforecasting — By Fluid", layout="wide")
 st.title("SE Oil & Gas Autoforecasting — Broken Down by Fluid")
 
 # ---------------- Sidebar: global params ----------------
@@ -47,7 +44,6 @@ if st.button("Load / QC / Merge"):
         st.error("Please upload both Header and Production CSV files.")
     else:
         try:
-            # Load header with map + bring raw lat/lon if present
             header_df = load_header(header_file)
             raw_hdr = pd.read_csv(header_file)
             for col in [lat_col, lon_col]:
