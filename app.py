@@ -1,11 +1,8 @@
-# --- SMOKE TEST (kept on purpose) ---
+# app.py — SE Oil & Gas Autoforecasting (by fluid)
 import streamlit as st
-st.set_page_config(page_title="SE Autoforecasting — By Fluid", layout="wide")
-st.write("✅ app.py loaded (entrypoint OK)")
-
-# --- real app imports (from root-level core.py) ---
 import pandas as pd
 from io import BytesIO
+
 from core import (
     load_header, load_production, fill_lateral_by_geo,
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
@@ -13,9 +10,13 @@ from core import (
     compute_eur_stats, probit_plot, eur_summary_table
 )
 
+# ---- smoke line so we know entrypoint is running
+st.set_page_config(page_title="SE Tool", layout="wide")
+st.write("✅ app.py loaded (entrypoint OK)")
+
 st.title("SE Oil & Gas Autoforecasting — Broken Down by Fluid")
 
-# ---------------- Sidebar: global params ----------------
+# ================= Sidebar: global params =================
 with st.sidebar:
     st.header("Global Parameters")
     norm_len = st.number_input("Normalization Length (ft)", 1000, 30000, 10000, step=500)
@@ -33,29 +34,47 @@ with st.sidebar:
             del st.session_state[k]
         st.experimental_rerun()
 
-# ---------------- Upload + Merge once ----------------
+# ================= Upload & Prepare Data =================
 st.header("Upload & Prepare Data")
 c1, c2 = st.columns(2)
-with c1: header_file = st.file_uploader("Header CSV", type=["csv"], key="header_csv")
-with c2: prod_file   = st.file_uploader("Production CSV", type=["csv"], key="prod_csv")
+with c1:
+    header_file = st.file_uploader("Header CSV", type=["csv"], key="header_csv")
+with c2:
+    prod_file   = st.file_uploader("Production CSV", type=["csv"], key="prod_csv")
 
 if st.button("Load / QC / Merge"):
     if not header_file or not prod_file:
         st.error("Please upload both Header and Production CSV files.")
     else:
         try:
-            header_df = load_header(header_file)
-            raw_hdr = pd.read_csv(header_file)
+            # ---- read the header file ONCE and reuse bytes for two passes
+            header_bytes = header_file.getvalue()
+            header_df = load_header(BytesIO(header_bytes))   # mapped columns
+            raw_hdr   = pd.read_csv(BytesIO(header_bytes))   # raw columns (for lat/lon)
+
+            # bring raw lat/lon into the mapped header if present
             for col in [lat_col, lon_col]:
                 if col in raw_hdr.columns and col not in header_df.columns:
                     header_df[col] = raw_hdr[col]
-            header_qc = fill_lateral_by_geo(header_df, lat_col=lat_col, lon_col=lon_col,
-                                            lateral_col='LateralLength', decimals=int(bin_decimals))
+
+            # QC/impute lateral by geo (if lat/lon provided)
+            header_qc = fill_lateral_by_geo(
+                header_df, lat_col=lat_col, lon_col=lon_col,
+                lateral_col='LateralLength', decimals=int(bin_decimals)
+            )
+
+            # production (only read once)
             prod_df = load_production(prod_file)
+
+            # stash for later steps
             st.session_state.header_qc = header_qc
             st.session_state.prod_df = prod_df
 
-            pp_cfg = PreprocessConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
+            # merge + normalization
+            pp_cfg = PreprocessConfig(
+                normalization_length=int(norm_len),
+                use_normalization=bool(use_norm)
+            )
             merged = preprocess(header_qc, prod_df, pp_cfg)
             if merged.empty:
                 st.warning("No rows after preprocessing. Check your inputs.")
@@ -75,14 +94,17 @@ if "merged" in st.session_state:
 
 st.markdown("---")
 
-# ---------------- Helper: common per-fluid UI block ----------------
+# ================= Helper: per-fluid UI block =================
 def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
     st.header(f"{fluid_name} — Run & Analyze")
 
     disabled = "merged" not in st.session_state
     if st.button(f"Run {fluid_name} Forecast", disabled=disabled):
         merged = st.session_state.merged
-        cfg = ForecastConfig(commodity=fluid_name.lower(), b_low=float(b_low), b_high=float(b_high), max_months=600)
+        cfg = ForecastConfig(
+            commodity=fluid_name.lower(),
+            b_low=float(b_low), b_high=float(b_high), max_months=600
+        )
         oneline, monthly = forecast_all(merged, cfg)
         st.session_state[f"{fluid_name}_oneline"] = oneline
         st.session_state[f"{fluid_name}_monthly"] = monthly
@@ -103,9 +125,12 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         with tab1:
             oneline = st.session_state[on_key]
             st.dataframe(oneline, use_container_width=True)
-            st.download_button(f"Download Oneline — {fluid_name} (CSV)",
+            st.download_button(
+                f"Download Oneline — {fluid_name} (CSV)",
                 oneline.to_csv(index=False).encode("utf-8"),
-                file_name=f"oneline_{fluid_name.lower()}.csv", mime="text/csv")
+                file_name=f"oneline_{fluid_name.lower()}.csv",
+                mime="text/csv"
+            )
 
         # Monthly
         with tab2:
@@ -115,10 +140,12 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as w:
                 st.session_state[on_key].to_excel(w, sheet_name="Oneline", index=False)
                 monthly.to_excel(w, sheet_name="Monthly", index=False)
-            st.download_button(f"Download Excel — {fluid_name}",
+            st.download_button(
+                f"Download Excel — {fluid_name}",
                 data=buf.getvalue(),
                 file_name=f"forecast_{fluid_name.lower()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
         # B-Factor Table
         with tab3:
@@ -127,9 +154,12 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             cols = [c for c in cols if c in oneline.columns]
             btable = oneline[cols].copy().sort_values('b', ascending=False)
             st.dataframe(btable, use_container_width=True)
-            st.download_button(f"Download B-Factor Table — {fluid_name} (CSV)",
+            st.download_button(
+                f"Download B-Factor Table — {fluid_name} (CSV)",
                 btable.to_csv(index=False).encode("utf-8"),
-                file_name=f"bfactors_{fluid_name.lower()}.csv", mime="text/csv")
+                file_name=f"bfactors_{fluid_name.lower()}.csv",
+                mime="text/csv"
+            )
 
         # Probit
         with tab4:
@@ -140,7 +170,10 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
                 unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
                 stats = compute_eur_stats(eurs)
-                st.dataframe(eur_summary_table(fluid_name, stats, unit, int(norm_len)), use_container_width=True)
+                st.dataframe(
+                    eur_summary_table(fluid_name, stats, unit, int(norm_len)),
+                    use_container_width=True
+                )
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit")
                 st.pyplot(fig)
 
@@ -148,14 +181,17 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         st.subheader(f"{fluid_name} — Per-well Plot")
         merged = st.session_state.merged
         api_list = list(merged['API10'].astype(str).unique())
-        pick = st.selectbox(f"Pick API10 ({fluid_name})", api_list, key=f"{fluid_name}_plot_pick")
-        wd = merged[merged['API10'].astype(str) == str(pick)]
-        models = _train_rf(merged, norm_col_for_models)
-        fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
-        fig = plot_one_well(wd, fc, fluid_name.lower())
-        st.pyplot(fig, clear_figure=True)
+        if len(api_list) == 0:
+            st.info("No wells available.")
+        else:
+            pick = st.selectbox(f"Pick API10 ({fluid_name})", api_list, key=f"{fluid_name}_plot_pick")
+            wd = merged[merged['API10'].astype(str) == str(pick)]
+            models = _train_rf(merged, norm_col_for_models)
+            fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
+            fig = plot_one_well(wd, fc, fluid_name.lower())
+            st.pyplot(fig, clear_figure=True)
 
-# ---------------- Per-fluid sections ----------------
+# ================= Per-fluid sections =================
 fluid_block("Oil",   "EUR (Mbbl)",        "NormOil")
 st.markdown("---")
 fluid_block("Gas",   "EUR (MMcf)",        "NormGas")
@@ -163,11 +199,12 @@ st.markdown("---")
 fluid_block("Water", "EUR (Mbbl water)",  "NormWater")
 st.markdown("---")
 
-# ---------------- Final: Type Wells summary (all fluids) ----------------
+# ================= Final: Type Wells summary =================
 st.header("Type Wells — Summary (End)")
 
 def _eurs_from_oneline(df: pd.DataFrame, col: str) -> list[float]:
-    if df is None or df.empty or col not in df.columns: return []
+    if df is None or df.empty or col not in df.columns:
+        return []
     return pd.to_numeric(df[col], errors="coerce").astype(float).tolist()
 
 tw_tabs = st.tabs(["Oil", "Gas", "Water"])
