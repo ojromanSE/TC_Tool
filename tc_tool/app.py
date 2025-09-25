@@ -1,13 +1,13 @@
-import streamlit as st
-import pandas as pd
-from io import BytesIO
-
-from core import (
+from tc_tool.core import (
     load_header, load_production, fill_lateral_by_geo,
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
     plot_one_well, forecast_one_well, _train_rf,
     compute_eur_stats, probit_plot, eur_summary_table
 )
+import streamlit as st
+import pandas as pd
+from io import BytesIO
+
 
 
 st.set_page_config(page_title="SE Autoforecasting — By Fluid", layout="wide")
