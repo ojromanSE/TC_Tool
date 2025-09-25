@@ -63,7 +63,7 @@ if st.button("Load / QC / Merge"):
                 lateral_col='LateralLength', decimals=int(bin_decimals)
             )
 
-            # production (only read once)
+            # production (read once)
             prod_df = load_production(prod_file)
 
             # stash for later steps
@@ -177,15 +177,29 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit")
                 st.pyplot(fig)
 
-        # Per-well plot
+        # Per-well plot  ▶ pick by WellName (not API)
         st.subheader(f"{fluid_name} — Per-well Plot")
         merged = st.session_state.merged
-        api_list = list(merged['API10'].astype(str).unique())
-        if len(api_list) == 0:
+        opts = (
+            merged[['API10', 'WellName']]
+            .dropna()
+            .astype({'API10': str, 'WellName': str})
+            .drop_duplicates()
+        )
+        if opts.empty:
             st.info("No wells available.")
         else:
-            pick = st.selectbox(f"Pick API10 ({fluid_name})", api_list, key=f"{fluid_name}_plot_pick")
-            wd = merged[merged['API10'].astype(str) == str(pick)]
+            opts['label'] = opts.apply(lambda r: f"{r['WellName']} (API {r['API10']})", axis=1)
+            label_to_api = dict(zip(opts['label'], opts['API10']))
+
+            pick_label = st.selectbox(
+                f"Pick Well ({fluid_name})",
+                options=opts['label'].tolist(),
+                key=f"{fluid_name}_plot_pick"
+            )
+            pick_api = label_to_api[pick_label]
+
+            wd = merged[merged['API10'].astype(str) == str(pick_api)]
             models = _train_rf(merged, norm_col_for_models)
             fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
             fig = plot_one_well(wd, fc, fluid_name.lower())
