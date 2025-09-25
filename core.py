@@ -2,70 +2,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, List
 from scipy.optimize import minimize
 from scipy.special import huber
 from sklearn.ensemble import RandomForestRegressor
 import matplotlib.pyplot as plt
-from matplotlib.ticker import LogFormatter, LogLocator, FuncFormatter
+from matplotlib.ticker import LogLocator, FuncFormatter
 from scipy import stats
-
-# --- plotting helper for a single well ---
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-
-def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
-    """
-    Plot historical monthly volumes, fitted curve over history, and forward forecast.
-    - wd: merged dataframe for ONE well (has MonthYear and Norm* columns)
-    - fc: dict returned by forecast_one_well(...)
-    - commodity: 'oil' | 'gas' | 'water'
-    """
-    com = commodity.lower()
-    col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[com]
-
-    # Prepare historical series
-    wd = wd.sort_values('MonthYear').copy()
-    hist_dates = wd['MonthYear'].dt.to_timestamp(how='start')
-    hist_vals  = wd[col].astype(float).values
-
-    # Fitted (over historical months)
-    t_hist = fc['t_hist']
-    fit_hist = fc['fit_hist']
-    fit_dates = hist_dates  # 1:1 with history
-
-    # Forecast series
-    if len(hist_dates) > 0:
-        start = hist_dates.iloc[-1] + pd.offsets.MonthBegin(1)
-    else:
-        start = pd.Timestamp.today().normalize().replace(day=1)
-    f_dates = pd.date_range(start=start, periods=len(fc['f_vals']), freq='MS')
-    f_vals  = fc['f_vals']
-
-    # Labels / units
-    unit = {"oil":"(normalized bbl/month)",
-            "gas":"(normalized Mcf/month)",
-            "water":"(normalized bbl/month)"}[com]
-    well = wd.iloc[0].get('WellName','N/A')
-    api  = str(wd.iloc[0].get('API10',''))
-
-    # Plot
-    fig, ax = plt.subplots(figsize=(10,6))
-    if len(hist_dates) > 0:
-        ax.scatter(hist_dates, hist_vals, label="Historical", s=22)
-        ax.plot(fit_dates, fit_hist, label="Fit (history)", linewidth=2)
-    if len(f_dates) > 0:
-        ax.plot(f_dates, f_vals, label="Forecast", linestyle="--", linewidth=2)
-
-    ax.set_title(f"{well}  |  API10 {api}  |  {commodity.capitalize()} forecast")
-    ax.set_xlabel("Month")
-    ax.set_ylabel(f"Monthly {commodity} {unit}")
-    ax.grid(True, linestyle="--", alpha=0.4)
-    ax.legend()
-    fig.tight_layout()
-    return fig
-
 
 # ---------------- Provider column maps (WDB & DI/IHS) ----------------
 REQUIRED_HEADER_COLUMNS = [
@@ -237,7 +180,7 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
                 fit_hist=fit_hist, f_months=np.array(f_m,int), f_vals=np.array(f_v,float),
                 EUR_total=eur_hist+eur_fcst, EUR_fcst=eur_fcst)
 
-# ---------------- All-wells forecast (returns oneline + monthly) ----------------
+# ---------------- All-wells forecast ----------------
 @dataclass
 class ForecastConfig:
     commodity: str      # 'oil'|'gas'|'water'
@@ -367,3 +310,55 @@ def eur_summary_table(fluid_name: str, stats_dict: Dict[str, float], unit: str, 
         ["Type Curve EUR",       stats_dict['TypeCurve'], per_ft(stats_dict['TypeCurve'])],
     ]
     return pd.DataFrame(rows, columns=[f"{fluid_name} EURs", unit, f"{unit}/ft"])
+
+# ---------------- Single-well plot with fixed colors ----------------
+def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
+    """
+    Plot historical monthly volumes, fitted curve over history, and forward forecast.
+    Colors: oil=green, gas=red, water=blue. Points and lines both colored.
+    """
+    com = commodity.lower()
+    col_map = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}
+    color_map = {'oil':'green','gas':'red','water':'blue'}
+    col = col_map[com]
+    color = color_map[com]
+
+    # Prepare historical series
+    wd = wd.sort_values('MonthYear').copy()
+    hist_dates = wd['MonthYear'].dt.to_timestamp(how='start')
+    hist_vals  = wd[col].astype(float).values
+
+    # Fitted (over historical months)
+    fit_hist = fc['fit_hist']
+    fit_dates = hist_dates  # 1:1 with history
+
+    # Forecast series
+    if len(hist_dates) > 0:
+        start = hist_dates.iloc[-1] + pd.offsets.MonthBegin(1)
+    else:
+        start = pd.Timestamp.today().normalize().replace(day=1)
+    f_dates = pd.date_range(start=start, periods=len(fc['f_vals']), freq='MS')
+    f_vals  = fc['f_vals']
+
+    # Labels / units
+    unit = {"oil":"(normalized bbl/month)",
+            "gas":"(normalized Mcf/month)",
+            "water":"(normalized bbl/month)"}[com]
+    well = wd.iloc[0].get('WellName','N/A')
+    api  = str(wd.iloc[0].get('API10',''))
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(10,6))
+    if len(hist_dates) > 0:
+        ax.scatter(hist_dates, hist_vals, label="Historical", s=22, color=color)
+        ax.plot(fit_dates, fit_hist, label="Fit (history)", linewidth=2, color=color)
+    if len(f_dates) > 0:
+        ax.plot(f_dates, f_vals, label="Forecast", linestyle="--", linewidth=2, color=color)
+
+    ax.set_title(f"{well}  |  API10 {api}  |  {commodity.capitalize()} forecast")
+    ax.set_xlabel("Month")
+    ax.set_ylabel(f"Monthly {commodity} {unit}")
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend()
+    fig.tight_layout()
+    return fig
