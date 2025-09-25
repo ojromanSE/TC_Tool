@@ -365,3 +365,48 @@ with tw_tabs[2]:
         st.pyplot(plot_type_curves(curves, lines, "water"))
 
 st.caption("Per-fluid workflow: forecast → B-factors & probits → Type Wells (P10/P50/P90 with faint historical lines).")
+
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+import tempfile
+
+if st.button("Generate PDF Report"):
+    # create a temp file
+    tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    doc = SimpleDocTemplate(tmp_pdf.name, pagesize=letter)
+    story = []
+    styles = getSampleStyleSheet()
+
+    story.append(Paragraph("<b>SE Oil & Gas Autoforecasting Report</b>", styles["Title"]))
+    story.append(Spacer(1, 12))
+
+    # include oneline tables
+    for fluid in ["Oil","Gas","Water"]:
+        on_key = f"{fluid}_oneline"
+        if on_key in st.session_state:
+            story.append(Paragraph(f"<b>{fluid} Oneline Table</b>", styles["Heading2"]))
+            df = st.session_state[on_key].head(30)  # first 30 rows to fit
+            data = [df.columns.tolist()] + df.values.tolist()
+            t = Table(data)
+            t.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.25,colors.grey)]))
+            story.append(t)
+            story.append(Spacer(1, 12))
+
+    # include Type Well curves (export matplotlib to PNG then embed)
+    for fluid in ["oil","gas","water"]:
+        mo_key = f"{fluid.capitalize()}_monthly"
+        if mo_key in st.session_state:
+            curves, lines = build_type_curves_and_lines(st.session_state[mo_key], fluid)
+            fig = plot_type_curves(curves, lines, fluid)
+            img_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+            fig.savefig(img_tmp.name, dpi=150, bbox_inches="tight")
+            story.append(Paragraph(f"<b>{fluid.capitalize()} Type Well Curve</b>", styles["Heading2"]))
+            story.append(Image(img_tmp.name, width=400, height=250))
+            story.append(Spacer(1, 12))
+
+    doc.build(story)
+    with open(tmp_pdf.name, "rb") as f:
+        st.download_button("Download PDF Report", data=f, file_name="SE_report.pdf", mime="application/pdf")
+
