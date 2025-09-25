@@ -300,7 +300,9 @@ def plot_type_curves(curves: pd.DataFrame, lines, fluid: str):
     ax.set_xlabel("Months since first production")
     ax.set_ylabel(f"Monthly {fluid.lower()} (normalized units)")
     ax.set_yscale('log')
+    ax.set_ylim(bottom=1)  # start at 10^0
     ax.grid(True, linestyle='--', alpha=0.4, which='both')
+
     ax.legend()
     fig.tight_layout()
     return fig
