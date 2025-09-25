@@ -177,33 +177,45 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit")
                 st.pyplot(fig)
 
-        # Per-well plot  ▶ pick by WellName (not API)
+        # -------- Per-well plot  ▶ pick by WellName (robust to missing WellName) --------
         st.subheader(f"{fluid_name} — Per-well Plot")
         merged = st.session_state.merged
-        opts = (
-            merged[['API10', 'WellName']]
-            .dropna()
-            .astype({'API10': str, 'WellName': str})
-            .drop_duplicates()
-        )
-        if opts.empty:
-            st.info("No wells available.")
+
+        if 'API10' not in merged.columns:
+            st.error("Merged data is missing API10 after preprocessing.")
         else:
-            opts['label'] = opts.apply(lambda r: f"{r['WellName']} (API {r['API10']})", axis=1)
-            label_to_api = dict(zip(opts['label'], opts['API10']))
+            # Build options safely even if WellName is missing
+            base = merged[['API10']].astype({'API10': str}).copy()
+            if 'WellName' in merged.columns:
+                base['WellName'] = merged['WellName'].astype(str)
+            else:
+                base['WellName'] = base['API10']  # fallback label
 
-            pick_label = st.selectbox(
-                f"Pick Well ({fluid_name})",
-                options=opts['label'].tolist(),
-                key=f"{fluid_name}_plot_pick"
-            )
-            pick_api = label_to_api[pick_label]
+            opts = base.dropna().drop_duplicates()
+            if opts.empty:
+                st.info("No wells available.")
+            else:
+                # Prefer WellName; if it's same as API, show 'API ####'
+                def make_label(r):
+                    wn = (r['WellName'] or "").strip()
+                    ap = r['API10']
+                    return wn if wn and wn != ap else f"API {ap}"
 
-            wd = merged[merged['API10'].astype(str) == str(pick_api)]
-            models = _train_rf(merged, norm_col_for_models)
-            fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
-            fig = plot_one_well(wd, fc, fluid_name.lower())
-            st.pyplot(fig, clear_figure=True)
+                opts['label'] = opts.apply(make_label, axis=1)
+                label_to_api = dict(zip(opts['label'], opts['API10']))
+
+                pick_label = st.selectbox(
+                    f"Pick Well ({fluid_name})",
+                    options=sorted(opts['label'].tolist()),
+                    key=f"{fluid_name}_plot_pick"
+                )
+                pick_api = label_to_api[pick_label]
+
+                wd = merged[merged['API10'].astype(str) == str(pick_api)]
+                models = _train_rf(merged, norm_col_for_models)
+                fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
+                fig = plot_one_well(wd, fc, fluid_name.lower())
+                st.pyplot(fig, clear_figure=True)
 
 # ================= Per-fluid sections =================
 fluid_block("Oil",   "EUR (Mbbl)",        "NormOil")
