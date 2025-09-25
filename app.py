@@ -2,6 +2,7 @@
 import streamlit as st
 import pandas as pd
 from io import BytesIO
+import numpy as np
 import matplotlib.pyplot as plt
 
 from core import (
@@ -235,39 +236,71 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fig = plot_one_well(wd, fc, fluid_name.lower())
                 st.pyplot(fig, clear_figure=True)
 
-# ================= Helper: Build Type Well Curves (P10/P50/P90) =================
-def build_type_curves(monthly_df: pd.DataFrame, com: str) -> pd.DataFrame:
+# ================= Helper: Type Curves (P10/P50/P90) + raw lines =================
+def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
     """
-    Align wells by months-since-first-production and compute P10/P50/P90 per month.
-    Uses the normalized monthly volume column for the selected commodity.
+    Returns:
+      curves: DataFrame with columns ['t','P10','P50','P90']
+      lines:  list of (t_array, y_array) for each well's HISTORICAL production
     """
     vol_col = f"Monthly_{com}_volume"
     if monthly_df.empty or vol_col not in monthly_df.columns:
-        return pd.DataFrame(columns=['t','P10','P50','P90'])
+        return pd.DataFrame(columns=['t','P10','P50','P90']), []
 
-    df = monthly_df[['API10','Date',vol_col]].dropna().copy()
+    # Only historical for raw lines
+    hist = monthly_df[monthly_df['Segment'] == 'Historical'][['API10','Date',vol_col]].dropna().copy()
+    hist = hist.sort_values(['API10','Date'])
+
     # month index per well
-    df = df.sort_values(['API10','Date'])
-    df['t'] = df.groupby('API10').cumcount() + 1
-    # quantiles per month index
-    q = df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
-    q.columns = ['P10','P50','P90']   # note: 0.90→P10, 0.50→P50, 0.10→P90
-    q = q.reset_index()
-    return q
+    hist['t'] = hist.groupby('API10').cumcount() + 1
 
-def plot_type_curves(curves: pd.DataFrame, fluid: str):
+    # collect raw lines (aligned)
+    lines = []
+    for _, g in hist.groupby('API10'):
+        t = g['t'].to_numpy()
+        y = g[vol_col].to_numpy()
+        # clamp to epsilon for log scale display
+        y = np.clip(y, 1e-6, None)
+        lines.append((t, y))
+
+    # compute quantiles per t (can use both hist & forecast; here we follow hist only or all?)
+    # We'll use ALL segments (historical + forecast) for type curves
+    all_df = monthly_df[['API10','Date',vol_col]].dropna().sort_values(['API10','Date']).copy()
+    all_df['t'] = all_df.groupby('API10').cumcount() + 1
+
+    q = all_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
+    q.columns = ['P10','P50','P90']   # 0.90→P10, 0.50→P50, 0.10→P90
+    q = q.reset_index()
+    return q, lines
+
+def plot_type_curves(curves: pd.DataFrame, lines, fluid: str):
     color_map = {'oil':'green','gas':'red','water':'blue'}
     color = color_map[fluid.lower()]
     fig, ax = plt.subplots(figsize=(9,5))
+
+    if lines:
+        # faint gray historical lines
+        for t, y in lines:
+            ax.plot(t, y, color='gray', alpha=0.15, linewidth=0.8)
+
     if curves.empty:
         ax.text(0.5, 0.5, "No data for type curve", ha='center', va='center'); ax.axis('off')
         return fig
-    ax.plot(curves['t'], curves['P50'], color=color, linewidth=2, label='P50')
-    ax.plot(curves['t'], curves['P10'], color=color, linewidth=1.5, linestyle='--', label='P10')
-    ax.plot(curves['t'], curves['P90'], color=color, linewidth=1.5, linestyle='--', label='P90')
+
+    # clamp for log safety
+    eps = 1e-6
+    P50 = np.clip(curves['P50'].to_numpy(dtype=float), eps, None)
+    P10 = np.clip(curves['P10'].to_numpy(dtype=float), eps, None)
+    P90 = np.clip(curves['P90'].to_numpy(dtype=float), eps, None)
+
+    ax.plot(curves['t'], P50, color=color, linewidth=2, label='P50')
+    ax.plot(curves['t'], P10, color=color, linewidth=1.5, linestyle='--', label='P10')
+    ax.plot(curves['t'], P90, color=color, linewidth=1.5, linestyle='--', label='P90')
+
     ax.set_xlabel("Months since first production")
     ax.set_ylabel(f"Monthly {fluid.lower()} (normalized units)")
-    ax.grid(True, linestyle='--', alpha=0.4)
+    ax.set_yscale('log')
+    ax.grid(True, linestyle='--', alpha=0.4, which='both')
     ax.legend()
     fig.tight_layout()
     return fig
@@ -298,12 +331,10 @@ with tw_tabs[0]:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (Mbbl)")
         stats_o = compute_eur_stats(eurs)
         st.dataframe(eur_summary_table("Oil", stats_o, "Mbbl", int(norm_len)), use_container_width=True)
-        if mo_key in st.session_state:
-            curves = build_type_curves(st.session_state[mo_key], "oil")
-        else:
-            curves = pd.DataFrame()
+        curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "oil")
+                         if mo_key in st.session_state else (pd.DataFrame(), []))
         st.subheader("Oil Type Curve (P10 / P50 / P90)")
-        st.pyplot(plot_type_curves(curves, "oil"))
+        st.pyplot(plot_type_curves(curves, lines, "oil"))
 
 with tw_tabs[1]:
     on_key, mo_key = "Gas_oneline", "Gas_monthly"
@@ -313,12 +344,10 @@ with tw_tabs[1]:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (MMcf)")
         stats_g = compute_eur_stats(eurs)
         st.dataframe(eur_summary_table("Gas", stats_g, "MMcf", int(norm_len)), use_container_width=True)
-        if mo_key in st.session_state:
-            curves = build_type_curves(st.session_state[mo_key], "gas")
-        else:
-            curves = pd.DataFrame()
+        curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "gas")
+                         if mo_key in st.session_state else (pd.DataFrame(), []))
         st.subheader("Gas Type Curve (P10 / P50 / P90)")
-        st.pyplot(plot_type_curves(curves, "gas"))
+        st.pyplot(plot_type_curves(curves, lines, "gas"))
 
 with tw_tabs[2]:
     on_key, mo_key = "Water_oneline", "Water_monthly"
@@ -328,11 +357,9 @@ with tw_tabs[2]:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (Mbbl water)")
         stats_w = compute_eur_stats(eurs)
         st.dataframe(eur_summary_table("Water", stats_w, "Mbbl", int(norm_len)), use_container_width=True)
-        if mo_key in st.session_state:
-            curves = build_type_curves(st.session_state[mo_key], "water")
-        else:
-            curves = pd.DataFrame()
+        curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "water")
+                         if mo_key in st.session_state else (pd.DataFrame(), []))
         st.subheader("Water Type Curve (P10 / P50 / P90)")
-        st.pyplot(plot_type_curves(curves, "water"))
+        st.pyplot(plot_type_curves(curves, lines, "water"))
 
-st.caption("Per-fluid workflow: forecast → B-factors & probits → Type Wells (P10/P50/P90).")
+st.caption("Per-fluid workflow: forecast → B-factors & probits → Type Wells (P10/P50/P90 with faint historical lines).")
