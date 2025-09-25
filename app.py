@@ -14,7 +14,7 @@ from core import (
 
 # ---- smoke line so we know entrypoint is running
 st.set_page_config(page_title="SE Tool", layout="wide")
-st.write("✅ app.py loaded (entrypoint OK)")
+st.write("✅ All Systems Working")
 
 st.title("SE Oil & Gas Autoforecasting")
 
