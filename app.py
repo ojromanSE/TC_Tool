@@ -147,7 +147,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-        # B-Factor Table
+        # B-Factor Table + analytics
         with tab3:
             oneline = st.session_state[on_key]
             cols = ['API10','WellName','qi (per day)','b','di (per month)','First-Year Decline (%)']
@@ -161,7 +161,24 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 mime="text/csv"
             )
 
-        # Probit
+            # ---- analytics plots
+            color_map = {'oil':'green','gas':'red','water':'blue'}
+            color = color_map[fluid_name.lower()]
+            if {'b','qi (per day)'}.issubset(oneline.columns):
+                st.subheader("B-Factor Analytics")
+                # 1) histogram of b
+                fig1, ax1 = plt.subplots(figsize=(7,4))
+                ax1.hist(oneline['b'].dropna().values, bins=25, color=color, alpha=0.85)
+                ax1.set_xlabel("b"); ax1.set_ylabel("Count"); ax1.grid(True, linestyle="--", alpha=0.4)
+                st.pyplot(fig1)
+                # 2) scatter of b vs qi (per day)
+                fig2, ax2 = plt.subplots(figsize=(7,4))
+                ax2.scatter(oneline['b'], oneline['qi (per day)'], s=22, color=color, alpha=0.85)
+                ax2.set_xlabel("b"); ax2.set_ylabel("qi (per day)")
+                ax2.grid(True, linestyle="--", alpha=0.4)
+                st.pyplot(fig2)
+
+        # Probit (colored like forecast)
         with tab4:
             oneline = st.session_state[on_key]
             if eur_col not in oneline.columns:
@@ -174,7 +191,9 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                     eur_summary_table(fluid_name, stats, unit, int(norm_len)),
                     use_container_width=True
                 )
-                fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit")
+                color_map = {'oil':'green','gas':'red','water':'blue'}
+                color = color_map[fluid_name.lower()]
+                fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit", color=color)
                 st.pyplot(fig)
 
         # -------- Per-well plot  ▶ pick by WellName (robust to missing WellName) --------
@@ -184,18 +203,16 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         if 'API10' not in merged.columns:
             st.error("Merged data is missing API10 after preprocessing.")
         else:
-            # Build options safely even if WellName is missing
             base = merged[['API10']].astype({'API10': str}).copy()
             if 'WellName' in merged.columns:
                 base['WellName'] = merged['WellName'].astype(str)
             else:
-                base['WellName'] = base['API10']  # fallback label
+                base['WellName'] = base['API10']
 
             opts = base.dropna().drop_duplicates()
             if opts.empty:
                 st.info("No wells available.")
             else:
-                # Prefer WellName; if it's same as API, show 'API ####'
                 def make_label(r):
                     wn = (r['WellName'] or "").strip()
                     ap = r['API10']
@@ -216,6 +233,9 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
                 fig = plot_one_well(wd, fc, fluid_name.lower())
                 st.pyplot(fig, clear_figure=True)
+
+# imports for the B-Factor analytics plots
+import matplotlib.pyplot as plt
 
 # ================= Per-fluid sections =================
 fluid_block("Oil",   "EUR (Mbbl)",        "NormOil")
