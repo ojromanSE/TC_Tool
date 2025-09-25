@@ -1,11 +1,14 @@
-# app.py — SE Oil & Gas Autoforecasting (by fluid)
-import streamlit as st
-import pandas as pd
-from io import BytesIO
-import numpy as np
-import matplotlib.pyplot as plt
+# app.py — SE Oil & Gas Autoforecasting (by fluid) with logo at top
 import os
+import tempfile
+from io import BytesIO
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
 from PIL import Image
+
 from core import (
     load_header, load_production, fill_lateral_by_geo,
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
@@ -13,25 +16,19 @@ from core import (
     compute_eur_stats, probit_plot, eur_summary_table
 )
 
-
-# Show "All systems working" plus logo side-by-side
-c1, c2 = st.columns([0.1, 0.9])
-
-with c1:
-    # load the logo from the repo
-    logo_path = os.path.join("static", "logo.png")
-    if os.path.exists(logo_path):
-        st.image(logo_path, use_column_width='auto')
-
-with c2:
-    st.success("All Systems Working")
-
-st.title("SE Oil & Gas Autoforecasting")
-
-# ---- smoke line so we know entrypoint is running
+# ---------- PAGE CONFIG (must be first Streamlit call) ----------
 st.set_page_config(page_title="SE Tool", layout="wide")
-st.write("✅ All Systems Working")
 
+# ---------- Top header with logo ----------
+LOGO_PATH = os.path.join("static", "logo.png")  # make sure your logo is here
+
+cols = st.columns([0.12, 0.88])
+with cols[0]:
+    if os.path.exists(LOGO_PATH):
+        st.image(LOGO_PATH, use_column_width=True)
+with cols[1]:
+    st.success("All Systems Working")
+    st.title("SE Oil & Gas Autoforecasting")
 
 # ================= Sidebar: global params =================
 with st.sidebar:
@@ -64,30 +61,19 @@ if st.button("Load / QC / Merge"):
         st.error("Please upload both Header and Production CSV files.")
     else:
         try:
-            # ---- read the header file ONCE and reuse bytes for two passes
             header_bytes = header_file.getvalue()
             header_df = load_header(BytesIO(header_bytes))   # mapped columns
             raw_hdr   = pd.read_csv(BytesIO(header_bytes))   # raw columns (for lat/lon)
-
-            # bring raw lat/lon into the mapped header if present
             for col in [lat_col, lon_col]:
                 if col in raw_hdr.columns and col not in header_df.columns:
                     header_df[col] = raw_hdr[col]
-
-            # QC/impute lateral by geo (if lat/lon provided)
             header_qc = fill_lateral_by_geo(
                 header_df, lat_col=lat_col, lon_col=lon_col,
                 lateral_col='LateralLength', decimals=int(bin_decimals)
             )
-
-            # production (read once)
             prod_df = load_production(prod_file)
-
-            # stash for later steps
             st.session_state.header_qc = header_qc
             st.session_state.prod_df = prod_df
-
-            # merge + normalization
             pp_cfg = PreprocessConfig(
                 normalization_length=int(norm_len),
                 use_normalization=bool(use_norm)
@@ -142,60 +128,34 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         with tab1:
             oneline = st.session_state[on_key]
             st.dataframe(oneline, use_container_width=True)
-            st.download_button(
-                f"Download Oneline — {fluid_name} (CSV)",
-                oneline.to_csv(index=False).encode("utf-8"),
-                file_name=f"oneline_{fluid_name.lower()}.csv",
-                mime="text/csv"
-            )
 
         # Monthly
         with tab2:
             monthly = st.session_state[mo_key]
             st.dataframe(monthly, use_container_width=True)
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="yyyy-mm-dd") as w:
-                st.session_state[on_key].to_excel(w, sheet_name="Oneline", index=False)
-                monthly.to_excel(w, sheet_name="Monthly", index=False)
-            st.download_button(
-                f"Download Excel — {fluid_name}",
-                data=buf.getvalue(),
-                file_name=f"forecast_{fluid_name.lower()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
 
-        # B-Factor Table + analytics
+        # B-Factor Table
         with tab3:
             oneline = st.session_state[on_key]
             cols = ['API10','WellName','qi (per day)','b','di (per month)','First-Year Decline (%)']
             cols = [c for c in cols if c in oneline.columns]
             btable = oneline[cols].copy().sort_values('b', ascending=False)
             st.dataframe(btable, use_container_width=True)
-            st.download_button(
-                f"Download B-Factor Table — {fluid_name} (CSV)",
-                btable.to_csv(index=False).encode("utf-8"),
-                file_name=f"bfactors_{fluid_name.lower()}.csv",
-                mime="text/csv"
-            )
-
-            # ---- analytics plots (b histogram & b vs qi)
             color_map = {'oil':'green','gas':'red','water':'blue'}
             color = color_map[fluid_name.lower()]
             if {'b','qi (per day)'}.issubset(oneline.columns):
                 st.subheader("B-Factor Analytics")
-                # 1) histogram of b
                 fig1, ax1 = plt.subplots(figsize=(7,4))
                 ax1.hist(oneline['b'].dropna().values, bins=25, color=color, alpha=0.85)
                 ax1.set_xlabel("b"); ax1.set_ylabel("Count"); ax1.grid(True, linestyle="--", alpha=0.4)
                 st.pyplot(fig1)
-                # 2) scatter of b vs qi (per day)
                 fig2, ax2 = plt.subplots(figsize=(7,4))
                 ax2.scatter(oneline['b'], oneline['qi (per day)'], s=22, color=color, alpha=0.85)
                 ax2.set_xlabel("b"); ax2.set_ylabel("qi (per day)")
                 ax2.grid(True, linestyle="--", alpha=0.4)
                 st.pyplot(fig2)
 
-        # Probit (colored like forecast)
+        # Probit
         with tab4:
             oneline = st.session_state[on_key]
             if eur_col not in oneline.columns:
@@ -213,78 +173,50 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit", color=color)
                 st.pyplot(fig)
 
-        # -------- Per-well plot  ▶ pick by WellName (robust to missing WellName) --------
+        # Per-well plot
         st.subheader(f"{fluid_name} — Per-well Plot")
         merged = st.session_state.merged
-
-        if 'API10' not in merged.columns:
-            st.error("Merged data is missing API10 after preprocessing.")
+        base = merged[['API10']].astype({'API10': str}).copy()
+        if 'WellName' in merged.columns:
+            base['WellName'] = merged['WellName'].astype(str)
         else:
-            base = merged[['API10']].astype({'API10': str}).copy()
-            if 'WellName' in merged.columns:
-                base['WellName'] = merged['WellName'].astype(str)
-            else:
-                base['WellName'] = base['API10']
+            base['WellName'] = base['API10']
+        opts = base.dropna().drop_duplicates()
+        def make_label(r):
+            wn = (r['WellName'] or "").strip()
+            ap = r['API10']
+            return wn if wn and wn != ap else f"API {ap}"
+        opts['label'] = opts.apply(make_label, axis=1)
+        label_to_api = dict(zip(opts['label'], opts['API10']))
+        pick_label = st.selectbox(
+            f"Pick Well ({fluid_name})",
+            options=sorted(opts['label'].tolist()),
+            key=f"{fluid_name}_plot_pick"
+        )
+        pick_api = label_to_api[pick_label]
+        wd = merged[merged['API10'].astype(str) == str(pick_api)]
+        models = _train_rf(merged, norm_col_for_models)
+        fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
+        fig = plot_one_well(wd, fc, fluid_name.lower())
+        st.pyplot(fig, clear_figure=True)
 
-            opts = base.dropna().drop_duplicates()
-            if opts.empty:
-                st.info("No wells available.")
-            else:
-                def make_label(r):
-                    wn = (r['WellName'] or "").strip()
-                    ap = r['API10']
-                    return wn if wn and wn != ap else f"API {ap}"
-
-                opts['label'] = opts.apply(make_label, axis=1)
-                label_to_api = dict(zip(opts['label'], opts['API10']))
-
-                pick_label = st.selectbox(
-                    f"Pick Well ({fluid_name})",
-                    options=sorted(opts['label'].tolist()),
-                    key=f"{fluid_name}_plot_pick"
-                )
-                pick_api = label_to_api[pick_label]
-
-                wd = merged[merged['API10'].astype(str) == str(pick_api)]
-                models = _train_rf(merged, norm_col_for_models)
-                fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
-                fig = plot_one_well(wd, fc, fluid_name.lower())
-                st.pyplot(fig, clear_figure=True)
-
-# ================= Helper: Type Curves (P10/P50/P90) + raw lines =================
+# ================= Type Curves =================
 def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
-    """
-    Returns:
-      curves: DataFrame with columns ['t','P10','P50','P90']
-      lines:  list of (t_array, y_array) for each well's HISTORICAL production
-    """
     vol_col = f"Monthly_{com}_volume"
     if monthly_df.empty or vol_col not in monthly_df.columns:
         return pd.DataFrame(columns=['t','P10','P50','P90']), []
-
-    # Only historical for raw lines
     hist = monthly_df[monthly_df['Segment'] == 'Historical'][['API10','Date',vol_col]].dropna().copy()
     hist = hist.sort_values(['API10','Date'])
-
-    # month index per well
     hist['t'] = hist.groupby('API10').cumcount() + 1
-
-    # collect raw lines (aligned)
     lines = []
     for _, g in hist.groupby('API10'):
         t = g['t'].to_numpy()
-        y = g[vol_col].to_numpy()
-        # clamp to epsilon for log scale display
-        y = np.clip(y, 1e-6, None)
+        y = np.clip(g[vol_col].to_numpy(), 1e-6, None)
         lines.append((t, y))
-
-    # compute quantiles per t (can use both hist & forecast; here we follow hist only or all?)
-    # We'll use ALL segments (historical + forecast) for type curves
     all_df = monthly_df[['API10','Date',vol_col]].dropna().sort_values(['API10','Date']).copy()
     all_df['t'] = all_df.groupby('API10').cumcount() + 1
-
     q = all_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
-    q.columns = ['P10','P50','P90']   # 0.90→P10, 0.50→P50, 0.10→P90
+    q.columns = ['P10','P50','P90']
     q = q.reset_index()
     return q, lines
 
@@ -292,32 +224,24 @@ def plot_type_curves(curves: pd.DataFrame, lines, fluid: str):
     color_map = {'oil':'green','gas':'red','water':'blue'}
     color = color_map[fluid.lower()]
     fig, ax = plt.subplots(figsize=(9,5))
-
     if lines:
-        # faint gray historical lines
         for t, y in lines:
             ax.plot(t, y, color='gray', alpha=0.15, linewidth=0.8)
-
     if curves.empty:
         ax.text(0.5, 0.5, "No data for type curve", ha='center', va='center'); ax.axis('off')
         return fig
-
-    # clamp for log safety
     eps = 1e-6
     P50 = np.clip(curves['P50'].to_numpy(dtype=float), eps, None)
     P10 = np.clip(curves['P10'].to_numpy(dtype=float), eps, None)
     P90 = np.clip(curves['P90'].to_numpy(dtype=float), eps, None)
-
     ax.plot(curves['t'], P50, color=color, linewidth=2, label='P50')
     ax.plot(curves['t'], P10, color=color, linewidth=1.5, linestyle='--', label='P10')
     ax.plot(curves['t'], P90, color=color, linewidth=1.5, linestyle='--', label='P90')
-
     ax.set_xlabel("Months since first production")
     ax.set_ylabel(f"Monthly {fluid.lower()} (normalized units)")
     ax.set_yscale('log')
-    ax.set_ylim(bottom=1)  # start at 10^0
+    ax.set_ylim(bottom=1)
     ax.grid(True, linestyle='--', alpha=0.4, which='both')
-
     ax.legend()
     fig.tight_layout()
     return fig
@@ -331,7 +255,7 @@ fluid_block("Water", "EUR (Mbbl water)",  "NormWater")
 st.markdown("---")
 
 # ================= Final: Type Wells summary + P10/P50/P90 plots =================
-st.header("Type Wells")
+st.header("Type Wells — Summary (End)")
 
 def _eurs_from_oneline(df: pd.DataFrame, col: str) -> list[float]:
     if df is None or df.empty or col not in df.columns:
@@ -380,48 +304,3 @@ with tw_tabs[2]:
         st.pyplot(plot_type_curves(curves, lines, "water"))
 
 st.caption("Per-fluid workflow: forecast → B-factors & probits → Type Wells (P10/P50/P90 with faint historical lines).")
-
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
-from reportlab.lib.pagesizes import letter
-import tempfile
-
-if st.button("Generate PDF Report"):
-    # create a temp file
-    tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    doc = SimpleDocTemplate(tmp_pdf.name, pagesize=letter)
-    story = []
-    styles = getSampleStyleSheet()
-
-    story.append(Paragraph("<b>SE Oil & Gas Autoforecasting Report</b>", styles["Title"]))
-    story.append(Spacer(1, 12))
-
-    # include oneline tables
-    for fluid in ["Oil","Gas","Water"]:
-        on_key = f"{fluid}_oneline"
-        if on_key in st.session_state:
-            story.append(Paragraph(f"<b>{fluid} Oneline Table</b>", styles["Heading2"]))
-            df = st.session_state[on_key].head(30)  # first 30 rows to fit
-            data = [df.columns.tolist()] + df.values.tolist()
-            t = Table(data)
-            t.setStyle(TableStyle([("GRID",(0,0),(-1,-1),0.25,colors.grey)]))
-            story.append(t)
-            story.append(Spacer(1, 12))
-
-    # include Type Well curves (export matplotlib to PNG then embed)
-    for fluid in ["oil","gas","water"]:
-        mo_key = f"{fluid.capitalize()}_monthly"
-        if mo_key in st.session_state:
-            curves, lines = build_type_curves_and_lines(st.session_state[mo_key], fluid)
-            fig = plot_type_curves(curves, lines, fluid)
-            img_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-            fig.savefig(img_tmp.name, dpi=150, bbox_inches="tight")
-            story.append(Paragraph(f"<b>{fluid.capitalize()} Type Well Curve</b>", styles["Heading2"]))
-            story.append(Image(img_tmp.name, width=400, height=250))
-            story.append(Spacer(1, 12))
-
-    doc.build(story)
-    with open(tmp_pdf.name, "rb") as f:
-        st.download_button("Download PDF Report", data=f, file_name="SE_report.pdf", mime="application/pdf")
-
