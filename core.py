@@ -370,7 +370,10 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     ax.set_xlabel("Month")
     ax.set_ylabel(f"Monthly {commodity} {unit}")
     ax.set_yscale('log')
+    # force the lower bound to 10^0
+    ax.set_ylim(bottom=1)  
     ax.grid(True, linestyle="--", alpha=0.4, which='both')
     ax.legend()
     fig.tight_layout()
     return fig
+
