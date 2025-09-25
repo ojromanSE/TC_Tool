@@ -1,3 +1,8 @@
+import streamlit as st
+st.title("✅ Streamlit entrypoint works")
+
+
+
 from tc_tool.core import (
     load_header, load_production, fill_lateral_by_geo,
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
