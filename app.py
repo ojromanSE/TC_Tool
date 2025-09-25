@@ -11,12 +11,27 @@ from core import (
     plot_one_well, forecast_one_well, _train_rf,
     compute_eur_stats, probit_plot, eur_summary_table
 )
+import os
+from PIL import Image
+
+# Show "All systems working" plus logo side-by-side
+c1, c2 = st.columns([0.1, 0.9])
+
+with c1:
+    # load the logo from the repo
+    logo_path = os.path.join("static", "logo.png")
+    if os.path.exists(logo_path):
+        st.image(logo_path, use_column_width='auto')
+
+with c2:
+    st.success("All Systems Working")
+
+st.title("SE Oil & Gas Autoforecasting")
 
 # ---- smoke line so we know entrypoint is running
 st.set_page_config(page_title="SE Tool", layout="wide")
 st.write("✅ All Systems Working")
 
-st.title("SE Oil & Gas Autoforecasting")
 
 # ================= Sidebar: global params =================
 with st.sidebar:
