@@ -16,7 +16,7 @@ from core import (
 st.set_page_config(page_title="SE Tool", layout="wide")
 st.write("✅ app.py loaded (entrypoint OK)")
 
-st.title("SE Oil & Gas Autoforecasting — Broken Down by Fluid")
+st.title("SE Oil & Gas Autoforecasting")
 
 # ================= Sidebar: global params =================
 with st.sidebar:
