@@ -9,6 +9,7 @@ from core import (
     compute_eur_stats, probit_plot, eur_summary_table
 )
 
+
 st.set_page_config(page_title="SE Autoforecasting — By Fluid", layout="wide")
 st.title("SE Oil & Gas Autoforecasting — Broken Down by Fluid")
 
