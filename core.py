@@ -171,7 +171,7 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     m = len(t_hist)
     while m < len(t_hist)+max_months:
         q = float(arps(qi,b,di,np.array([m],float))[0])
-        if q < 1e-3: break
+        if q < 1e-6: break
         f_m.append(m); f_v.append(q); m += 1
 
     eur_hist = float(y_hist.sum())
@@ -244,7 +244,7 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
     monthly_df = pd.DataFrame(monthly).sort_values(['API10','Date','Segment'])
     return oneline_df, monthly_df
 
-# ---------------- EUR stats & Probit (with color) ----------------
+# ---------------- EUR stats & Probit (color support) ----------------
 def compute_eur_stats(eur_array: List[float]) -> Dict[str, float]:
     eur = np.array(eur_array, dtype=float)
     eur = eur[np.isfinite(eur)]
@@ -266,7 +266,6 @@ def _mantissa_formatter(val, pos=None):
     return s if len(s) <= 4 else ""
 
 def probit_plot(eurs: List[float], unit_label: str, title: str, color: str | None = None):
-    """Probit plot; scatter/line colored if `color` provided."""
     eur = np.array([x for x in eurs if np.isfinite(x) and x>0.0], dtype=float)
     if eur.size == 0:
         fig, ax = plt.subplots(figsize=(8,6))
@@ -297,40 +296,27 @@ def probit_plot(eurs: List[float], unit_label: str, title: str, color: str | Non
     ax.set_title(title); plt.tight_layout()
     return fig
 
-def eur_summary_table(fluid_name: str, stats_dict: Dict[str, float], unit: str, norm_len: int) -> pd.DataFrame:
-    factor = 1000.0 if unit != "MMcf" else 1.0
-    per_ft = lambda x: (x / norm_len * factor) if (np.isfinite(x)) else np.nan
-    rows = [
-        ["P90",                  stats_dict['P90'],       per_ft(stats_dict['P90'])],
-        ["P50",                  stats_dict['P50'],       per_ft(stats_dict['P50'])],
-        ["P10",                  stats_dict['P10'],       per_ft(stats_dict['P10'])],
-        ["P10/P90 Ratio",        stats_dict['P10/P90'],   np.nan],
-        ["Well Count",           stats_dict['Count'],     np.nan],
-        ["Normalization Length", norm_len,                "ft"],
-        ["Mean",                 stats_dict['Mean'],      per_ft(stats_dict['Mean'])],
-        ["Type Curve EUR",       stats_dict['TypeCurve'], per_ft(stats_dict['TypeCurve'])],
-    ]
-    return pd.DataFrame(rows, columns=[f"{fluid_name} EURs", unit, f"{unit}/ft"])
-
-# ---------------- Single-well plot with fixed colors ----------------
+# ---------------- Single-well plot with fixed colors + LOG Y ----------------
 def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     """
     Plot historical monthly volumes, fitted curve over history, and forward forecast.
     Colors: oil=green, gas=red, water=blue. Points and lines both colored.
+    Y-axis is logarithmic (values clamped to small epsilon for display).
     """
     com = commodity.lower()
     col_map = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}
     color_map = {'oil':'green','gas':'red','water':'blue'}
     col = col_map[com]
     color = color_map[com]
+    eps = 1e-6  # for log-scale safety
 
     # Prepare historical series
     wd = wd.sort_values('MonthYear').copy()
     hist_dates = wd['MonthYear'].dt.to_timestamp(how='start')
-    hist_vals  = wd[col].astype(float).values
+    hist_vals  = np.clip(wd[col].astype(float).values, eps, None)
 
     # Fitted (over historical months)
-    fit_hist = fc['fit_hist']
+    fit_hist = np.clip(fc['fit_hist'], eps, None)
     fit_dates = hist_dates  # 1:1 with history
 
     # Forecast series
@@ -339,7 +325,7 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     else:
         start = pd.Timestamp.today().normalize().replace(day=1)
     f_dates = pd.date_range(start=start, periods=len(fc['f_vals']), freq='MS')
-    f_vals  = fc['f_vals']
+    f_vals  = np.clip(fc['f_vals'], eps, None)
 
     # Labels / units
     unit = {"oil":"(normalized bbl/month)",
@@ -359,7 +345,8 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     ax.set_title(f"{well}  |  API10 {api}  |  {commodity.capitalize()} forecast")
     ax.set_xlabel("Month")
     ax.set_ylabel(f"Monthly {commodity} {unit}")
-    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.set_yscale('log')
+    ax.grid(True, linestyle="--", alpha=0.4, which='both')
     ax.legend()
     fig.tight_layout()
     return fig
