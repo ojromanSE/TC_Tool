@@ -244,7 +244,7 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
     monthly_df = pd.DataFrame(monthly).sort_values(['API10','Date','Segment'])
     return oneline_df, monthly_df
 
-# ---------------- EUR stats & Probit ----------------
+# ---------------- EUR stats & Probit (with color) ----------------
 def compute_eur_stats(eur_array: List[float]) -> Dict[str, float]:
     eur = np.array(eur_array, dtype=float)
     eur = eur[np.isfinite(eur)]
@@ -265,7 +265,8 @@ def _mantissa_formatter(val, pos=None):
     s = f"{val:g}"
     return s if len(s) <= 4 else ""
 
-def probit_plot(eurs: List[float], unit_label: str, title: str):
+def probit_plot(eurs: List[float], unit_label: str, title: str, color: str | None = None):
+    """Probit plot; scatter/line colored if `color` provided."""
     eur = np.array([x for x in eurs if np.isfinite(x) and x>0.0], dtype=float)
     if eur.size == 0:
         fig, ax = plt.subplots(figsize=(8,6))
@@ -281,10 +282,10 @@ def probit_plot(eurs: List[float], unit_label: str, title: str):
     p90  = np.percentile(eur_sorted, 10)
 
     fig, ax = plt.subplots(figsize=(9,7))
-    ax.scatter(eur_sorted, z, edgecolors='black', alpha=0.85, s=48)
+    ax.scatter(eur_sorted, z, edgecolors='black', alpha=0.85, s=48, color=color)
     ax.plot([p90, p10],
             [stats.norm.ppf(1-0.90), stats.norm.ppf(1-0.10)],
-            linewidth=2, color='black')
+            linewidth=2, color=color if color else 'black')
     ticks = [stats.norm.ppf(1-x/100) for x in (10,50,90)]
     ax.set_yticks(ticks); ax.set_yticklabels(['P10','P50','P90'])
     ax.set_ylabel("Probit"); ax.set_xlabel(f"EUR ({unit_label})")
@@ -297,7 +298,7 @@ def probit_plot(eurs: List[float], unit_label: str, title: str):
     return fig
 
 def eur_summary_table(fluid_name: str, stats_dict: Dict[str, float], unit: str, norm_len: int) -> pd.DataFrame:
-    factor = 1000.0 if unit != "MMcf" else 1.0   # Mbbl→bbl/ft convenience
+    factor = 1000.0 if unit != "MMcf" else 1.0
     per_ft = lambda x: (x / norm_len * factor) if (np.isfinite(x)) else np.nan
     rows = [
         ["P90",                  stats_dict['P90'],       per_ft(stats_dict['P90'])],
