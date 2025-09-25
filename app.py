@@ -316,7 +316,7 @@ fluid_block("Water", "EUR (Mbbl water)",  "NormWater")
 st.markdown("---")
 
 # ================= Final: Type Wells summary + P10/P50/P90 plots =================
-st.header("Type Wells — Summary (End)")
+st.header("Type Wells")
 
 def _eurs_from_oneline(df: pd.DataFrame, col: str) -> list[float]:
     if df is None or df.empty or col not in df.columns:
