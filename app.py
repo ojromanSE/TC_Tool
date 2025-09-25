@@ -4,15 +4,15 @@ import pandas as pd
 from io import BytesIO
 import numpy as np
 import matplotlib.pyplot as plt
-
+import os
+from PIL import Image
 from core import (
     load_header, load_production, fill_lateral_by_geo,
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
     plot_one_well, forecast_one_well, _train_rf,
     compute_eur_stats, probit_plot, eur_summary_table
 )
-import os
-from PIL import Image
+
 
 # Show "All systems working" plus logo side-by-side
 c1, c2 = st.columns([0.1, 0.9])
