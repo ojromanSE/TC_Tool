@@ -1,8 +1,7 @@
 # app.py — SE Oil & Gas Autoforecasting
-# UI: full workflow + enhanced B-factor analytics
+# UI: full workflow + enhanced B-factor analytics, all tables rounded to 2 decimals
 # PDF: 3 pages per fluid (B-factor / Probit / Type-curve) with header band for logo
 #      B-factor page uses a 2-column layout (plots left, stats table right)
-
 import os
 import tempfile
 from io import BytesIO
@@ -52,6 +51,26 @@ with st.sidebar:
             del st.session_state[k]
         st.experimental_rerun()
 
+# ================= Small helpers =================
+def _phase_color(fluid: str) -> str:
+    return {'oil': 'green', 'gas': 'red', 'water': 'blue'}[fluid.lower()]
+
+def _save_fig(fig, dpi=220):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    fig.savefig(tmp.name, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return tmp.name
+
+def round_df(df: pd.DataFrame, ndigits: int = 2) -> pd.DataFrame:
+    """Round numeric columns; leave others intact."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    num_cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
+    if num_cols:
+        out[num_cols] = out[num_cols].round(ndigits)
+    return out
+
 # ================= Upload & Prepare Data =================
 st.header("Upload & Prepare Data")
 c1, c2 = st.columns(2)
@@ -93,34 +112,16 @@ if st.button("Load / QC / Merge"):
 
 if "merged" in st.session_state:
     with st.expander("Preview: Header (QC’d)"):
-        st.dataframe(st.session_state.header_qc.head(20), use_container_width=True)
+        st.dataframe(round_df(st.session_state.header_qc.head(20)), use_container_width=True)
     with st.expander("Preview: Production"):
-        st.dataframe(st.session_state.prod_df.head(20), use_container_width=True)
+        st.dataframe(round_df(st.session_state.prod_df.head(20)), use_container_width=True)
     with st.expander("Preview: Merged"):
-        st.dataframe(st.session_state.merged.head(20), use_container_width=True)
+        st.dataframe(round_df(st.session_state.merged.head(20)), use_container_width=True)
 
 st.markdown("---")
 
-# ================= Shared helpers =================
-def _phase_color(fluid: str) -> str:
-    return {'oil': 'green', 'gas': 'red', 'water': 'blue'}[fluid.lower()]
-
-def _save_fig(fig, dpi=220):
-    """Save a matplotlib fig to a temp PNG and return the path."""
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    fig.savefig(tmp.name, dpi=dpi, bbox_inches="tight")
-    plt.close(fig)
-    return tmp.name
-
-# ---------- B-factor analytics helpers (hist + box + scatter + stats) ----------
+# ---------- B-factor analytics (hist + box + scatter + stats) ----------
 def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
-    """
-    Returns: (hist_png, box_png, scatter_png, stats_df)
-      - Histogram with mean/median/P10/P90 markers
-      - Slim horizontal boxplot
-      - b vs EUR scatter (EUR on log x) with regression + R²
-      - Summary stats table incl. IQR and outlier count
-    """
     color = _phase_color(fluid)
     df = oneline.copy()
     df = df[pd.to_numeric(df.get('b'), errors='coerce').notna()]
@@ -129,7 +130,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
 
     b = pd.to_numeric(df['b'], errors='coerce').dropna().astype(float)
 
-    # ----- summary stats -----
+    # stats
     P10 = float(np.percentile(b, 10))
     P25 = float(np.percentile(b, 25))
     P50 = float(np.percentile(b, 50))
@@ -156,7 +157,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     ]
     stats_df = pd.DataFrame(stats_rows, columns=[f"{fluid} b-factor statistics", "value"])
 
-    # ----- Histogram with markers -----
+    # Histogram
     fig_h, axh = plt.subplots(figsize=(6.6, 3.4))
     axh.hist(b.values, bins=30, color=color, alpha=0.85, edgecolor='none')
     axh.set_xlabel("b-factor"); axh.set_ylabel("Number of wells")
@@ -169,7 +170,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     axh.legend(loc="upper right", fontsize=8, frameon=False)
     hist_png = _save_fig(fig_h)
 
-    # ----- Slim horizontal boxplot -----
+    # Boxplot
     fig_bx, axbx = plt.subplots(figsize=(6.6, 1.1))
     axbx.boxplot(b.values, vert=False, widths=0.5,
                  boxprops=dict(color='gray'),
@@ -180,7 +181,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     axbx.grid(True, axis='x', linestyle='--', alpha=0.35)
     box_png = _save_fig(fig_bx)
 
-    # ----- Scatter: b vs EUR (log EUR), regression + R² -----
+    # Scatter b vs EUR
     scatter_png = None
     if eur_col in df.columns:
         eur = pd.to_numeric(df[eur_col], errors='coerce')
@@ -282,11 +283,11 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
 
         # Oneline
         with tab1:
-            st.dataframe(st.session_state[on_key], use_container_width=True)
+            st.dataframe(round_df(st.session_state[on_key]), use_container_width=True)
 
         # Monthly
         with tab2:
-            st.dataframe(st.session_state[mo_key], use_container_width=True)
+            st.dataframe(round_df(st.session_state[mo_key]), use_container_width=True)
 
         # Enhanced B-Factor
         with tab3:
@@ -295,7 +296,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             cols = [c for c in cols if c in oneline.columns]
             btable = oneline[cols].copy().sort_values('b', ascending=False)
             st.subheader(f"{fluid_name} — B-Factor Table")
-            st.dataframe(btable, use_container_width=True)
+            st.dataframe(round_df(btable), use_container_width=True)
 
             hist_png, box_png, scatter_png, bstats = bfactor_analytics_figures(
                 oneline, fluid=fluid_name, eur_col=eur_col
@@ -308,7 +309,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 if scatter_png: st.image(scatter_png, caption="b-factor vs EUR (log scale)")
             with c2:
                 if box_png: st.image(box_png, caption="b-factor boxplot")
-                st.dataframe(bstats, use_container_width=True)
+                st.dataframe(round_df(bstats), use_container_width=True)
 
         # Probit
         with tab4:
@@ -320,7 +321,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
                 stats = compute_eur_stats(eurs)
                 st.dataframe(
-                    eur_summary_table(fluid_name, stats, unit, int(norm_len)),
+                    round_df(eur_summary_table(fluid_name, stats, unit, int(norm_len))),
                     use_container_width=True
                 )
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit", color=_phase_color(fluid_name))
@@ -380,7 +381,7 @@ with tw_tabs[0]:
     else:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (Mbbl)")
         stats_o = compute_eur_stats(eurs)
-        st.dataframe(eur_summary_table("Oil", stats_o, "Mbbl", int(norm_len)), use_container_width=True)
+        st.dataframe(round_df(eur_summary_table("Oil", stats_o, "Mbbl", int(norm_len))), use_container_width=True)
         curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "oil")
                          if mo_key in st.session_state else (pd.DataFrame(), []))
         st.subheader("Oil Type Curve (P10 / P50 / P90)")
@@ -393,7 +394,7 @@ with tw_tabs[1]:
     else:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (MMcf)")
         stats_g = compute_eur_stats(eurs)
-        st.dataframe(eur_summary_table("Gas", stats_g, "MMcf", int(norm_len)), use_container_width=True)
+        st.dataframe(round_df(eur_summary_table("Gas", stats_g, "MMcf", int(norm_len))), use_container_width=True)
         curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "gas")
                          if mo_key in st.session_state else (pd.DataFrame(), []))
         st.subheader("Gas Type Curve (P10 / P50 / P90)")
@@ -406,7 +407,7 @@ with tw_tabs[2]:
     else:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (Mbbl water)")
         stats_w = compute_eur_stats(eurs)
-        st.dataframe(eur_summary_table("Water", stats_w, "Mbbl", int(norm_len)), use_container_width=True)
+        st.dataframe(round_df(eur_summary_table("Water", stats_w, "Mbbl", int(norm_len))), use_container_width=True)
         curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "water")
                          if mo_key in st.session_state else (pd.DataFrame(), []))
         st.subheader("Water Type Curve (P10 / P50 / P90)")
@@ -425,12 +426,17 @@ from reportlab.platypus import (
 from reportlab.lib.utils import ImageReader
 
 def _df_to_table(df: pd.DataFrame, title: str, font_size: int = 7):
-    """Convert a DataFrame to a reportlab Table with small font and repeated header."""
+    """Convert a DataFrame to a reportlab Table with small font, 2-decimal rounding."""
     styles = getSampleStyleSheet()
     if df is None or df.empty:
         return [Paragraph(f"<b>{title}</b> — (no data)", styles['Heading3']), Spacer(1,6)]
 
     df_str = df.copy()
+    # round numeric to 2 decimals
+    for c in df_str.columns:
+        if pd.api.types.is_numeric_dtype(df_str[c]):
+            df_str[c] = df_str[c].round(2)
+    # stringify
     for c in df_str.columns:
         df_str[c] = df_str[c].astype(str)
 
@@ -454,7 +460,6 @@ def _logo_on_page(canvas, doc):
         if os.path.exists(LOGO_PATH):
             img = ImageReader(LOGO_PATH)
             w, h = 0.9*inch, 0.9*inch
-            # Draw within header band (topMargin leaves space already)
             canvas.drawImage(img, doc.pagesize[0]-w-0.4*inch, doc.pagesize[1]-h-0.35*inch,
                              width=w, height=h, preserveAspectRatio=True, mask='auto')
     except Exception:
@@ -468,7 +473,7 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     Build 3 pages per fluid:
       1) B-factor plots (left) + stats table (right)
       2) Probit plot + probit table
-      3) Type-curve table + plot
+      3) Type-curve table (EUR stats summary) + type-curve plot
     """
     styles = getSampleStyleSheet()
 
@@ -483,10 +488,8 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     # -------------------- PAGE 1: B-factor (2-column layout) --------------------
     story.append(Paragraph(f"<b>{fluid} — B-Factor Analytics</b>", styles['Heading2']))
 
-    # Build figures & stats
     hist_png, box_png, scatter_png, bstats = bfactor_analytics_figures(oneline, fluid, eur_col)
 
-    # Left column: slimmer stacked plots (under the header band)
     left_stack = []
     if hist_png:
         left_stack.append(Image(hist_png, width=4.2*inch, height=2.5*inch))
@@ -497,10 +500,8 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     if scatter_png:
         left_stack.append(Image(scatter_png, width=4.2*inch, height=2.3*inch))
 
-    # Right column: compact stats table (title + table)
     right_stack = _df_to_table(bstats, f"{fluid} — b-factor statistics", font_size=7)
 
-    # Assemble a 2-column table: left = plots, right = stats
     two_col = Table(
         [[left_stack, right_stack]],
         colWidths=[4.4*inch, 3.0*inch]
@@ -534,23 +535,19 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
 
     # -------------------- PAGE 3: Type Curve ------------------
     story.append(Paragraph(f"<b>{fluid} — Type Curve</b>", styles['Heading2']))
-    if mo_key in st.session_state:
+    if mo_key in st.session_state and on_key in st.session_state:
+        oneline_df = st.session_state[on_key]
+        eurs = pd.to_numeric(oneline_df[eur_col], errors="coerce").astype(float).tolist()
+        unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
+        stats = compute_eur_stats(eurs)
+        df_tc = eur_summary_table(fluid, stats, unit, int(st.session_state.get('norm_len_pdf', 10000)))
+        story += _df_to_table(df_tc, f"{fluid} — Type Curve Table", font_size=7)
+
         curves, lines = build_type_curves_and_lines(st.session_state[mo_key], fluid.lower())
-        if not curves.empty:
-            snap_months = [12, 24, 36]
-            rows = []
-            for m in snap_months:
-                row = curves[curves['t'] == m]
-                if not row.empty:
-                    rr = row.iloc[0]
-                    rows.append([m, rr['P10'], rr['P50'], rr['P90']])
-            if rows:
-                df_tc = pd.DataFrame(rows, columns=["Month","P10","P50","P90"])
-                story += _df_to_table(df_tc, f"{fluid} — Type Curve Table", font_size=7)
         figtc = plot_type_curves(curves, lines, fluid.lower())
         story.append(Image(_save_fig(figtc), width=6.5*inch, height=4.0*inch))
     else:
-        story.append(Paragraph("No monthly data available for type-curve.", styles['Normal']))
+        story.append(Paragraph("No data available for type-curve.", styles['Normal']))
     story.append(PageBreak())
 
 # ============ PDF button ============
@@ -559,12 +556,11 @@ st.session_state['norm_len_pdf'] = int(norm_len)  # pass to report builder
 if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_oneline"]):
     if st.button("Generate PDF Report"):
         tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        # Bigger top margin to create a HEADER BAND for the logo so nothing overlaps
         doc = SimpleDocTemplate(
             tmp_pdf.name,
             pagesize=letter,
             leftMargin=0.5*inch, rightMargin=0.5*inch,
-            topMargin=1.15*inch, bottomMargin=0.6*inch   # header band ~1.15"
+            topMargin=1.15*inch, bottomMargin=0.6*inch   # header band for logo
         )
         story = []
 
@@ -572,11 +568,8 @@ if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_onelin
         story.append(Paragraph("<b>SE Oil & Gas Autoforecasting — Report</b>", styles['Title']))
         story.append(Spacer(1, 8))
 
-        # Oil
         _fluid_section(story, "Oil",   "Oil_oneline",   "Oil_monthly",   "EUR (Mbbl)")
-        # Gas
         _fluid_section(story, "Gas",   "Gas_oneline",   "Gas_monthly",   "EUR (MMcf)")
-        # Water
         _fluid_section(story, "Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
 
         doc.build(story, onFirstPage=_logo_on_page, onLaterPages=_logo_on_page)
