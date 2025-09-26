@@ -1,4 +1,6 @@
-# app.py — SE Oil & Gas Autoforecasting with Enhanced B-Factor Analytics + PDF
+# app.py — SE Oil & Gas Autoforecasting
+# UI: full workflow + enhanced B-factor analytics
+# PDF: NO Oneline/B-factor tables (keeps plots + stats + probit + type curves)
 import os
 import tempfile
 from io import BytesIO
@@ -408,7 +410,7 @@ with tw_tabs[2]:
         st.subheader("Water Type Curve (P10 / P50 / P90)")
         st.pyplot(plot_type_curves(curves, lines, "water"))
 
-st.caption("Per-fluid workflow: forecast → enhanced B-factors & probits → Type Wells.")
+st.caption("Per-fluid workflow: enhanced B-factors & probits → Type Wells.")
 
 # =========================== PDF REPORT ===========================
 from reportlab.lib.pagesizes import letter
@@ -459,7 +461,13 @@ def _logo_on_page(canvas, doc):
     canvas.drawRightString(doc.pagesize[0]-0.4*inch, 0.4*inch, f"Page {page_num}")
 
 def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
-    """Add all required tables/plots for a fluid to the report (per your spec)."""
+    """
+    PDF section per fluid WITHOUT the Oneline and B-factor tables.
+    Keeps:
+      - B-factor histogram + boxplot + b vs EUR (with R²) + stats table
+      - Probit table + Probit plot
+      - Type-curve table (snapshots) + Type-curve plot
+    """
     styles = getSampleStyleSheet()
     story.append(Paragraph(f"<b>{fluid}</b>", styles['Heading2']))
     story.append(Spacer(1,6))
@@ -471,15 +479,7 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
 
     oneline = st.session_state[on_key].copy()
 
-    # 1) Oneline Table
-    story += _df_to_table(oneline, f"{fluid} — Oneline Table")
-
-    # 2) B-Factor Table + Enhanced Analytics
-    cols = ['API10','WellName','qi (per day)','b','di (per month)','First-Year Decline (%)']
-    cols = [c for c in cols if c in oneline.columns]
-    btable = oneline[cols].copy().sort_values('b', ascending=False)
-    story += _df_to_table(btable, f"{fluid} — B-Factor Table")
-
+    # --- B-Factor enhanced analytics (no B-factor table) ---
     hist_png, box_png, scatter_png, bstats = bfactor_analytics_figures(oneline, fluid, eur_col)
     if hist_png:
         story.append(Image(hist_png, width=6.5*inch, height=3.8*inch))
@@ -491,25 +491,27 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     story += _df_to_table(bstats, f"{fluid} — b-factor statistics")
     story.append(Spacer(1,8))
 
-    # 3) Probit table + plot
+    # --- Probit table + plot
     if eur_col in oneline.columns:
         eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
         unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
         stats = compute_eur_stats(eurs)
-        story += _df_to_table(eur_summary_table(fluid, stats, unit, int(st.session_state.get('norm_len_pdf', 10000))),
-                              f"{fluid} — Probit Table")
+        story += _df_to_table(
+            eur_summary_table(fluid, stats, unit, int(st.session_state.get('norm_len_pdf', 10000))),
+            f"{fluid} — Probit Table"
+        )
         figp = probit_plot(eurs, unit, f"{fluid} EUR Probit", color=_phase_color(fluid))
         story.append(Image(_save_fig(figp), width=6.5*inch, height=4.2*inch))
         story.append(Spacer(1,8))
 
-    # 4) Type curve table + plot
+    # --- Type curve snapshots table + plot
     if mo_key in st.session_state:
         curves, lines = build_type_curves_and_lines(st.session_state[mo_key], fluid.lower())
         if not curves.empty:
             snap_months = [12, 24, 36]
             rows = []
             for m in snap_months:
-                row = curves[curves['t']==m]
+                row = curves[curves['t'] == m]
                 if not row.empty:
                     rr = row.iloc[0]
                     rows.append([m, rr['P10'], rr['P50'], rr['P90']])
