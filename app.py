@@ -1,7 +1,8 @@
 # app.py — SE Oil & Gas Autoforecasting
-# UI: full workflow + enhanced B-factor analytics, all tables rounded to 2 decimals
-# PDF: 3 pages per fluid (B-factor / Probit / Type-curve) with header band for logo
+# Tables: force EXACTLY 2 decimals everywhere (UI + PDF)
+# PDF: 3 pages per fluid (B-factor/Probit/Type-curve) with header band + logo
 #      B-factor page uses a 2-column layout (plots left, stats table right)
+
 import os
 import tempfile
 from io import BytesIO
@@ -51,7 +52,28 @@ with st.sidebar:
             del st.session_state[k]
         st.experimental_rerun()
 
-# ================= Small helpers =================
+# ================= Formatting helpers (2 decimals everywhere) =================
+def _fmt2(value) -> str:
+    """Format any numeric-like value to 2 decimals; leave text as-is; blank for NaN."""
+    try:
+        # Try numeric conversion
+        f = float(value)
+        if np.isfinite(f):
+            return f"{f:.2f}"
+        return ""
+    except Exception:
+        # Non-numeric -> keep original text
+        return "" if value is None else str(value)
+
+def format_df_2dec(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with EVERY cell rendered to a string w/ exactly 2 decimals for numerics."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for c in out.columns:
+        out[c] = out[c].map(_fmt2)
+    return out
+
 def _phase_color(fluid: str) -> str:
     return {'oil': 'green', 'gas': 'red', 'water': 'blue'}[fluid.lower()]
 
@@ -60,16 +82,6 @@ def _save_fig(fig, dpi=220):
     fig.savefig(tmp.name, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return tmp.name
-
-def round_df(df: pd.DataFrame, ndigits: int = 2) -> pd.DataFrame:
-    """Round numeric columns; leave others intact."""
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    num_cols = [c for c in out.columns if pd.api.types.is_numeric_dtype(out[c])]
-    if num_cols:
-        out[num_cols] = out[num_cols].round(ndigits)
-    return out
 
 # ================= Upload & Prepare Data =================
 st.header("Upload & Prepare Data")
@@ -112,11 +124,11 @@ if st.button("Load / QC / Merge"):
 
 if "merged" in st.session_state:
     with st.expander("Preview: Header (QC’d)"):
-        st.dataframe(round_df(st.session_state.header_qc.head(20)), use_container_width=True)
+        st.dataframe(format_df_2dec(st.session_state.header_qc.head(20)), use_container_width=True)
     with st.expander("Preview: Production"):
-        st.dataframe(round_df(st.session_state.prod_df.head(20)), use_container_width=True)
+        st.dataframe(format_df_2dec(st.session_state.prod_df.head(20)), use_container_width=True)
     with st.expander("Preview: Merged"):
-        st.dataframe(round_df(st.session_state.merged.head(20)), use_container_width=True)
+        st.dataframe(format_df_2dec(st.session_state.merged.head(20)), use_container_width=True)
 
 st.markdown("---")
 
@@ -141,7 +153,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     lo, hi = P25 - 1.5*IQR, P75 + 1.5*IQR
     outliers = int(((b < lo) | (b > hi)).sum())
     stats_rows = [
-        ["count",               int(b.size)],
+        ["count",               float(b.size)],
         ["mean",                float(b.mean())],
         ["median",              float(b.median())],
         ["Standard deviation",  float(b.std(ddof=1)) if b.size>1 else 0.0],
@@ -153,7 +165,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
         ["P90",                 P90],
         ["P95",                 P95],
         ["IQR",                 float(IQR)],
-        ["Outliers (±1.5*IQR)", outliers],
+        ["Outliers (±1.5*IQR)", float(outliers)],
     ]
     stats_df = pd.DataFrame(stats_rows, columns=[f"{fluid} b-factor statistics", "value"])
 
@@ -283,20 +295,20 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
 
         # Oneline
         with tab1:
-            st.dataframe(round_df(st.session_state[on_key]), use_container_width=True)
+            st.dataframe(format_df_2dec(st.session_state[on_key]), use_container_width=True)
 
         # Monthly
         with tab2:
-            st.dataframe(round_df(st.session_state[mo_key]), use_container_width=True)
+            st.dataframe(format_df_2dec(st.session_state[mo_key]), use_container_width=True)
 
-        # Enhanced B-Factor
+        # B-Factor analytics + table
         with tab3:
             oneline = st.session_state[on_key]
             cols = ['API10','WellName','qi (per day)','b','di (per month)','First-Year Decline (%)']
             cols = [c for c in cols if c in oneline.columns]
             btable = oneline[cols].copy().sort_values('b', ascending=False)
             st.subheader(f"{fluid_name} — B-Factor Table")
-            st.dataframe(round_df(btable), use_container_width=True)
+            st.dataframe(format_df_2dec(btable), use_container_width=True)
 
             hist_png, box_png, scatter_png, bstats = bfactor_analytics_figures(
                 oneline, fluid=fluid_name, eur_col=eur_col
@@ -309,7 +321,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 if scatter_png: st.image(scatter_png, caption="b-factor vs EUR (log scale)")
             with c2:
                 if box_png: st.image(box_png, caption="b-factor boxplot")
-                st.dataframe(round_df(bstats), use_container_width=True)
+                st.dataframe(format_df_2dec(bstats), use_container_width=True)
 
         # Probit
         with tab4:
@@ -321,7 +333,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
                 stats = compute_eur_stats(eurs)
                 st.dataframe(
-                    round_df(eur_summary_table(fluid_name, stats, unit, int(norm_len))),
+                    format_df_2dec(eur_summary_table(fluid_name, stats, unit, int(norm_len))),
                     use_container_width=True
                 )
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit", color=_phase_color(fluid_name))
@@ -381,7 +393,7 @@ with tw_tabs[0]:
     else:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (Mbbl)")
         stats_o = compute_eur_stats(eurs)
-        st.dataframe(round_df(eur_summary_table("Oil", stats_o, "Mbbl", int(norm_len))), use_container_width=True)
+        st.dataframe(format_df_2dec(eur_summary_table("Oil", stats_o, "Mbbl", int(norm_len))), use_container_width=True)
         curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "oil")
                          if mo_key in st.session_state else (pd.DataFrame(), []))
         st.subheader("Oil Type Curve (P10 / P50 / P90)")
@@ -394,7 +406,7 @@ with tw_tabs[1]:
     else:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (MMcf)")
         stats_g = compute_eur_stats(eurs)
-        st.dataframe(round_df(eur_summary_table("Gas", stats_g, "MMcf", int(norm_len))), use_container_width=True)
+        st.dataframe(format_df_2dec(eur_summary_table("Gas", stats_g, "MMcf", int(norm_len))), use_container_width=True)
         curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "gas")
                          if mo_key in st.session_state else (pd.DataFrame(), []))
         st.subheader("Gas Type Curve (P10 / P50 / P90)")
@@ -407,7 +419,7 @@ with tw_tabs[2]:
     else:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (Mbbl water)")
         stats_w = compute_eur_stats(eurs)
-        st.dataframe(round_df(eur_summary_table("Water", stats_w, "Mbbl", int(norm_len))), use_container_width=True)
+        st.dataframe(format_df_2dec(eur_summary_table("Water", stats_w, "Mbbl", int(norm_len))), use_container_width=True)
         curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "water")
                          if mo_key in st.session_state else (pd.DataFrame(), []))
         st.subheader("Water Type Curve (P10 / P50 / P90)")
@@ -426,19 +438,12 @@ from reportlab.platypus import (
 from reportlab.lib.utils import ImageReader
 
 def _df_to_table(df: pd.DataFrame, title: str, font_size: int = 7):
-    """Convert a DataFrame to a reportlab Table with small font, 2-decimal rounding."""
+    """Convert a DataFrame to a reportlab Table (2-dec formatting, repeated header)."""
     styles = getSampleStyleSheet()
     if df is None or df.empty:
         return [Paragraph(f"<b>{title}</b> — (no data)", styles['Heading3']), Spacer(1,6)]
 
-    df_str = df.copy()
-    # round numeric to 2 decimals
-    for c in df_str.columns:
-        if pd.api.types.is_numeric_dtype(df_str[c]):
-            df_str[c] = df_str[c].round(2)
-    # stringify
-    for c in df_str.columns:
-        df_str[c] = df_str[c].astype(str)
+    df_str = format_df_2dec(df)  # <- enforce 2-dec formatting on every cell
 
     data = [df_str.columns.tolist()] + df_str.values.tolist()
     tbl = Table(data, repeatRows=1)
