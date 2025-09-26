@@ -1,4 +1,4 @@
-# app.py — SE Oil & Gas Autoforecasting (by fluid) with logo at top
+# app.py — SE Oil & Gas Autoforecasting (with PDF report + logo header per page)
 import os
 import tempfile
 from io import BytesIO
@@ -7,7 +7,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-from PIL import Image
 
 from core import (
     load_header, load_production, fill_lateral_by_geo,
@@ -19,9 +18,10 @@ from core import (
 # ---------- PAGE CONFIG (must be first Streamlit call) ----------
 st.set_page_config(page_title="SE Tool", layout="wide")
 
-# ---------- Top header with logo ----------
-LOGO_PATH = os.path.join("static", "logo.png")  # make sure your logo is here
+# ---------- Paths / constants ----------
+LOGO_PATH = os.path.join("static", "logo.png")  # ensure tc_tool/static/logo.png exists
 
+# ---------- Top header with logo (left) + status/title (right) ----------
 cols = st.columns([0.12, 0.88])
 with cols[0]:
     if os.path.exists(LOGO_PATH):
@@ -134,13 +134,14 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             monthly = st.session_state[mo_key]
             st.dataframe(monthly, use_container_width=True)
 
-        # B-Factor Table
+        # B-Factor Table + analytics
         with tab3:
             oneline = st.session_state[on_key]
             cols = ['API10','WellName','qi (per day)','b','di (per month)','First-Year Decline (%)']
             cols = [c for c in cols if c in oneline.columns]
             btable = oneline[cols].copy().sort_values('b', ascending=False)
             st.dataframe(btable, use_container_width=True)
+
             color_map = {'oil':'green','gas':'red','water':'blue'}
             color = color_map[fluid_name.lower()]
             if {'b','qi (per day)'}.issubset(oneline.columns):
@@ -149,6 +150,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 ax1.hist(oneline['b'].dropna().values, bins=25, color=color, alpha=0.85)
                 ax1.set_xlabel("b"); ax1.set_ylabel("Count"); ax1.grid(True, linestyle="--", alpha=0.4)
                 st.pyplot(fig1)
+
                 fig2, ax2 = plt.subplots(figsize=(7,4))
                 ax2.scatter(oneline['b'], oneline['qi (per day)'], s=22, color=color, alpha=0.85)
                 ax2.set_xlabel("b"); ax2.set_ylabel("qi (per day)")
@@ -304,3 +306,169 @@ with tw_tabs[2]:
         st.pyplot(plot_type_curves(curves, lines, "water"))
 
 st.caption("Per-fluid workflow: forecast → B-factors & probits → Type Wells (P10/P50/P90 with faint historical lines).")
+
+# =========================== PDF REPORT ===========================
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.platypus import (
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
+)
+from reportlab.lib.utils import ImageReader
+
+def _df_to_table(df: pd.DataFrame, title: str, font_size: int = 7):
+    """Convert a DataFrame to a reportlab Table with small font and repeated header."""
+    if df is None or df.empty:
+        return [Paragraph(f"<b>{title}</b> — (no data)", getSampleStyleSheet()['Heading3']), Spacer(1,6)]
+
+    # Convert all values to strings to avoid formatting issues
+    df_str = df.copy()
+    for c in df_str.columns:
+        df_str[c] = df_str[c].astype(str)
+
+    data = [df_str.columns.tolist()] + df_str.values.tolist()
+    tbl = Table(data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ('FONTNAME',(0,0),(-1,-1),'Helvetica'),
+        ('FONTSIZE',(0,0),(-1,-1), font_size),
+        ('BACKGROUND',(0,0),(-1,0), colors.lightgrey),
+        ('GRID',(0,0),(-1,-1), 0.25, colors.grey),
+        ('VALIGN',(0,0),(-1,-1),'TOP'),
+        ('ALIGN',(0,0),(-1,-1),'LEFT'),
+        ('BOTTOMPADDING',(0,0),(-1,-1),3),
+        ('TOPPADDING',(0,0),(-1,-1),3),
+    ]))
+    return [Paragraph(f"<b>{title}</b>", getSampleStyleSheet()['Heading3']), tbl, Spacer(1,8)]
+
+def _save_fig(fig):
+    """Save a matplotlib fig to a temp PNG and return the path."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    fig.savefig(tmp.name, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return tmp.name
+
+def _logo_on_page(canvas, doc):
+    """Draw logo at top-right and page number bottom-right."""
+    # logo
+    try:
+        if os.path.exists(LOGO_PATH):
+            img = ImageReader(LOGO_PATH)
+            w, h = 0.9*inch, 0.9*inch
+            canvas.drawImage(img, doc.pagesize[0]-w-0.4*inch, doc.pagesize[1]-h-0.35*inch, width=w, height=h, preserveAspectRatio=True, mask='auto')
+    except Exception:
+        pass
+    # page number
+    page_num = canvas.getPageNumber()
+    canvas.setFont("Helvetica", 8)
+    canvas.drawRightString(doc.pagesize[0]-0.4*inch, 0.4*inch, f"Page {page_num}")
+
+def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
+    """Add all required tables/plots for a fluid to the report."""
+    styles = getSampleStyleSheet()
+    story.append(Paragraph(f"<b>{fluid}</b>", styles['Heading2']))
+    story.append(Spacer(1,6))
+
+    if on_key not in st.session_state:
+        story.append(Paragraph("(No data – run forecast first.)", styles['Normal']))
+        story.append(PageBreak())
+        return
+
+    oneline = st.session_state[on_key].copy()
+
+    # --- Oneline Table
+    story += _df_to_table(oneline, f"{fluid} — Oneline Table")
+
+    # --- B-Factor Table + Plots
+    cols = ['API10','WellName','qi (per day)','b','di (per month)','First-Year Decline (%)']
+    cols = [c for c in cols if c in oneline.columns]
+    btable = oneline[cols].copy().sort_values('b', ascending=False)
+    story += _df_to_table(btable, f"{fluid} — B-Factor Table")
+
+    color_map = {'Oil':'green','Gas':'red','Water':'blue'}
+    color = color_map[fluid]
+
+    if {'b','qi (per day)'}.issubset(oneline.columns):
+        # Histogram of b
+        fig1, ax1 = plt.subplots(figsize=(6.5,3.8))
+        ax1.hist(oneline['b'].dropna().values, bins=25, color=color, alpha=0.85)
+        ax1.set_xlabel("b"); ax1.set_ylabel("Count"); ax1.grid(True, linestyle="--", alpha=0.4)
+        story.append(Image(_save_fig(fig1), width=6.5*inch, height=3.8*inch))
+        # Scatter b vs qi
+        fig2, ax2 = plt.subplots(figsize=(6.5,3.8))
+        ax2.scatter(oneline['b'], oneline['qi (per day)'], s=12, color=color, alpha=0.85)
+        ax2.set_xlabel("b"); ax2.set_ylabel("qi (per day)")
+        ax2.grid(True, linestyle="--", alpha=0.4)
+        story.append(Image(_save_fig(fig2), width=6.5*inch, height=3.8*inch))
+        story.append(Spacer(1,8))
+
+    # --- Probit table + plot
+    if eur_col in oneline.columns:
+        eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
+        unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
+        stats = compute_eur_stats(eurs)
+        story += _df_to_table(eur_summary_table(fluid, stats, unit, int(st.session_state.get('norm_len_pdf', 10000))), f"{fluid} — Probit Table")
+
+        figp = probit_plot(eurs, unit, f"{fluid} EUR Probit", color=color.lower())
+        story.append(Image(_save_fig(figp), width=6.5*inch, height=4.2*inch))
+        story.append(Spacer(1,8))
+
+    # --- Type curve table + plot
+    if mo_key in st.session_state:
+        curves, lines = build_type_curves_and_lines(st.session_state[mo_key], fluid.lower())
+        # Build a small type-curve stats table (P10/P50/P90 @ month 12 and 24 if available)
+        if not curves.empty:
+            snap_months = [12, 24, 36]
+            rows = []
+            for m in snap_months:
+                row = curves[curves['t']==m]
+                if not row.empty:
+                    rr = row.iloc[0]
+                    rows.append([m, rr['P10'], rr['P50'], rr['P90']])
+            if rows:
+                df_tc = pd.DataFrame(rows, columns=["Month","P10","P50","P90"])
+                story += _df_to_table(df_tc, f"{fluid} — Type Curve Table")
+
+        figtc = plot_type_curves(curves, lines, fluid.lower())
+        story.append(Image(_save_fig(figtc), width=6.5*inch, height=4.0*inch))
+
+    story.append(PageBreak())
+
+# ============ PDF button ============
+st.session_state['norm_len_pdf'] = int(norm_len)  # pass to report builder
+
+if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_oneline"]):
+    if st.button("Generate PDF Report"):
+        # Build the PDF
+        tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        doc = SimpleDocTemplate(
+            tmp_pdf.name,
+            pagesize=letter,
+            leftMargin=0.5*inch, rightMargin=0.5*inch,
+            topMargin=0.6*inch, bottomMargin=0.6*inch
+        )
+        story = []
+
+        styles = getSampleStyleSheet()
+        story.append(Paragraph("<b>SE Oil & Gas Autoforecasting — Full Report</b>", styles['Title']))
+        story.append(Spacer(1, 8))
+
+        # Oil
+        _fluid_section(story, "Oil",   "Oil_oneline",   "Oil_monthly",   "EUR (Mbbl)")
+        # Gas
+        _fluid_section(story, "Gas",   "Gas_oneline",   "Gas_monthly",   "EUR (MMcf)")
+        # Water
+        _fluid_section(story, "Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
+
+        # Build with logo header per page
+        doc.build(story, onFirstPage=_logo_on_page, onLaterPages=_logo_on_page)
+
+        with open(tmp_pdf.name, "rb") as f:
+            st.download_button(
+                "Download PDF Report",
+                data=f.read(),
+                file_name="SE_autoforecast_report.pdf",
+                mime="application/pdf"
+            )
+else:
+    st.info("Run at least one forecast (Oil/Gas/Water) to enable the PDF report.")
