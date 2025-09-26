@@ -1,6 +1,8 @@
 # app.py — SE Oil & Gas Autoforecasting
 # UI: full workflow + enhanced B-factor analytics
 # PDF: 3 pages per fluid (B-factor / Probit / Type-curve) with header band for logo
+#      B-factor page uses a 2-column layout (plots left, stats table right)
+
 import os
 import tempfile
 from io import BytesIO
@@ -75,7 +77,7 @@ if st.button("Load / QC / Merge"):
             )
             prod_df = load_production(prod_file)
             st.session_state.header_qc = header_qc
-            st.session_state.prod_df = prod_df
+            st.session_state.prod_df   = prod_df
             pp_cfg = PreprocessConfig(
                 normalization_length=int(norm_len),
                 use_normalization=bool(use_norm)
@@ -464,7 +466,7 @@ def _logo_on_page(canvas, doc):
 def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     """
     Build 3 pages per fluid:
-      1) B-factor plots + stats table
+      1) B-factor plots (left) + stats table (right)
       2) Probit plot + probit table
       3) Type-curve table + plot
     """
@@ -478,15 +480,39 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
 
     oneline = st.session_state[on_key].copy()
 
-    # -------------------- PAGE 1: B-factor --------------------
+    # -------------------- PAGE 1: B-factor (2-column layout) --------------------
     story.append(Paragraph(f"<b>{fluid} — B-Factor Analytics</b>", styles['Heading2']))
+
+    # Build figures & stats
     hist_png, box_png, scatter_png, bstats = bfactor_analytics_figures(oneline, fluid, eur_col)
-    if hist_png:  story.append(Image(hist_png, width=6.5*inch, height=3.2*inch))
-    if box_png:   story.append(Image(box_png,  width=6.5*inch, height=1.0*inch))
+
+    # Left column: slimmer stacked plots (under the header band)
+    left_stack = []
+    if hist_png:
+        left_stack.append(Image(hist_png, width=4.2*inch, height=2.5*inch))
+        left_stack.append(Spacer(1, 4))
+    if box_png:
+        left_stack.append(Image(box_png,  width=4.2*inch, height=0.85*inch))
+        left_stack.append(Spacer(1, 4))
     if scatter_png:
-        story.append(Spacer(1, 6))
-        story.append(Image(scatter_png, width=6.5*inch, height=3.0*inch))
-    story += _df_to_table(bstats, f"{fluid} — b-factor statistics", font_size=7)
+        left_stack.append(Image(scatter_png, width=4.2*inch, height=2.3*inch))
+
+    # Right column: compact stats table (title + table)
+    right_stack = _df_to_table(bstats, f"{fluid} — b-factor statistics", font_size=7)
+
+    # Assemble a 2-column table: left = plots, right = stats
+    two_col = Table(
+        [[left_stack, right_stack]],
+        colWidths=[4.4*inch, 3.0*inch]
+    )
+    two_col.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'TOP'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 6),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+    ]))
+    story.append(two_col)
     story.append(PageBreak())
 
     # -------------------- PAGE 2: Probit ----------------------
