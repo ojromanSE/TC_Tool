@@ -1,6 +1,6 @@
 # app.py — SE Oil & Gas Autoforecasting
 # UI: full workflow + enhanced B-factor analytics
-# PDF: NO Oneline/B-factor tables (keeps plots + stats + probit + type curves)
+# PDF: 3 pages per fluid (B-factor / Probit / Type-curve) with header band for logo
 import os
 import tempfile
 from io import BytesIO
@@ -155,7 +155,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     stats_df = pd.DataFrame(stats_rows, columns=[f"{fluid} b-factor statistics", "value"])
 
     # ----- Histogram with markers -----
-    fig_h, axh = plt.subplots(figsize=(7.0, 3.8))
+    fig_h, axh = plt.subplots(figsize=(6.6, 3.4))
     axh.hist(b.values, bins=30, color=color, alpha=0.85, edgecolor='none')
     axh.set_xlabel("b-factor"); axh.set_ylabel("Number of wells")
     axh.grid(True, linestyle="--", alpha=0.35)
@@ -168,7 +168,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     hist_png = _save_fig(fig_h)
 
     # ----- Slim horizontal boxplot -----
-    fig_bx, axbx = plt.subplots(figsize=(7.0, 1.3))
+    fig_bx, axbx = plt.subplots(figsize=(6.6, 1.1))
     axbx.boxplot(b.values, vert=False, widths=0.5,
                  boxprops=dict(color='gray'),
                  whiskerprops=dict(color='gray'),
@@ -192,7 +192,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
             ss_tot = np.sum((y - y.mean())**2)
             r2 = 1.0 - ss_res/ss_tot if ss_tot>0 else np.nan
 
-            fig_s, axs = plt.subplots(figsize=(7.0, 4.0))
+            fig_s, axs = plt.subplots(figsize=(6.6, 3.2))
             axs.scatter(10**x, y, s=16, color=color, alpha=0.85)
             x_line = np.linspace(x.min(), x.max(), 200)
             axs.plot(10**x_line, a*x_line + c, linestyle='--', color='red', linewidth=1.8,
@@ -447,11 +447,12 @@ def _df_to_table(df: pd.DataFrame, title: str, font_size: int = 7):
     return [Paragraph(f"<b>{title}</b>", styles['Heading3']), tbl, Spacer(1,8)]
 
 def _logo_on_page(canvas, doc):
-    """Draw logo at top-right and page number bottom-right."""
+    """Draw logo at top-right and page number bottom-right, leaving a header band."""
     try:
         if os.path.exists(LOGO_PATH):
             img = ImageReader(LOGO_PATH)
             w, h = 0.9*inch, 0.9*inch
+            # Draw within header band (topMargin leaves space already)
             canvas.drawImage(img, doc.pagesize[0]-w-0.4*inch, doc.pagesize[1]-h-0.35*inch,
                              width=w, height=h, preserveAspectRatio=True, mask='auto')
     except Exception:
@@ -462,49 +463,51 @@ def _logo_on_page(canvas, doc):
 
 def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     """
-    PDF section per fluid WITHOUT the Oneline and B-factor tables.
-    Keeps:
-      - B-factor histogram + boxplot + b vs EUR (with R²) + stats table
-      - Probit table + Probit plot
-      - Type-curve table (snapshots) + Type-curve plot
+    Build 3 pages per fluid:
+      1) B-factor plots + stats table
+      2) Probit plot + probit table
+      3) Type-curve table + plot
     """
     styles = getSampleStyleSheet()
-    story.append(Paragraph(f"<b>{fluid}</b>", styles['Heading2']))
-    story.append(Spacer(1,6))
 
     if on_key not in st.session_state:
+        story.append(Paragraph(f"<b>{fluid}</b>", styles['Heading2']))
         story.append(Paragraph("(No data – run forecast first.)", styles['Normal']))
         story.append(PageBreak())
         return
 
     oneline = st.session_state[on_key].copy()
 
-    # --- B-Factor enhanced analytics (no B-factor table) ---
+    # -------------------- PAGE 1: B-factor --------------------
+    story.append(Paragraph(f"<b>{fluid} — B-Factor Analytics</b>", styles['Heading2']))
     hist_png, box_png, scatter_png, bstats = bfactor_analytics_figures(oneline, fluid, eur_col)
-    if hist_png:
-        story.append(Image(hist_png, width=6.5*inch, height=3.8*inch))
-    if box_png:
-        story.append(Image(box_png, width=6.5*inch, height=1.3*inch))
-    story.append(Spacer(1,8))
+    if hist_png:  story.append(Image(hist_png, width=6.5*inch, height=3.2*inch))
+    if box_png:   story.append(Image(box_png,  width=6.5*inch, height=1.0*inch))
     if scatter_png:
-        story.append(Image(scatter_png, width=6.5*inch, height=4.0*inch))
-    story += _df_to_table(bstats, f"{fluid} — b-factor statistics")
-    story.append(Spacer(1,8))
+        story.append(Spacer(1, 6))
+        story.append(Image(scatter_png, width=6.5*inch, height=3.0*inch))
+    story += _df_to_table(bstats, f"{fluid} — b-factor statistics", font_size=7)
+    story.append(PageBreak())
 
-    # --- Probit table + plot
+    # -------------------- PAGE 2: Probit ----------------------
+    story.append(Paragraph(f"<b>{fluid} — Probit</b>", styles['Heading2']))
     if eur_col in oneline.columns:
         eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
         unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
         stats = compute_eur_stats(eurs)
-        story += _df_to_table(
-            eur_summary_table(fluid, stats, unit, int(st.session_state.get('norm_len_pdf', 10000))),
-            f"{fluid} — Probit Table"
-        )
         figp = probit_plot(eurs, unit, f"{fluid} EUR Probit", color=_phase_color(fluid))
         story.append(Image(_save_fig(figp), width=6.5*inch, height=4.2*inch))
-        story.append(Spacer(1,8))
+        story += _df_to_table(
+            eur_summary_table(fluid, stats, unit, int(st.session_state.get('norm_len_pdf', 10000))),
+            f"{fluid} — Probit Table",
+            font_size=7
+        )
+    else:
+        story.append(Paragraph("No EUR column found for probit.", styles['Normal']))
+    story.append(PageBreak())
 
-    # --- Type curve snapshots table + plot
+    # -------------------- PAGE 3: Type Curve ------------------
+    story.append(Paragraph(f"<b>{fluid} — Type Curve</b>", styles['Heading2']))
     if mo_key in st.session_state:
         curves, lines = build_type_curves_and_lines(st.session_state[mo_key], fluid.lower())
         if not curves.empty:
@@ -517,10 +520,11 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
                     rows.append([m, rr['P10'], rr['P50'], rr['P90']])
             if rows:
                 df_tc = pd.DataFrame(rows, columns=["Month","P10","P50","P90"])
-                story += _df_to_table(df_tc, f"{fluid} — Type Curve Table")
+                story += _df_to_table(df_tc, f"{fluid} — Type Curve Table", font_size=7)
         figtc = plot_type_curves(curves, lines, fluid.lower())
         story.append(Image(_save_fig(figtc), width=6.5*inch, height=4.0*inch))
-
+    else:
+        story.append(Paragraph("No monthly data available for type-curve.", styles['Normal']))
     story.append(PageBreak())
 
 # ============ PDF button ============
@@ -529,16 +533,17 @@ st.session_state['norm_len_pdf'] = int(norm_len)  # pass to report builder
 if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_oneline"]):
     if st.button("Generate PDF Report"):
         tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        # Bigger top margin to create a HEADER BAND for the logo so nothing overlaps
         doc = SimpleDocTemplate(
             tmp_pdf.name,
             pagesize=letter,
             leftMargin=0.5*inch, rightMargin=0.5*inch,
-            topMargin=0.6*inch, bottomMargin=0.6*inch
+            topMargin=1.15*inch, bottomMargin=0.6*inch   # header band ~1.15"
         )
         story = []
 
         styles = getSampleStyleSheet()
-        story.append(Paragraph("<b>SE Oil & Gas Autoforecasting — Full Report</b>", styles['Title']))
+        story.append(Paragraph("<b>SE Oil & Gas Autoforecasting — Report</b>", styles['Title']))
         story.append(Spacer(1, 8))
 
         # Oil
