@@ -414,48 +414,25 @@ def _aggregate_daily_to_monthly(df: pd.DataFrame, com: str) -> pd.DataFrame:
     return g
 
 
-def forecast_one_well_daily(wd: pd.DataFrame, commodity: str,
-                            b_low: float, b_high: float, max_days: int,
-                            models: Dict[str, RandomForestRegressor]) -> Dict[str, object]:
-    """
-    Fit on DAILY Norm* series. Decline parameters are per-month, so convert
-    days to 'months' using 30.4375 day/month.
-    """
+def forecast_one_well_daily(wd: pd.DataFrame, commodity: str, b_low: float, b_high: float,
+                            max_days: int, models: Dict[str, RandomForestRegressor]) -> Dict[str, object]:
     commodity = commodity.lower()
-    col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[commodity]
+    col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[commodity]
 
-    wd = wd.sort_values('Day').copy()
-    t_hist_days = np.arange(len(wd), dtype=float)          # 0..N-1 days
-    t_hist = t_hist_days / 30.4375                         # months
-    y_hist = wd[col].values.astype(float)
-    y_s = _smooth(y_hist, 5)  # a touch more smoothing for daily
+    wd = wd.copy()
 
-    feats = np.array([[wd['NormOil'].mean(), wd['NormGas'].mean(), wd['NormWater'].mean()]], dtype=float)
-    peak_qi = float(np.nanmax(y_s)) if len(y_s)>0 else 1.0
-    peak_qi = min(peak_qi, 152000.0)
-    qi0 = min(peak_qi, max(float(models['qi'].predict(feats)[0]), 0.01))
-    b0  = float(models['b'].predict(feats)[0])
-    di0 = float(models['di'].predict(feats)[0])
+    # --- Ensure a date column exists ---
+    date_col = None
+    for cand in ['Day', 'Date', 'ReportDate', 'ProductionDate']:
+        if cand in wd.columns:
+            date_col = cand
+            break
+    if date_col is None:
+        raise KeyError("No date column found in daily data (expected Day, Date, or ReportDate).")
 
-    bounds = [(0.01, peak_qi*1.5), (b_low, b_high), (1e-6, 1.0)]
-    res = minimize(robust_loss, x0=[qi0,b0,di0], args=(t_hist, y_s),
-                   bounds=bounds, method='L-BFGS-B')
-    qi,b,di = map(float, res.x)
+    wd = wd.sort_values(date_col).copy()
+    wd['t_days'] = (pd.to_datetime(wd[date_col]) - pd.to_datetime(wd[date_col]).min()).dt.days.astype(float)
 
-    fit_hist = arps(qi,b,di,t_hist)
-    f_d, f_v = [], []
-    m = len(t_hist)   # continue from last day
-    while m < len(t_hist) + max_days:
-        q = float(arps(qi,b,di,np.array([m/30.4375],float))[0])
-        if q < 1e-6: break
-        f_d.append(m); f_v.append(q); m += 1
-
-    eur_hist = float(y_hist.sum())
-    eur_fcst = float(np.sum(f_v))
-    return dict(qi=qi, b=b, di=di, t_hist=t_hist, hist=y_hist,
-                fit_hist=fit_hist,
-                f_days=np.array(f_d,int), f_vals=np.array(f_v,float),
-                EUR_total=eur_hist+eur_fcst, EUR_fcst=eur_fcst)
 
 def forecast_all_daily(merged_daily: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
     com = cfg.commodity.lower()
