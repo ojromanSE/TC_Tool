@@ -27,15 +27,18 @@ HEADER_COLUMN_MAPS = [
     {'WellName':'Well Name','County':'County/Parish','LateralLength':'DI Lateral Length',
      'PrimaryFormation':'Producing Reservoir','CompletionDate':'Completion Date',
      'FirstProdDate':'First Prod Date','State':'State','API10':'API10'}
-]
 PROD_COLUMN_MAPS = [
     # WDB (monthly)
     {'WellName':'WellName','ReportDate':'ReportDate','TotalOil':'TotalOil',
      'TotalGas':'TotalGas','TotalWater':'TotalWater','API10':'API'},
     # DI / IHS (monthly)
     {'WellName':'Well Name','ReportDate':'Monthly Production Date','TotalOil':'Monthly Oil',
-     'TotalGas':'Monthly Gas','TotalWater':'Monthly Water','API10':'API10'}
+     'TotalGas':'Monthly Gas','TotalWater':'Monthly Water','API10':'API10'},
+    # Generic daily format
+    {'WellName':'WellName','ReportDate':'Date','TotalOil':'DailyOil',
+     'TotalGas':'DailyGas','TotalWater':'DailyWater','API10':'API'}
 ]
+
 
 # --- Daily production column maps (common variants) ---
 DAILY_PROD_COLUMN_MAPS = [
