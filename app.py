@@ -10,6 +10,45 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import streamlit as st
+def _map_daily_columns_ui(raw_df: pd.DataFrame) -> pd.DataFrame | None:
+    """
+    If auto-detect fails for the daily CSV, this UI lets you map columns manually.
+    Returns a standardized daily df or None if user hasn't confirmed yet.
+    """
+    st.warning("Couldn’t auto-detect daily columns. Map them below and click **Use these mappings**.")
+    cols = list(raw_df.columns)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        well_col = st.selectbox("Well name column", cols, key="mapdaily_well")
+        oil_col  = st.selectbox("Daily oil column", cols, key="mapdaily_oil")
+    with c2:
+        date_col = st.selectbox("Date column", cols, key="mapdaily_date")
+        gas_col  = st.selectbox("Daily gas column", cols, key="mapdaily_gas")
+    with c3:
+        water_col = st.selectbox("Daily water column", cols, key="mapdaily_water")
+
+    if st.button("Use these mappings", key="mapdaily_apply"):
+        df = raw_df.rename(columns={
+            well_col:  'WellName',
+            date_col:  'Date',
+            oil_col:   'DailyOil',
+            gas_col:   'DailyGas',
+            water_col: 'DailyWater',
+        })[['WellName','Date','DailyOil','DailyGas','DailyWater']].copy()
+
+        # Standardize
+        df['WellName'] = df['WellName'].astype(str).str.strip()
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+        for c in ('DailyOil','DailyGas','DailyWater'):
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+
+        df = df.dropna(subset=['Date'])
+        st.success(f"Daily file mapped: {df['WellName'].nunique()} wells, {len(df)} rows.")
+        st.dataframe(df.head(20), use_container_width=True)
+        return df
+
+    return None
 
 from core import (
     load_header, load_production, load_production_daily, fill_lateral_by_geo,
