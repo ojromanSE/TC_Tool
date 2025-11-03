@@ -1,4 +1,4 @@
-# app.py — SE Oil & Gas Autoforecasting (daily-capable)
+# app.py — SE Oil & Gas Autoforecasting (hybrid daily+monthly, daily preferred per well)
 
 import os
 import tempfile
@@ -14,8 +14,8 @@ import streamlit as st
 from core import (
     load_header, load_production, load_production_daily, fill_lateral_by_geo,
     preprocess, PreprocessConfig, preprocess_daily, PreprocessDailyConfig,
-    forecast_all, ForecastConfig, forecast_all_daily,
-    plot_one_well, forecast_one_well, _train_rf,
+    forecast_all, ForecastConfig, forecast_all_daily, forecast_all_hybrid,
+    plot_one_well, forecast_one_well, _train_rf, _train_rf_hybrid,
     compute_eur_stats, probit_plot, eur_summary_table
 )
 
@@ -47,13 +47,6 @@ with st.sidebar:
     lat_col = st.text_input("Latitude column (optional QC)", value="Latitude")
     lon_col = st.text_input("Longitude column (optional QC)", value="Longitude")
     bin_decimals = st.number_input("Geo Bin Decimals", 0, 4, 2)
-    st.markdown("---")
-    st.subheader("Forecast Data Frequency")
-    freq_choice = st.radio(
-        "Use…",
-        options=["Auto (prefer daily if uploaded)", "Monthly only", "Daily if available"],
-        index=0
-    )
     st.markdown("---")
     if st.button("Reset All"):
         for k in list(st.session_state.keys()):
@@ -135,10 +128,6 @@ if st.button("Load / QC / Merge"):
             prod_df  = load_production(BytesIO(prod_file.getvalue())) if prod_file else None
             daily_df = load_production_daily(BytesIO(daily_file.getvalue())) if daily_file else None
 
-            st.session_state.header_qc = header_qc
-            st.session_state.prod_df   = prod_df
-            st.session_state.daily_df  = daily_df
-
             # Build merged datasets
             pp_cfg_m = PreprocessConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
             pp_cfg_d = PreprocessDailyConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
@@ -146,27 +135,46 @@ if st.button("Load / QC / Merge"):
             merged_m = preprocess(header_qc, prod_df, pp_cfg_m) if prod_df is not None else None
             merged_d = preprocess_daily(header_qc, daily_df, pp_cfg_d) if daily_df is not None else None
 
+            # ---------- Store merged datasets ----------
             if merged_m is not None:
                 st.session_state.merged_monthly = merged_m
             if merged_d is not None:
                 st.session_state.merged_daily = merged_d
+            st.session_state.header_qc = header_qc
+            st.session_state.prod_df   = prod_df
+            st.session_state.daily_df  = daily_df
 
-            # Decide which dataset to use for forecasting
-            use_daily = (
-                (freq_choice == "Daily if available" and merged_d is not None) or
-                (freq_choice == "Auto (prefer daily if uploaded)" and merged_d is not None and merged_m is None)
-            )
-            st.session_state.use_daily_for_forecast = bool(use_daily)
-
-            if use_daily:
-                st.session_state.merged = merged_d
-                st.success(f"Merged DAILY: {len(merged_d['API10'].unique())} wells and {len(merged_d)} daily rows.")
+            # ---------- Build a combined picker dataset (prefer daily) ----------
+            daily_apis = set()
+            if merged_d is not None and not merged_d.empty:
+                daily_apis = set(merged_d['API10'].astype(str).unique())
+                daily_picker = (merged_d
+                    .groupby(['API10','WellName','MonthYear'], as_index=False)[['NormOil','NormGas','NormWater']].sum())
             else:
-                if merged_m is None:
-                    st.warning("No monthly data available; upload monthly data or switch forecast to daily.")
+                daily_picker = pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
+
+            if merged_m is not None and not merged_m.empty:
+                monthly_picker = merged_m[~merged_m['API10'].astype(str).isin(daily_apis)][
+                    ['API10','WellName','MonthYear','NormOil','NormGas','NormWater']
+                ].copy()
+            else:
+                monthly_picker = pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
+
+            picker_df = pd.concat([daily_picker, monthly_picker], ignore_index=True)
+
+            st.session_state.daily_api_set = daily_apis
+            st.session_state.merged = picker_df  # used for per-well selection UI
+
+            # User feedback
+            if not picker_df.empty:
+                wells = len(picker_df['API10'].astype(str).unique())
+                if daily_apis:
+                    st.success(f"Hybrid ready. {len(daily_apis)} wells will use DAILY, others MONTHLY. Total wells: {wells}.")
                 else:
-                    st.session_state.merged = merged_m
-                    st.success(f"Merged MONTHLY: {len(merged_m['API10'].unique())} wells and {len(merged_m)} monthly rows.")
+                    st.success(f"Using MONTHLY only. Total wells: {wells}.")
+            else:
+                st.warning("No valid rows found after preprocessing.")
+
         except Exception as e:
             st.exception(e)
 
@@ -180,7 +188,7 @@ if "daily_df" in st.session_state and st.session_state["daily_df"] is not None:
     with st.expander("Preview: Production (Daily)"):
         st.dataframe(format_df_2dec(st.session_state.daily_df.head(20)), use_container_width=True)
 if "merged" in st.session_state:
-    with st.expander("Preview: Merged (active)"):
+    with st.expander("Preview: Merged (active for picker; daily preferred)"):
         st.dataframe(format_df_2dec(st.session_state.merged.head(20)), use_container_width=True)
 
 st.markdown("---")
@@ -321,22 +329,24 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
 
     disabled = "merged" not in st.session_state
     if st.button(f"Run {fluid_name} Forecast", disabled=disabled):
-        merged_key = 'merged_daily' if st.session_state.get('use_daily_for_forecast') else 'merged_monthly'
-        merged = st.session_state.get(merged_key)
-        if merged is None:
-            st.error("No data available for the selected frequency.")
+        merged_m = st.session_state.get('merged_monthly')
+        merged_d = st.session_state.get('merged_daily')
+        cfg = ForecastConfig(
+            commodity=fluid_name.lower(),
+            b_low=float(b_low), b_high=float(b_high), max_months=600
+        )
+        if merged_m is not None and not merged_m.empty and merged_d is not None and not merged_d.empty:
+            oneline, monthly = forecast_all_hybrid(merged_m, merged_d, cfg)
+        elif merged_d is not None and not merged_d.empty:
+            oneline, monthly = forecast_all_daily(merged_d, cfg)
+        elif merged_m is not None and not merged_m.empty:
+            oneline, monthly = forecast_all(merged_m, cfg)
         else:
-            cfg = ForecastConfig(
-                commodity=fluid_name.lower(),
-                b_low=float(b_low), b_high=float(b_high), max_months=600
-            )
-            if st.session_state.get('use_daily_for_forecast'):
-                oneline, monthly = forecast_all_daily(merged, cfg)
-            else:
-                oneline, monthly = forecast_all(merged, cfg)
-            st.session_state[f"{fluid_name}_oneline"] = oneline
-            st.session_state[f"{fluid_name}_monthly"] = monthly
-            st.success(f"{fluid_name} forecast completed for {oneline.shape[0]} wells.")
+            st.error("No data available to forecast.")
+            return
+        st.session_state[f"{fluid_name}_oneline"] = oneline
+        st.session_state[f"{fluid_name}_monthly"] = monthly
+        st.success(f"{fluid_name} forecast completed for {oneline.shape[0]} wells.")
 
     on_key = f"{fluid_name}_oneline"
     mo_key = f"{fluid_name}_monthly"
@@ -391,12 +401,12 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit", color=_phase_color(fluid_name))
                 st.pyplot(fig)
 
-        # Per-well plot (use merged for picker; fit/plot on *monthly* view)
+        # Per-well plot (use hybrid picker; plot on monthly axis)
         st.subheader(f"{fluid_name} — Per-well Plot")
-        merged = st.session_state.merged
-        base = merged[['API10']].astype({'API10': str}).copy()
-        if 'WellName' in merged.columns:
-            base['WellName'] = merged['WellName'].astype(str)
+        picker = st.session_state.merged
+        base = picker[['API10']].astype({'API10': str}).copy()
+        if 'WellName' in picker.columns:
+            base['WellName'] = picker['WellName'].astype(str)
         else:
             base['WellName'] = base['API10']
         opts = base.dropna().drop_duplicates()
@@ -414,22 +424,25 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             key=f"{fluid_name}_plot_pick"
         )
         pick_api = label_to_api[pick_label]
-        wd = merged[merged['API10'].astype(str) == str(pick_api)]
 
-        # train models on the active merged set
-        models = _train_rf(merged, norm_col_for_models)
+        daily_api_set = st.session_state.get('daily_api_set', set())
+        is_daily = pick_api in daily_api_set
 
-        # Always plot on monthly axis in the UI for consistency
-        # If we are using daily merged data, aggregate wd to monthly before fitting
-        if st.session_state.get('use_daily_for_forecast'):
-            wd_m = wd.copy()
+        merged_m = st.session_state.get('merged_monthly')
+        merged_d = st.session_state.get('merged_daily')
+
+        models = _train_rf_hybrid(merged_m, merged_d, norm_col_for_models)
+
+        if is_daily:
+            wd_d = merged_d[merged_d['API10'].astype(str) == pick_api]
             vol_col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[fluid_name.lower()]
-            wd_m = (wd_m.groupby(['API10','WellName','MonthYear'], as_index=False)[vol_col].sum())
+            wd_m = (wd_d.groupby(['API10','WellName','MonthYear'], as_index=False)[vol_col].sum())
             fc = forecast_one_well(wd_m, fluid_name.lower(), float(b_low), float(b_high), 600, models)
             fig = plot_one_well(wd_m, fc, fluid_name.lower())
         else:
-            fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
-            fig = plot_one_well(wd, fc, fluid_name.lower())
+            wd_m = merged_m[merged_m['API10'].astype(str) == pick_api]
+            fc = forecast_one_well(wd_m, fluid_name.lower(), float(b_low), float(b_high), 600, models)
+            fig = plot_one_well(wd_m, fc, fluid_name.lower())
         st.pyplot(fig, clear_figure=True)
 
 # ================= Per-fluid sections =================
@@ -616,6 +629,7 @@ st.session_state['norm_len_pdf'] = int(norm_len)
 if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_oneline"]):
     if st.button("Generate PDF Report"):
         tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        from reportlab.platypus import SimpleDocTemplate
         doc = SimpleDocTemplate(
             tmp_pdf.name,
             pagesize=letter,
