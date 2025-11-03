@@ -56,13 +56,11 @@ with st.sidebar:
 def _fmt2(value) -> str:
     """Format any numeric-like value to 2 decimals; leave text as-is; blank for NaN."""
     try:
-        # Try numeric conversion
         f = float(value)
         if np.isfinite(f):
             return f"{f:.2f}"
         return ""
     except Exception:
-        # Non-numeric -> keep original text
         return "" if value is None else str(value)
 
 def format_df_2dec(df: pd.DataFrame) -> pd.DataFrame:
@@ -260,7 +258,7 @@ def plot_type_curves(curves: pd.DataFrame, lines, fluid: str):
     ax.set_xlabel("Months since first production")
     ax.set_ylabel(f"Monthly {fluid.lower()} (normalized units)")
     ax.set_yscale('log')
-    ax.set_ylim(bottom=1)  # start at 10^0
+    ax.set_ylim(bottom=1)
     ax.grid(True, linestyle='--', alpha=0.4, which='both')
     ax.legend()
     fig.tight_layout()
@@ -330,6 +328,9 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 st.info("Run the forecast to populate EURs.")
             else:
                 eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
+                # For Gas, multiply by 1000 for display but keep unit as MMcf as requested
+                if fluid_name == "Gas" or eur_col == "EUR (MMcf)":
+                    eurs = [x * 1000 if x is not None else None for x in eurs]
                 unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
                 stats = compute_eur_stats(eurs)
                 st.dataframe(
@@ -379,10 +380,14 @@ st.markdown("---")
 # ================= Final: Type Wells summary + P10/P50/P90 plots =================
 st.header("Type Wells — Summary (End)")
 
-def _eurs_from_oneline(df: pd.DataFrame, col: str) -> list[float]:
+def _eurs_from_oneline(df: pd.DataFrame, col: str, fluid: str = None) -> list[float]:
     if df is None or df.empty or col not in df.columns:
         return []
-    return pd.to_numeric(df[col], errors="coerce").astype(float).tolist()
+    eur_list = pd.to_numeric(df[col], errors="coerce").astype(float).tolist()
+    # For Gas, apply *1000 for display
+    if fluid and fluid.lower() == "gas":
+        eur_list = [x * 1000 if x is not None else None for x in eur_list]
+    return eur_list
 
 tw_tabs = st.tabs(["Oil", "Gas", "Water"])
 
@@ -404,7 +409,7 @@ with tw_tabs[1]:
     if on_key not in st.session_state:
         st.info("Run Gas first.")
     else:
-        eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (MMcf)")
+        eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (MMcf)", "Gas")
         stats_g = compute_eur_stats(eurs)
         st.dataframe(format_df_2dec(eur_summary_table("Gas", stats_g, "MMcf", int(norm_len))), use_container_width=True)
         curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "gas")
@@ -443,7 +448,7 @@ def _df_to_table(df: pd.DataFrame, title: str, font_size: int = 7):
     if df is None or df.empty:
         return [Paragraph(f"<b>{title}</b> — (no data)", styles['Heading3']), Spacer(1,6)]
 
-    df_str = format_df_2dec(df)  # <- enforce 2-dec formatting on every cell
+    df_str = format_df_2dec(df)
 
     data = [df_str.columns.tolist()] + df_str.values.tolist()
     tbl = Table(data, repeatRows=1)
@@ -525,6 +530,9 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     story.append(Paragraph(f"<b>{fluid} — Probit</b>", styles['Heading2']))
     if eur_col in oneline.columns:
         eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
+        # For Gas, multiply by 1000 for display but keep unit as MMcf as requested
+        if fluid.lower() == "gas" or eur_col == "EUR (MMcf)":
+            eurs = [x * 1000 if x is not None else None for x in eurs]
         unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
         stats = compute_eur_stats(eurs)
         figp = probit_plot(eurs, unit, f"{fluid} EUR Probit", color=_phase_color(fluid))
@@ -543,6 +551,9 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     if mo_key in st.session_state and on_key in st.session_state:
         oneline_df = st.session_state[on_key]
         eurs = pd.to_numeric(oneline_df[eur_col], errors="coerce").astype(float).tolist()
+        # For Gas, multiply by 1000 for display but keep unit as MMcf as requested
+        if fluid.lower() == "gas" or eur_col == "EUR (MMcf)":
+            eurs = [x * 1000 if x is not None else None for x in eurs]
         unit = "Mbbl" if "Mbbl" in eur_col else "MMcf" if "MMcf" in eur_col else "Mbbl"
         stats = compute_eur_stats(eurs)
         df_tc = eur_summary_table(fluid, stats, unit, int(st.session_state.get('norm_len_pdf', 10000)))
@@ -565,7 +576,7 @@ if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_onelin
             tmp_pdf.name,
             pagesize=letter,
             leftMargin=0.5*inch, rightMargin=0.5*inch,
-            topMargin=1.15*inch, bottomMargin=0.6*inch   # header band for logo
+            topMargin=1.15*inch, bottomMargin=0.6*inch
         )
         story = []
 
