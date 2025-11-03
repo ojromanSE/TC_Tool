@@ -1,7 +1,5 @@
-# app.py — SE Oil & Gas Autoforecasting
-# Tables: force EXACTLY 2 decimals everywhere (UI + PDF)
-# PDF: 3 pages per fluid (B-factor/Probit/Type-curve) with header band + logo
-#      B-factor page uses a 2-column layout (plots left, stats table right)
+# app.py — SE Oil & Gas Autoforecasting (hybrid daily + monthly)
+# Fully updated
 
 import os
 import tempfile
@@ -9,23 +7,27 @@ from io import BytesIO
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # safe headless backend for Streamlit
 import matplotlib.pyplot as plt
 import streamlit as st
 
 from core import (
-    load_header, load_production, fill_lateral_by_geo,
-    preprocess, PreprocessConfig, forecast_all, ForecastConfig,
-    plot_one_well, forecast_one_well, _train_rf,
+    load_header, load_production, load_production_daily, fill_lateral_by_geo,
+    preprocess, PreprocessConfig, preprocess_daily, PreprocessDailyConfig,
+    forecast_all, ForecastConfig, forecast_all_daily, forecast_all_hybrid,
+    plot_one_well, forecast_one_well, _train_rf, _train_rf_hybrid,
     compute_eur_stats, probit_plot, eur_summary_table
 )
 
-# ---------- PAGE CONFIG (must be first Streamlit call) ----------
+# ---------- PAGE CONFIG ----------
 st.set_page_config(page_title="SE Tool", layout="wide")
 
 # ---------- Paths / constants ----------
-LOGO_PATH = os.path.join("static", "logo.png")  # ensure tc_tool/static/logo.png exists
+LOGO_PATH = os.path.join("static", "logo.png")
+_TMP_PNGS: list[str] = []  # track temp images created for PDF
 
-# ---------- Top header with logo (left) + status/title (right) ----------
+# ---------- Top header ----------
 cols = st.columns([0.12, 0.88])
 with cols[0]:
     if os.path.exists(LOGO_PATH):
@@ -34,7 +36,7 @@ with cols[1]:
     st.success("All Systems Working")
     st.title("SE Oil & Gas Autoforecasting")
 
-# ================= Sidebar: global params =================
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Global Parameters")
     norm_len = st.number_input("Normalization Length (ft)", 1000, 30000, 10000, step=500)
@@ -52,21 +54,17 @@ with st.sidebar:
             del st.session_state[k]
         st.experimental_rerun()
 
-# ================= Formatting helpers (2 decimals everywhere) =================
+# ---------- Helpers ----------
 def _fmt2(value) -> str:
-    """Format any numeric-like value to 2 decimals; leave text as-is; blank for NaN."""
     try:
-        # Try numeric conversion
         f = float(value)
         if np.isfinite(f):
             return f"{f:.2f}"
         return ""
     except Exception:
-        # Non-numeric -> keep original text
         return "" if value is None else str(value)
 
 def format_df_2dec(df: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy with EVERY cell rendered to a string w/ exactly 2 decimals for numerics."""
     if df is None or df.empty:
         return df
     out = df.copy()
@@ -81,24 +79,46 @@ def _save_fig(fig, dpi=220):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     fig.savefig(tmp.name, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
+    _TMP_PNGS.append(tmp.name)
     return tmp.name
 
-# ================= Upload & Prepare Data =================
+# ======================================================
+# ============ Upload & Prepare Data ===================
+# ======================================================
 st.header("Upload & Prepare Data")
-c1, c2 = st.columns(2)
+c1, c2, c3 = st.columns(3)
 with c1:
     header_file = st.file_uploader("Header CSV", type=["csv"], key="header_csv")
 with c2:
-    prod_file   = st.file_uploader("Production CSV", type=["csv"], key="prod_csv")
+    prod_file   = st.file_uploader("Production CSV (Monthly)", type=["csv"], key="prod_csv")
+with c3:
+    daily_file  = st.file_uploader("Production CSV (Daily, optional)", type=["csv"], key="daily_csv")
+
+with st.expander("Daily production CSV template"):
+    tmp_daily = pd.DataFrame({
+        "WellName": ["Sample 1","Sample 1","Sample 2"],
+        "Date": ["2023-01-01","2023-01-02","2023-01-01"],
+        "DailyOil": [120.0, 115.0, 80.0],
+        "DailyGas": [800.0, 780.0, 500.0],
+        "DailyWater": [30.0, 31.0, 20.0],
+        "API": ["12345678901234","12345678901234","98765432109876"]  # API or API14 OK
+    })
+    st.dataframe(format_df_2dec(tmp_daily), use_container_width=True)
+    st.download_button(
+        "Download daily template CSV",
+        tmp_daily.to_csv(index=False).encode("utf-8"),
+        file_name="daily_production_template.csv",
+        mime="text/csv"
+    )
 
 if st.button("Load / QC / Merge"):
-    if not header_file or not prod_file:
-        st.error("Please upload both Header and Production CSV files.")
+    if not header_file or (not prod_file and not daily_file):
+        st.error("Please upload Header and at least one Production file (Monthly or Daily).")
     else:
         try:
             header_bytes = header_file.getvalue()
             header_df = load_header(BytesIO(header_bytes))   # mapped columns
-            raw_hdr   = pd.read_csv(BytesIO(header_bytes))   # raw columns (for lat/lon)
+            raw_hdr   = pd.read_csv(BytesIO(header_bytes))   # raw (for lat/lon passthrough)
             for col in [lat_col, lon_col]:
                 if col in raw_hdr.columns and col not in header_df.columns:
                     header_df[col] = raw_hdr[col]
@@ -106,33 +126,105 @@ if st.button("Load / QC / Merge"):
                 header_df, lat_col=lat_col, lon_col=lon_col,
                 lateral_col='LateralLength', decimals=int(bin_decimals)
             )
-            prod_df = load_production(prod_file)
+
+            # Load monthly and/or daily with correct loaders
+            prod_df  = load_production(BytesIO(prod_file.getvalue())) if prod_file else None
+            daily_df = load_production_daily(BytesIO(daily_file.getvalue())) if daily_file else None
+
+            # Preprocess with the right preprocessors
+            pp_cfg_m = PreprocessConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
+            pp_cfg_d = PreprocessDailyConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
+
+            merged_m = preprocess(header_qc, prod_df, pp_cfg_m) if prod_df is not None else None
+            merged_d = preprocess_daily(header_qc, daily_df, pp_cfg_d) if daily_df is not None else None
+
+            # ---------- Store merged datasets ----------
+            st.session_state.merged_monthly = merged_m
+            st.session_state.merged_daily   = merged_d
             st.session_state.header_qc = header_qc
             st.session_state.prod_df   = prod_df
-            pp_cfg = PreprocessConfig(
-                normalization_length=int(norm_len),
-                use_normalization=bool(use_norm)
-            )
-            merged = preprocess(header_qc, prod_df, pp_cfg)
-            if merged.empty:
-                st.warning("No rows after preprocessing. Check your inputs.")
+            st.session_state.daily_df  = daily_df
+
+            # ---------- Build a combined picker dataset (prefer daily) ----------
+            daily_apis = set()
+
+            def _build_daily_picker(df: pd.DataFrame) -> pd.DataFrame:
+                """Make a daily-preferred picker frame robustly (guarantee required cols)."""
+                if df is None or df.empty:
+                    return pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
+
+                dd = df.copy()
+
+                # Ensure MonthYear exists
+                if 'MonthYear' not in dd.columns:
+                    date_col = None
+                    for name in ['Day','Date','ReportDate','ProductionDate']:
+                        if name in dd.columns:
+                            date_col = name; break
+                    if date_col is None:
+                        return pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
+                    dd['MonthYear'] = pd.to_datetime(dd[date_col]).dt.to_period('M')
+
+                if 'WellName' not in dd.columns:
+                    dd['WellName'] = dd.get('API10', '').astype(str)
+
+                for c in ('NormOil','NormGas','NormWater'):
+                    if c not in dd.columns:
+                        dd[c] = np.nan
+
+                out = (dd.groupby(['API10','WellName','MonthYear'], as_index=False)[['NormOil','NormGas','NormWater']].sum())
+                return out
+
+            # Daily picker (if any daily)
+            if merged_d is not None and not merged_d.empty:
+                daily_apis = set(merged_d['API10'].astype(str).unique())
+                daily_picker = _build_daily_picker(merged_d)
             else:
-                st.session_state.merged = merged
-                st.success(f"Merged {len(merged['API10'].unique())} wells and {len(merged)} monthly rows.")
+                daily_picker = pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
+
+            # Monthly picker (drop wells that also have daily)
+            if merged_m is not None and not merged_m.empty:
+                monthly_picker = merged_m[~merged_m['API10'].astype(str).isin(daily_apis)][
+                    ['API10','WellName','MonthYear','NormOil','NormGas','NormWater']
+                ].copy()
+            else:
+                monthly_picker = pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
+
+            picker_df = pd.concat([daily_picker, monthly_picker], ignore_index=True)
+
+            st.session_state.daily_api_set = daily_apis
+            st.session_state.merged = picker_df  # used for per-well selection UI
+
+            # User feedback
+            if not picker_df.empty:
+                wells = len(picker_df['API10'].astype(str).unique())
+                if daily_apis:
+                    st.success(f"Hybrid ready. {len(daily_apis)} wells will use DAILY, others MONTHLY. Total wells: {wells}.")
+                else:
+                    st.success(f"Using MONTHLY only. Total wells: {wells}.")
+            else:
+                st.warning("No valid rows found after preprocessing.")
+
         except Exception as e:
             st.exception(e)
 
-if "merged" in st.session_state:
+# ------- Optional previews --------
+if "header_qc" in st.session_state:
     with st.expander("Preview: Header (QC’d)"):
         st.dataframe(format_df_2dec(st.session_state.header_qc.head(20)), use_container_width=True)
-    with st.expander("Preview: Production"):
+if "prod_df" in st.session_state and st.session_state["prod_df"] is not None:
+    with st.expander("Preview: Production (Monthly)"):
         st.dataframe(format_df_2dec(st.session_state.prod_df.head(20)), use_container_width=True)
-    with st.expander("Preview: Merged"):
+if "daily_df" in st.session_state and st.session_state["daily_df"] is not None:
+    with st.expander("Preview: Production (Daily)"):
+        st.dataframe(format_df_2dec(st.session_state.daily_df.head(20)), use_container_width=True)
+if "merged" in st.session_state:
+    with st.expander("Preview: Merged (active for picker; daily preferred)"):
         st.dataframe(format_df_2dec(st.session_state.merged.head(20)), use_container_width=True)
 
 st.markdown("---")
 
-# ---------- B-factor analytics (hist + box + scatter + stats) ----------
+# ---------- B-factor analytics ----------
 def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     color = _phase_color(fluid)
     df = oneline.copy()
@@ -142,7 +234,6 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
 
     b = pd.to_numeric(df['b'], errors='coerce').dropna().astype(float)
 
-    # stats
     P10 = float(np.percentile(b, 10))
     P25 = float(np.percentile(b, 25))
     P50 = float(np.percentile(b, 50))
@@ -169,7 +260,6 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     ]
     stats_df = pd.DataFrame(stats_rows, columns=[f"{fluid} b-factor statistics", "value"])
 
-    # Histogram
     fig_h, axh = plt.subplots(figsize=(6.6, 3.4))
     axh.hist(b.values, bins=30, color=color, alpha=0.85, edgecolor='none')
     axh.set_xlabel("b-factor"); axh.set_ylabel("Number of wells")
@@ -182,7 +272,6 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     axh.legend(loc="upper right", fontsize=8, frameon=False)
     hist_png = _save_fig(fig_h)
 
-    # Boxplot
     fig_bx, axbx = plt.subplots(figsize=(6.6, 1.1))
     axbx.boxplot(b.values, vert=False, widths=0.5,
                  boxprops=dict(color='gray'),
@@ -193,7 +282,6 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     axbx.grid(True, axis='x', linestyle='--', alpha=0.35)
     box_png = _save_fig(fig_bx)
 
-    # Scatter b vs EUR
     scatter_png = None
     if eur_col in df.columns:
         eur = pd.to_numeric(df[eur_col], errors='coerce')
@@ -224,7 +312,7 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
 # ---------- Type curve helpers ----------
 def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
     vol_col = f"Monthly_{com}_volume"
-    if monthly_df.empty or vol_col not in monthly_df.columns:
+    if monthly_df is None or monthly_df.empty or vol_col not in monthly_df.columns:
         return pd.DataFrame(columns=['t','P10','P50','P90']), []
     hist = monthly_df[monthly_df['Segment'] == 'Historical'][['API10','Date',vol_col]].dropna().copy()
     hist = hist.sort_values(['API10','Date'])
@@ -260,24 +348,35 @@ def plot_type_curves(curves: pd.DataFrame, lines, fluid: str):
     ax.set_xlabel("Months since first production")
     ax.set_ylabel(f"Monthly {fluid.lower()} (normalized units)")
     ax.set_yscale('log')
-    ax.set_ylim(bottom=1)  # start at 10^0
+    ax.set_ylim(bottom=1)
     ax.grid(True, linestyle='--', alpha=0.4, which='both')
     ax.legend()
     fig.tight_layout()
     return fig
 
-# ================= Per-fluid UI block =================
+# ======================================================
+# ============ Forecasting UI per fluid ================
+# ======================================================
 def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
     st.header(f"{fluid_name} — Run & Analyze")
 
     disabled = "merged" not in st.session_state
     if st.button(f"Run {fluid_name} Forecast", disabled=disabled):
-        merged = st.session_state.merged
+        merged_m = st.session_state.get('merged_monthly')
+        merged_d = st.session_state.get('merged_daily')
         cfg = ForecastConfig(
             commodity=fluid_name.lower(),
             b_low=float(b_low), b_high=float(b_high), max_months=600
         )
-        oneline, monthly = forecast_all(merged, cfg)
+        if merged_m is not None and not merged_m.empty and merged_d is not None and not merged_d.empty:
+            oneline, monthly = forecast_all_hybrid(merged_m, merged_d, cfg)
+        elif merged_d is not None and not merged_d.empty:
+            oneline, monthly = forecast_all_daily(merged_d, cfg)
+        elif merged_m is not None and not merged_m.empty:
+            oneline, monthly = forecast_all(merged_m, cfg)
+        else:
+            st.error("No data available to forecast.")
+            return
         st.session_state[f"{fluid_name}_oneline"] = oneline
         st.session_state[f"{fluid_name}_monthly"] = monthly
         st.success(f"{fluid_name} forecast completed for {oneline.shape[0]} wells.")
@@ -293,15 +392,12 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             f"Probit ({fluid_name})",
         ])
 
-        # Oneline
         with tab1:
             st.dataframe(format_df_2dec(st.session_state[on_key]), use_container_width=True)
 
-        # Monthly
         with tab2:
             st.dataframe(format_df_2dec(st.session_state[mo_key]), use_container_width=True)
 
-        # B-Factor analytics + table
         with tab3:
             oneline = st.session_state[on_key]
             cols = ['API10','WellName','qi (per day)','b','di (per month)','First-Year Decline (%)']
@@ -323,7 +419,6 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 if box_png: st.image(box_png, caption="b-factor boxplot")
                 st.dataframe(format_df_2dec(bstats), use_container_width=True)
 
-        # Probit
         with tab4:
             oneline = st.session_state[on_key]
             if eur_col not in oneline.columns:
@@ -339,22 +434,19 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit", color=_phase_color(fluid_name))
                 st.pyplot(fig)
 
-        # Per-well plot
+        # ---------- Per-well Plot (robust; daily preferred) ----------
         st.subheader(f"{fluid_name} — Per-well Plot")
-        merged = st.session_state.merged
-        base = merged[['API10']].astype({'API10': str}).copy()
-        if 'WellName' in merged.columns:
-            base['WellName'] = merged['WellName'].astype(str)
+        picker = st.session_state.merged
+        base = picker[['API10']].astype({'API10': str}).copy()
+        if 'WellName' in picker.columns:
+            base['WellName'] = picker['WellName'].astype(str)
         else:
             base['WellName'] = base['API10']
         opts = base.dropna().drop_duplicates()
-
-        def make_label(r):
-            wn = (r['WellName'] or "").strip()
-            ap = r['API10']
-            return wn if wn and wn != ap else f"API {ap}"
-
-        opts['label'] = opts.apply(make_label, axis=1)
+        opts['label'] = opts.apply(
+            lambda r: r['WellName'] if (r['WellName'] and r['WellName'] != r['API10']) else f"API {r['API10']}",
+            axis=1
+        )
         label_to_api = dict(zip(opts['label'], opts['API10']))
         pick_label = st.selectbox(
             f"Pick Well ({fluid_name})",
@@ -362,18 +454,48 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             key=f"{fluid_name}_plot_pick"
         )
         pick_api = label_to_api[pick_label]
-        wd = merged[merged['API10'].astype(str) == str(pick_api)]
-        models = _train_rf(merged, norm_col_for_models)
-        fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
-        fig = plot_one_well(wd, fc, fluid_name.lower())
+
+        daily_api_set = st.session_state.get('daily_api_set', set())
+        is_daily = pick_api in daily_api_set
+
+        merged_m = st.session_state.get('merged_monthly')
+        merged_d = st.session_state.get('merged_daily')
+
+        models = _train_rf_hybrid(merged_m, merged_d, norm_col_for_models)
+
+        if is_daily and merged_d is not None:
+            wd_d = merged_d[merged_d['API10'].astype(str) == pick_api].copy()
+            # ensure MonthYear exists
+            if 'MonthYear' not in wd_d.columns:
+                date_col = None
+                for c in ['Date','Day','ReportDate','ProductionDate']:
+                    if c in wd_d.columns: date_col=c; break
+                if date_col:
+                    wd_d['MonthYear'] = pd.to_datetime(wd_d[date_col]).dt.to_period('M')
+            # aggregate daily -> monthly for plotting
+            vol_col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[fluid_name.lower()]
+            wd_m = (wd_d.groupby(['API10','WellName','MonthYear'], as_index=False)[vol_col].sum())
+            fc = forecast_one_well(wd_m, fluid_name.lower(), float(b_low), float(b_high), 600, models)
+            fig = plot_one_well(wd_m, fc, fluid_name.lower())
+        else:
+            wd_m = pd.DataFrame()
+            if merged_m is not None:
+                wd_m = merged_m[merged_m['API10'].astype(str) == pick_api].copy()
+            if wd_m.empty:
+                st.warning("No production data found for this well.")
+                return
+            fc = forecast_one_well(wd_m, fluid_name.lower(), float(b_low), float(b_high), 600, models)
+            fig = plot_one_well(wd_m, fc, fluid_name.lower())
         st.pyplot(fig, clear_figure=True)
 
-# ================= Per-fluid sections =================
-fluid_block("Oil",   "EUR (Mbbl)",        "NormOil")
+# ======================================================
+# ============ Fluid Sections ==========================
+# ======================================================
+fluid_block("Oil",   "EUR (Mbbl)",       "NormOil")
 st.markdown("---")
-fluid_block("Gas",   "EUR (MMcf)",        "NormGas")
+fluid_block("Gas",   "EUR (MMcf)",       "NormGas")
 st.markdown("---")
-fluid_block("Water", "EUR (Mbbl water)",  "NormWater")
+fluid_block("Water", "EUR (Mbbl water)", "NormWater")
 st.markdown("---")
 
 # ================= Final: Type Wells summary + P10/P50/P90 plots =================
@@ -394,8 +516,8 @@ with tw_tabs[0]:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (Mbbl)")
         stats_o = compute_eur_stats(eurs)
         st.dataframe(format_df_2dec(eur_summary_table("Oil", stats_o, "Mbbl", int(norm_len))), use_container_width=True)
-        curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "oil")
-                         if mo_key in st.session_state else (pd.DataFrame(), []))
+        curves, lines = (build_type_curves_and_lines(st.session_state.get(mo_key), "oil")
+                         if st.session_state.get(mo_key) is not None else (pd.DataFrame(), []))
         st.subheader("Oil Type Curve (P10 / P50 / P90)")
         st.pyplot(plot_type_curves(curves, lines, "oil"))
 
@@ -407,8 +529,8 @@ with tw_tabs[1]:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (MMcf)")
         stats_g = compute_eur_stats(eurs)
         st.dataframe(format_df_2dec(eur_summary_table("Gas", stats_g, "MMcf", int(norm_len))), use_container_width=True)
-        curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "gas")
-                         if mo_key in st.session_state else (pd.DataFrame(), []))
+        curves, lines = (build_type_curves_and_lines(st.session_state.get(mo_key), "gas")
+                         if st.session_state.get(mo_key) is not None else (pd.DataFrame(), []))
         st.subheader("Gas Type Curve (P10 / P50 / P90)")
         st.pyplot(plot_type_curves(curves, lines, "gas"))
 
@@ -420,12 +542,12 @@ with tw_tabs[2]:
         eurs = _eurs_from_oneline(st.session_state[on_key], "EUR (Mbbl water)")
         stats_w = compute_eur_stats(eurs)
         st.dataframe(format_df_2dec(eur_summary_table("Water", stats_w, "Mbbl", int(norm_len))), use_container_width=True)
-        curves, lines = (build_type_curves_and_lines(st.session_state[mo_key], "water")
-                         if mo_key in st.session_state else (pd.DataFrame(), []))
+        curves, lines = (build_type_curves_and_lines(st.session_state.get(mo_key), "water")
+                         if st.session_state.get(mo_key) is not None else (pd.DataFrame(), []))
         st.subheader("Water Type Curve (P10 / P50 / P90)")
         st.pyplot(plot_type_curves(curves, lines, "water"))
 
-st.caption("Per-fluid workflow: enhanced B-factors & probits → Type Wells.")
+st.caption("Hybrid daily + monthly forecasting workflow — SE Tools")
 
 # =========================== PDF REPORT ===========================
 from reportlab.lib.pagesizes import letter
@@ -438,13 +560,11 @@ from reportlab.platypus import (
 from reportlab.lib.utils import ImageReader
 
 def _df_to_table(df: pd.DataFrame, title: str, font_size: int = 7):
-    """Convert a DataFrame to a reportlab Table (2-dec formatting, repeated header)."""
     styles = getSampleStyleSheet()
     if df is None or df.empty:
         return [Paragraph(f"<b>{title}</b> — (no data)", styles['Heading3']), Spacer(1,6)]
 
-    df_str = format_df_2dec(df)  # <- enforce 2-dec formatting on every cell
-
+    df_str = format_df_2dec(df)
     data = [df_str.columns.tolist()] + df_str.values.tolist()
     tbl = Table(data, repeatRows=1)
     tbl.setStyle(TableStyle([
@@ -460,7 +580,6 @@ def _df_to_table(df: pd.DataFrame, title: str, font_size: int = 7):
     return [Paragraph(f"<b>{title}</b>", styles['Heading3']), tbl, Spacer(1,8)]
 
 def _logo_on_page(canvas, doc):
-    """Draw logo at top-right and page number bottom-right, leaving a header band."""
     try:
         if os.path.exists(LOGO_PATH):
             img = ImageReader(LOGO_PATH)
@@ -474,12 +593,6 @@ def _logo_on_page(canvas, doc):
     canvas.drawRightString(doc.pagesize[0]-0.4*inch, 0.4*inch, f"Page {page_num}")
 
 def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
-    """
-    Build 3 pages per fluid:
-      1) B-factor plots (left) + stats table (right)
-      2) Probit plot + probit table
-      3) Type-curve table (EUR stats summary) + type-curve plot
-    """
     styles = getSampleStyleSheet()
 
     if on_key not in st.session_state:
@@ -490,7 +603,7 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
 
     oneline = st.session_state[on_key].copy()
 
-    # -------------------- PAGE 1: B-factor (2-column layout) --------------------
+    # PAGE 1: B-factor (2-column layout)
     story.append(Paragraph(f"<b>{fluid} — B-Factor Analytics</b>", styles['Heading2']))
 
     hist_png, box_png, scatter_png, bstats = bfactor_analytics_figures(oneline, fluid, eur_col)
@@ -521,7 +634,7 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     story.append(two_col)
     story.append(PageBreak())
 
-    # -------------------- PAGE 2: Probit ----------------------
+    # PAGE 2: Probit
     story.append(Paragraph(f"<b>{fluid} — Probit</b>", styles['Heading2']))
     if eur_col in oneline.columns:
         eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
@@ -538,7 +651,7 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
         story.append(Paragraph("No EUR column found for probit.", styles['Normal']))
     story.append(PageBreak())
 
-    # -------------------- PAGE 3: Type Curve ------------------
+    # PAGE 3: Type Curve
     story.append(Paragraph(f"<b>{fluid} — Type Curve</b>", styles['Heading2']))
     if mo_key in st.session_state and on_key in st.session_state:
         oneline_df = st.session_state[on_key]
@@ -556,7 +669,7 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     story.append(PageBreak())
 
 # ============ PDF button ============
-st.session_state['norm_len_pdf'] = int(norm_len)  # pass to report builder
+st.session_state['norm_len_pdf'] = int(norm_len)
 
 if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_oneline"]):
     if st.button("Generate PDF Report"):
@@ -565,7 +678,7 @@ if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_onelin
             tmp_pdf.name,
             pagesize=letter,
             leftMargin=0.5*inch, rightMargin=0.5*inch,
-            topMargin=1.15*inch, bottomMargin=0.6*inch   # header band for logo
+            topMargin=1.15*inch, bottomMargin=0.6*inch
         )
         story = []
 
@@ -578,6 +691,12 @@ if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_onelin
         _fluid_section(story, "Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
 
         doc.build(story, onFirstPage=_logo_on_page, onLaterPages=_logo_on_page)
+
+        # Cleanup temp images used in this build
+        for p in list(_TMP_PNGS):
+            try: os.unlink(p)
+            except Exception: pass
+        _TMP_PNGS.clear()
 
         with open(tmp_pdf.name, "rb") as f:
             st.download_button(
