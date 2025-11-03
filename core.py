@@ -726,6 +726,32 @@ def compute_eur_stats(eur_array: List[float]) -> Dict[str, float]:
     return {"P10": float(p10), "P50": float(p50), "P90": float(p90),
             "Mean": mean, "Count": int(eur_sorted.size),
             "P10/P90": ratio, "TypeCurve": float(p50)}
+def eur_summary_table(fluid_name: str, stats_dict: dict, unit: str, norm_len: int) -> pd.DataFrame:
+    """
+    Build a small summary table for EUR stats, plus a per-ft column.
+    - unit: 'Mbbl' or 'MMcf' (table is unit-aware)
+    - norm_len: normalization length in ft (used to compute per-ft numbers)
+    """
+    # For liquids we typically show per-ft in bbl/ft (Mbbl → bbl multiplier = 1000).
+    # For gas the unit is already MMcf; leave factor = 1.0 to get MMcf/ft.
+    factor = 1000.0 if unit != "MMcf" else 1.0
+
+    def per_ft(x: float) -> float:
+        if x is None or not np.isfinite(x) or not norm_len:
+            return np.nan
+        return (x / norm_len * factor)
+
+    rows = [
+        ["P90",                  stats_dict.get("P90"),       per_ft(stats_dict.get("P90"))],
+        ["P50",                  stats_dict.get("P50"),       per_ft(stats_dict.get("P50"))],
+        ["P10",                  stats_dict.get("P10"),       per_ft(stats_dict.get("P10"))],
+        ["P10/P90 Ratio",        stats_dict.get("P10/P90"),   np.nan],
+        ["Well Count",           stats_dict.get("Count"),     np.nan],
+        ["Normalization Length", norm_len,                    "ft"],
+        ["Mean",                 stats_dict.get("Mean"),      per_ft(stats_dict.get("Mean"))],
+        ["Type Curve EUR",       stats_dict.get("TypeCurve"), per_ft(stats_dict.get("TypeCurve"))],
+    ]
+    return pd.DataFrame(rows, columns=[f"{fluid_name} EURs", unit, f"{unit}/ft"])
 
 def _mantissa_formatter(val, pos=None):
     s = f"{val:g}"
