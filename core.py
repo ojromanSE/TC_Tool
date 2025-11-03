@@ -364,13 +364,51 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
 
 # ---------------- DAILY forecast path ----------------
 def _aggregate_daily_to_monthly(df: pd.DataFrame, com: str) -> pd.DataFrame:
-    vol_col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[com]
-    out_col = f"Monthly_{com}_volume"
-    g = (df.groupby(['API10','WellName','MonthYear'], as_index=False)[vol_col].sum()
-           .rename(columns={vol_col: out_col}))
-    g['Date'] = g['MonthYear'].dt.to_timestamp(how='start')
+    """
+    Convert a daily production DataFrame to monthly totals for compatibility
+    with downstream plots and reports. Automatically derives MonthYear and
+    fills missing WellName if needed.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['API10','WellName','MonthYear',f'Monthly_{com}_volume','Segment'])
+
+    df = df.copy()
+
+    # --- ensure API and WellName ---
+    if 'API10' not in df.columns:
+        raise KeyError("Expected 'API10' column in daily data.")
+    if 'WellName' not in df.columns:
+        df['WellName'] = df['API10'].astype(str)
+
+    # --- ensure a date column we can use ---
+    date_col = None
+    for cand in ['Date', 'ReportDate', 'ProductionDate', 'ProdDate', 'Day']:
+        if cand in df.columns:
+            date_col = cand
+            break
+    if date_col is None:
+        raise KeyError("No date column found in daily data (expected one of Date / ReportDate / Day).")
+
+    df['MonthYear'] = pd.to_datetime(df[date_col]).dt.to_period('M')
+
+    # --- determine volume column ---
+    vol_col = None
+    for cand in [f'Daily{com.capitalize()}', f'Total{com.capitalize()}', f'{com.capitalize()}']:
+        if cand in df.columns:
+            vol_col = cand
+            break
+    if vol_col is None:
+        raise KeyError(f"No daily volume column found for {com} (expected Daily{com.capitalize()}).")
+
+    # --- perform aggregation ---
+    g = (
+        df.groupby(['API10', 'WellName', 'MonthYear'], as_index=False)[vol_col]
+          .sum()
+          .rename(columns={vol_col: f'Monthly_{com}_volume'})
+    )
     g['Segment'] = 'Historical'
-    return g[['API10','WellName','Date',out_col,'Segment']]
+    return g
+
 
 def forecast_one_well_daily(wd: pd.DataFrame, commodity: str,
                             b_low: float, b_high: float, max_days: int,
