@@ -351,7 +351,15 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
                             f'Monthly_{com}_volume':float(v),'Segment':'Forecast'})
 
     oneline_df = pd.DataFrame(oneline)
-    monthly_df = pd.DataFrame(monthly).sort_values(['API10','Date','Segment'])
+    monthly_df = pd.DataFrame(monthly)
+    if monthly_df.empty:
+        monthly_df = pd.DataFrame(
+            columns=['API10','WellName','Date',f'Monthly_{com}_volume','Segment']
+        )
+    else:
+        sort_cols = [c for c in ['API10','Date','Segment'] if c in monthly_df.columns]
+        if sort_cols:
+            monthly_df = monthly_df.sort_values(sort_cols)
     return oneline_df, monthly_df
 
 # ---------------- DAILY forecast path ----------------
@@ -448,7 +456,6 @@ def forecast_all_daily(merged_daily: pd.DataFrame, cfg: ForecastConfig) -> Tuple
                         'Remaining (Mbbl water)': round(fc['EUR_fcst']/1_000.0,2)})
         oneline.append(row)
 
-        # daily -> monthly forecast aggregation
         last_day = wd['Day'].max()
         f_dates = pd.date_range(start=last_day + pd.offsets.Day(1), periods=len(fc['f_vals']), freq='D')
         df_f = pd.DataFrame({
@@ -466,11 +473,200 @@ def forecast_all_daily(merged_daily: pd.DataFrame, cfg: ForecastConfig) -> Tuple
         monthly_rows.append(df_f_m[['API10','WellName','Date',f'Monthly_{com}_volume','Segment']])
 
     oneline_df = pd.DataFrame(oneline)
-    monthly_df = pd.concat([monthly_hist] + monthly_rows, ignore_index=True) if monthly_rows else monthly_hist
-    monthly_df = monthly_df.sort_values(['API10','Date','Segment'])
+
+    if monthly_rows:
+        monthly_df = pd.concat([monthly_hist] + monthly_rows, ignore_index=True)
+    else:
+        monthly_df = monthly_hist.copy()
+
+    if monthly_df.empty:
+        monthly_df = pd.DataFrame(
+            columns=['API10','WellName','Date',f'Monthly_{com}_volume','Segment']
+        )
+    else:
+        sort_cols = [c for c in ['API10','Date','Segment'] if c in monthly_df.columns]
+        if sort_cols:
+            monthly_df = monthly_df.sort_values(sort_cols)
     return oneline_df, monthly_df
 
-# ---------------- EUR stats & Probit (color support) ----------------
+# ---------------- HYBRID helpers (daily preferred per well) ----------------
+def _train_rf_hybrid(merged_m: pd.DataFrame | None, merged_d: pd.DataFrame | None, target_col: str) -> Dict[str, RandomForestRegressor]:
+    frames = []
+    if merged_m is not None and not merged_m.empty:
+        frames.append(merged_m[['API10','NormOil','NormGas','NormWater']].copy())
+    if merged_d is not None and not merged_d.empty:
+        frames.append(merged_d[['API10','NormOil','NormGas','NormWater']].copy())
+    if not frames:
+        return _train_rf(pd.DataFrame(columns=['API10','NormOil','NormGas','NormWater']), target_col)
+    df_all = pd.concat(frames, ignore_index=True)
+    return _train_rf(df_all, target_col)
+
+def forecast_all_hybrid(merged_m: pd.DataFrame | None,
+                        merged_d: pd.DataFrame | None,
+                        cfg: ForecastConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    For each API10: prefer DAILY if present; otherwise use MONTHLY.
+    Outputs monthly tables; daily forecasts are aggregated to months.
+    """
+    com = cfg.commodity.lower()
+    col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[com]
+
+    models = _train_rf_hybrid(merged_m, merged_d, col)
+
+    # Historical monthly (daily aggregated + monthly native)
+    hist_parts = []
+    if merged_d is not None and not merged_d.empty:
+        hist_parts.append(_aggregate_daily_to_monthly(merged_d, com))
+    if merged_m is not None and not merged_m.empty:
+        mm = merged_m.sort_values(['API10','MonthYear'])
+        hist_m = pd.DataFrame({
+            'API10': mm['API10'].astype(str),
+            'WellName': mm['WellName'],
+            'Date': mm['MonthYear'].dt.to_timestamp(how='start'),
+            f'Monthly_{com}_volume': mm[col].astype(float),
+            'Segment': 'Historical'
+        })
+        hist_parts.append(hist_m)
+
+    monthly_hist = pd.concat(hist_parts, ignore_index=True) if hist_parts else pd.DataFrame(
+        columns=['API10','WellName','Date', f'Monthly_{com}_volume','Segment']
+    )
+
+    # Prefer daily wells: drop monthly hist rows for those
+    daily_apis = set()
+    if merged_d is not None and not merged_d.empty:
+        daily_apis = set(merged_d['API10'].astype(str).unique())
+        if not monthly_hist.empty:
+            # Keep daily hist for daily wells (already aggregated), remove monthly duplicates
+            mask = monthly_hist['API10'].astype(str).isin(daily_apis) & (monthly_hist['Segment'] == 'Historical')
+            monthly_hist = monthly_hist[~mask]
+
+    apis = set()
+    if merged_m is not None and not merged_m.empty:
+        apis |= set(merged_m['API10'].astype(str).unique())
+    if merged_d is not None and not merged_d.empty:
+        apis |= set(merged_d['API10'].astype(str).unique())
+
+    oneline, monthly_rows = [], []
+
+    for api in sorted(apis):
+        use_daily = api in daily_apis
+        if use_daily:
+            wd = merged_d[merged_d['API10'].astype(str) == api]
+            if wd.empty or wd[col].max() <= 0 or wd[col].sum() <= 0:
+                continue
+            fc = forecast_one_well_daily(wd, com, cfg.b_low, cfg.b_high, cfg.max_months*30, models)
+            hdr = wd.iloc[0]; well = hdr.get('WellName','N/A')
+
+            qi_day = fc['qi']/30.4
+            q12 = float(arps(fc['qi'], fc['b'], fc['di'], np.array([12.0]))[0])
+            decline_yr = (1.0 - (q12/fc['qi']))*100.0 if fc['qi']>0 else 0.0
+
+            row = {
+                'API10': str(api), 'WellName': well,
+                'State': hdr.get('State'), 'County': hdr.get('County'),
+                'PrimaryFormation': hdr.get('PrimaryFormation'),
+                'LateralLength': hdr.get('LateralLength'),
+                'CompletionDate': hdr.get('CompletionDate'),
+                'FirstProdDate': hdr.get('FirstProdDate'),
+                'qi (per day)': round(qi_day,0),
+                'b': round(fc['b'],3),
+                'di (per month)': round(fc['di'],4),
+                'First-Year Decline (%)': round(decline_yr,1),
+            }
+            if com=='oil':
+                row.update({'EUR (Mbbl)': round(fc['EUR_total']/1_000.0,2),
+                            'Remaining (Mbbl)': round(fc['EUR_fcst']/1_000.0,2)})
+            elif com=='gas':
+                row.update({'EUR (MMcf)': round(fc['EUR_total']/1_000_000.0,2),
+                            'Remaining (MMcf)': round(fc['EUR_fcst']/1_000_000.0,2)})
+            else:
+                row.update({'EUR (Mbbl water)': round(fc['EUR_total']/1_000.0,2),
+                            'Remaining (Mbbl water)': round(fc['EUR_fcst']/1_000.0,2)})
+            oneline.append(row)
+
+            # daily forecast → monthly aggregate
+            last_day = wd['Day'].max()
+            f_dates = pd.date_range(start=last_day + pd.offsets.Day(1), periods=len(fc['f_vals']), freq='D')
+            df_f = pd.DataFrame({
+                'API10': str(api),
+                'WellName': well,
+                'Day': f_dates,
+                col: fc['f_vals'],
+                'Segment': 'Forecast'
+            })
+            df_f['MonthYear'] = df_f['Day'].dt.to_period('M')
+            df_f_m = (df_f.groupby(['API10','WellName','MonthYear'], as_index=False)[col].sum())
+            df_f_m['Date'] = df_f_m['MonthYear'].dt.to_timestamp(how='start')
+            df_f_m[f'Monthly_{com}_volume'] = df_f_m[col]
+            df_f_m['Segment'] = 'Forecast'
+            monthly_rows.append(df_f_m[['API10','WellName','Date',f'Monthly_{com}_volume','Segment']])
+
+        else:
+            wd = merged_m[merged_m['API10'].astype(str) == api]
+            if wd.empty or wd[col].max() <= 0 or wd[col].sum() <= 0:
+                continue
+            fc = forecast_one_well(wd, com, cfg.b_low, cfg.b_high, cfg.max_months, models)
+            hdr = wd.iloc[0]; well = hdr.get('WellName','N/A')
+
+            qi_day = fc['qi']/30.4
+            q12 = float(arps(fc['qi'], fc['b'], fc['di'], np.array([12.0]))[0])
+            decline_yr = (1.0 - (q12/fc['qi']))*100.0 if fc['qi']>0 else 0.0
+
+            row = {
+                'API10': str(api), 'WellName': well,
+                'State': hdr.get('State'), 'County': hdr.get('County'),
+                'PrimaryFormation': hdr.get('PrimaryFormation'),
+                'LateralLength': hdr.get('LateralLength'),
+                'CompletionDate': hdr.get('CompletionDate'),
+                'FirstProdDate': hdr.get('FirstProdDate'),
+                'qi (per day)': round(qi_day,0),
+                'b': round(fc['b'],3),
+                'di (per month)': round(fc['di'],4),
+                'First-Year Decline (%)': round(decline_yr,1),
+            }
+            if com=='oil':
+                row.update({'EUR (Mbbl)': round(fc['EUR_total']/1_000.0,2),
+                            'Remaining (Mbbl)': round(fc['EUR_fcst']/1_000.0,2)})
+            elif com=='gas':
+                row.update({'EUR (MMcf)': round(fc['EUR_total']/1_000_000.0,2),
+                            'Remaining (MMcf)': round(fc['EUR_fcst']/1_000_000.0,2)})
+            else:
+                row.update({'EUR (Mbbl water)': round(fc['EUR_total']/1_000.0,2),
+                            'Remaining (Mbbl water)': round(fc['EUR_fcst']/1_000.0,2)})
+            oneline.append(row)
+
+            hist_dates = wd.sort_values('MonthYear')['MonthYear'].dt.to_timestamp(how='start')
+            start = hist_dates.iloc[-1] + pd.offsets.MonthBegin(1) if len(hist_dates)>0 \
+                    else merged_m['MonthYear'].min().to_timestamp(how='start')
+            f_dates = pd.date_range(start=start, periods=len(fc['f_vals']), freq='MS')
+            df_fm = pd.DataFrame({
+                'API10': str(api),
+                'WellName': well,
+                'Date': f_dates,
+                f'Monthly_{com}_volume': fc['f_vals'],
+                'Segment': 'Forecast'
+            })
+            monthly_rows.append(df_fm[['API10','WellName','Date',f'Monthly_{com}_volume','Segment']])
+
+    oneline_df = pd.DataFrame(oneline)
+
+    monthly_df = monthly_hist.copy()
+    if monthly_rows:
+        monthly_df = pd.concat([monthly_df] + monthly_rows, ignore_index=True)
+
+    if monthly_df.empty:
+        monthly_df = pd.DataFrame(
+            columns=['API10','WellName','Date',f'Monthly_{com}_volume','Segment']
+        )
+    else:
+        sort_cols = [c for c in ['API10','Date','Segment'] if c in monthly_df.columns]
+        if sort_cols:
+            monthly_df = monthly_df.sort_values(sort_cols)
+
+    return oneline_df, monthly_df
+
+# ---------------- EUR stats & Probit ----------------
 def compute_eur_stats(eur_array: List[float]) -> Dict[str, float]:
     eur = np.array(eur_array, dtype=float)
     eur = eur[np.isfinite(eur)]
@@ -584,5 +780,3 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     ax.legend()
     fig.tight_layout()
     return fig
-
-# (Optional) You can add a daily-specific plot if you want a daily-per-well view later.
