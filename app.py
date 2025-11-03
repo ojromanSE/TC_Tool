@@ -146,13 +146,41 @@ if st.button("Load / QC / Merge"):
 
             # ---------- Build a combined picker dataset (prefer daily) ----------
             daily_apis = set()
+
+            def _build_daily_picker(df: pd.DataFrame) -> pd.DataFrame:
+                """Make a daily-preferred picker frame robustly (guarantee required cols)."""
+                if df is None or df.empty:
+                    return pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
+
+                dd = df.copy()
+
+                # Ensure MonthYear exists
+                if 'MonthYear' not in dd.columns:
+                    if 'Day' in dd.columns:
+                        dd['MonthYear'] = pd.to_datetime(dd['Day']).dt.to_period('M')
+                    elif 'Date' in dd.columns:
+                        dd['MonthYear'] = pd.to_datetime(dd['Date']).dt.to_period('M')
+                    else:
+                        return pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
+
+                if 'WellName' not in dd.columns:
+                    dd['WellName'] = dd.get('API10', '').astype(str)
+
+                for c in ('NormOil','NormGas','NormWater'):
+                    if c not in dd.columns:
+                        dd[c] = np.nan
+
+                out = (dd.groupby(['API10','WellName','MonthYear'], as_index=False)[['NormOil','NormGas','NormWater']].sum())
+                return out
+
+            # Daily picker (if any daily)
             if merged_d is not None and not merged_d.empty:
                 daily_apis = set(merged_d['API10'].astype(str).unique())
-                daily_picker = (merged_d
-                    .groupby(['API10','WellName','MonthYear'], as_index=False)[['NormOil','NormGas','NormWater']].sum())
+                daily_picker = _build_daily_picker(merged_d)
             else:
                 daily_picker = pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
 
+            # Monthly picker (drop wells that also have daily)
             if merged_m is not None and not merged_m.empty:
                 monthly_picker = merged_m[~merged_m['API10'].astype(str).isin(daily_apis)][
                     ['API10','WellName','MonthYear','NormOil','NormGas','NormWater']
@@ -624,6 +652,8 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     story.append(PageBreak())
 
 # ============ PDF button ============
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
 st.session_state['norm_len_pdf'] = int(norm_len)
 
 if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_oneline"]):
@@ -646,6 +676,7 @@ if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_onelin
         _fluid_section(story, "Gas",   "Gas_oneline",   "Gas_monthly",   "EUR (MMcf)")
         _fluid_section(story, "Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
 
+        from reportlab.lib.utils import ImageReader  # already imported, safe
         doc.build(story, onFirstPage=_logo_on_page, onLaterPages=_logo_on_page)
 
         # Cleanup temp images used in this build
