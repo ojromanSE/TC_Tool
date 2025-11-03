@@ -34,8 +34,12 @@ PROD_COLUMN_MAPS = [
      'TotalGas':'TotalGas','TotalWater':'TotalWater','API10':'API'},
     # DI / IHS (monthly)
     {'WellName':'Well Name','ReportDate':'Monthly Production Date','TotalOil':'Monthly Oil',
-     'TotalGas':'Monthly Gas','TotalWater':'Monthly Water','API10':'API10'}
+     'TotalGas':'Monthly Gas','TotalWater':'Monthly Water','API10':'API10'},
+    # Generic daily format
+    {'WellName':'WellName','ReportDate':'Date','TotalOil':'DailyOil',
+     'TotalGas':'DailyGas','TotalWater':'DailyWater','API10':'API'}
 ]
+
 
 # --- Daily production column maps (common variants) ---
 DAILY_PROD_COLUMN_MAPS = [
