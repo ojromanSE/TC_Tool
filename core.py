@@ -28,14 +28,22 @@ HEADER_COLUMN_MAPS = [
      'PrimaryFormation':'Producing Reservoir','CompletionDate':'Completion Date',
      'FirstProdDate':'First Prod Date','State':'State','API10':'API10'}
 ]
+
+# IMPORTANT: include DI/IHS variant that has API (not API10)
 PROD_COLUMN_MAPS = [
-    # WDB (monthly)
+    # WDB (monthly) -> uses API
     {'WellName':'WellName','ReportDate':'ReportDate','TotalOil':'TotalOil',
      'TotalGas':'TotalGas','TotalWater':'TotalWater','API10':'API'},
-    # DI / IHS (monthly)
+
+    # DI / IHS (monthly) -> prefers API10
     {'WellName':'Well Name','ReportDate':'Monthly Production Date','TotalOil':'Monthly Oil',
      'TotalGas':'Monthly Gas','TotalWater':'Monthly Water','API10':'API10'},
-    # Generic daily passed through monthly loader (supported for compatibility)
+
+    # DI / IHS (monthly) variant -> uses API (we normalize API10 earlier)
+    {'WellName':'Well Name','ReportDate':'Monthly Production Date','TotalOil':'Monthly Oil',
+     'TotalGas':'Monthly Gas','TotalWater':'Monthly Water','API10':'API'},
+
+    # Generic daily passed through monthly loader (compatibility)
     {'WellName':'WellName','ReportDate':'Date','TotalOil':'DailyOil',
      'TotalGas':'DailyGas','TotalWater':'DailyWater','API10':'API'}
 ]
@@ -76,20 +84,30 @@ def load_header(file_like) -> pd.DataFrame:
     return _translate(df, HEADER_COLUMN_MAPS, REQUIRED_HEADER_COLUMNS)
 
 def load_production(file_like) -> pd.DataFrame:
-    """Monthly loader (also supports a generic daily shape for compatibility)."""
+    """
+    Monthly loader that also accepts a few daily-shaped files (compat path).
+    It normalizes API to a 10-digit 'API10' if the source only has API or API/UWI.
+    Output columns: ['WellName','ReportDate','TotalOil','TotalGas','TotalWater','API10']
+    """
     df = pd.read_csv(file_like)
-    if 'API/UWI' in df.columns and 'API10' not in df.columns and 'API' not in df.columns:
-        df['API10'] = df['API/UWI'].astype(str).str[:10]
-        df.rename(columns={'API10':'API'}, inplace=True)
+
+    # Normalize API10 early so DI/IHS mappings can match regardless of source header
+    if 'API10' not in df.columns:
+        if 'API' in df.columns:
+            df['API10'] = df['API'].astype(str).str[:10]
+        elif 'API/UWI' in df.columns:
+            df['API10'] = df['API/UWI'].astype(str).str[:10]
+
     out = _translate(df, PROD_COLUMN_MAPS, REQUIRED_PROD_COLUMNS)
-    out['ReportDate'] = pd.to_datetime(out['ReportDate'])
+    out['ReportDate'] = pd.to_datetime(out['ReportDate'], errors='coerce')
+    out = out.dropna(subset=['ReportDate'])
     return out
 
 def load_production_daily(file_like) -> pd.DataFrame:
     """
     Load DAILY production CSVs. Returns standardized columns:
       ['WellName','Date','DailyOil','DailyGas','DailyWater','API10']
-    Accepts API (10) or API14; trims to API10.
+    Accepts API (10/14) or API/UWI; trims to API10.
     """
     raw = pd.read_csv(file_like)
 
@@ -98,7 +116,7 @@ def load_production_daily(file_like) -> pd.DataFrame:
         raw['API'] = raw['API/UWI']
 
     df = None
-    # Direct match (already standardized)
+    # Already standardized?
     if {'WellName','Date','DailyOil','DailyGas','DailyWater','API10'}.issubset(raw.columns):
         df = raw.copy()
     elif {'WellName','Date','DailyOil','DailyGas','DailyWater','API'}.issubset(raw.columns):
@@ -340,6 +358,9 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
                         'Remaining (Mbbl water)': round(fc['EUR_fcst']/1_000.0,2)})
         oneline.append(row)
 
+    # Build monthly table (hist + fcast)
+    for api10, wd in merged.groupby('API10'):
+        hdr = wd.iloc[0]; well = hdr.get('WellName','N/A')
         hist_dates = wd.sort_values('MonthYear')['MonthYear'].dt.to_timestamp(how='start')
         hist_vals  = wd[col].values.astype(float)
         start = hist_dates.iloc[-1] + pd.offsets.MonthBegin(1) if len(hist_dates)>0 \
@@ -609,7 +630,9 @@ def forecast_all_hybrid(merged_m: pd.DataFrame | None,
         use_daily = api in daily_apis
         if use_daily:
             wd = merged_d[merged_d['API10'].astype(str) == api]
-            if wd.empty or wd[col].max() <= 0 or wd[col].sum() <= 0:
+            if wd.empty:
+                continue
+            if wd[col].max() <= 0 or wd[col].sum() <= 0:
                 continue
             fc = forecast_one_well_daily(wd, com, cfg.b_low, cfg.b_high, cfg.max_months*30, models)
             hdr = wd.iloc[0]; well = hdr.get('WellName','N/A')
