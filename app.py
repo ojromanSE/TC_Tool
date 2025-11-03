@@ -10,7 +10,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import streamlit as st
-def _map_daily_columns_ui(raw_df: pd.DataFrame) -> pd.DataFrame | None:
+
+def _map_daily_columns_ui(raw_df: pd.DataFrame) -> "pd.DataFrame | None":
     """
     If auto-detect fails for the daily CSV, this UI lets you map columns manually.
     Returns a standardized daily df or None if user hasn't confirmed yet.
@@ -157,76 +158,25 @@ if st.button("Load / QC / Merge"):
                 lateral_col='LateralLength', decimals=int(bin_decimals)
             )
 
-           # Existing:
-# prod_df  = load_production(BytesIO(prod_file.getvalue())) if prod_file else None
-# daily_df = load_production_daily(BytesIO(daily_file.getvalue())) if daily_file else None
+            # Existing:
+            # prod_df  = load_production(BytesIO(prod_file.getvalue())) if prod_file else None
+            # daily_df = load_production_daily(BytesIO(daily_file.getvalue())) if daily_file else None
 
-prod_df  = load_production(BytesIO(prod_file.getvalue())) if prod_file else None
+            prod_df  = load_production(BytesIO(prod_file.getvalue())) if prod_file else None
 
-daily_df = None
-if daily_file:
-    try:
-        daily_df = load_production_daily(BytesIO(daily_file.getvalue()))
-        st.success("Daily file auto-detected successfully.")
-    except Exception as e:
-        st.info(f"Daily auto-detect failed: {e}")
-        # Offer manual mapping UI
-        raw_daily = pd.read_csv(BytesIO(daily_file.getvalue()))
-        mapped = _map_daily_columns_ui(raw_daily)
-        daily_df = mapped if mapped is not None else None
-        if daily_df is None:
-            st.stop()  # wait for user to confirm mapping
-
-pp_cfg_m = PreprocessConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
-pp_cfg_d = PreprocessDailyConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
-
-merged_m = preprocess(header_qc, prod_df, pp_cfg_m) if prod_df is not None else None
-merged_d = preprocess_daily(header_qc, daily_df, pp_cfg_d) if daily_df is not None else None
-
-# Build picker frame (prefer daily wells)
-daily_wells = set()
-if merged_d is not None and not merged_d.empty:
-    daily_wells = set(merged_d['WellName'].astype(str))
-    daily_picker = (merged_d.groupby(['WellName','MonthYear'], as_index=False)
-                    [['NormOil','NormGas','NormWater']].sum())
-else:
-    daily_picker = pd.DataFrame(columns=['WellName','MonthYear','NormOil','NormGas','NormWater'])
-
-if merged_m is not None and not merged_m.empty:
-    monthly_picker = merged_m[~merged_m['WellName'].astype(str).isin(daily_wells)][
-        ['WellName','MonthYear','NormOil','NormGas','NormWater']
-    ].copy()
-else:
-    monthly_picker = pd.DataFrame(columns=['WellName','MonthYear','NormOil','NormGas','NormWater'])
-
-picker_df = pd.concat([daily_picker, monthly_picker], ignore_index=True)
-
-st.session_state.merged_monthly = merged_m
-st.session_state.merged_daily   = merged_d
-st.session_state.header_qc = header_qc
-st.session_state.prod_df   = prod_df
-st.session_state.daily_df  = daily_df
-st.session_state.daily_well_set = set(daily_wells)
-st.session_state.merged = picker_df
-
-# --- Helpful coverage summary ---
-def _coverage_table(merged_m, merged_d):
-    wells_m = set() if merged_m is None or merged_m.empty else set(merged_m['WellName'].astype(str))
-    wells_d = set() if merged_d is None or merged_d.empty else set(merged_d['WellName'].astype(str))
-    all_w   = sorted(wells_m | wells_d)
-    rows = []
-    for w in all_w:
-        src = "Daily" if w in wells_d else "Monthly" if w in wells_m else "—"
-        rows.append({"WellName": w, "Source used": src})
-    return pd.DataFrame(rows)
-
-cov = _coverage_table(merged_m, merged_d)
-if not cov.empty:
-    st.subheader("Well coverage (Daily preferred):")
-    st.dataframe(cov, use_container_width=True)
-    st.success(f"Total wells: {cov.shape[0]} | Daily: {(cov['Source used']=='Daily').sum()} | Monthly: {(cov['Source used']=='Monthly').sum()}")
-else:
-    st.warning("No valid rows found after preprocessing.")
+            daily_df = None
+            if daily_file:
+                try:
+                    daily_df = load_production_daily(BytesIO(daily_file.getvalue()))
+                    st.success("Daily file auto-detected successfully.")
+                except Exception as e:
+                    st.info(f"Daily auto-detect failed: {e}")
+                    # Offer manual mapping UI
+                    raw_daily = pd.read_csv(BytesIO(daily_file.getvalue()))
+                    mapped = _map_daily_columns_ui(raw_daily)
+                    daily_df = mapped if mapped is not None else None
+                    if daily_df is None:
+                        st.stop()  # wait for user to confirm mapping
 
             pp_cfg_m = PreprocessConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
             pp_cfg_d = PreprocessDailyConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
@@ -259,6 +209,25 @@ else:
             st.session_state.daily_df  = daily_df
             st.session_state.daily_well_set = set(daily_wells)
             st.session_state.merged = picker_df
+
+            # --- Helpful coverage summary ---
+            def _coverage_table(merged_m, merged_d):
+                wells_m = set() if merged_m is None or merged_m.empty else set(merged_m['WellName'].astype(str))
+                wells_d = set() if merged_d is None or merged_d.empty else set(merged_d['WellName'].astype(str))
+                all_w   = sorted(wells_m | wells_d)
+                rows = []
+                for w in all_w:
+                    src = "Daily" if w in wells_d else "Monthly" if w in wells_m else "—"
+                    rows.append({"WellName": w, "Source used": src})
+                return pd.DataFrame(rows)
+
+            cov = _coverage_table(merged_m, merged_d)
+            if not cov.empty:
+                st.subheader("Well coverage (Daily preferred):")
+                st.dataframe(cov, use_container_width=True)
+                st.success(f"Total wells: {cov.shape[0]} | Daily: {(cov['Source used']=='Daily').sum()} | Monthly: {(cov['Source used']=='Monthly').sum()}")
+            else:
+                st.warning("No valid rows found after preprocessing.")
 
             if not picker_df.empty:
                 wells = len(picker_df['WellName'].astype(str).unique())
@@ -499,6 +468,9 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         picker = st.session_state.merged
         opts = (picker[['WellName']].dropna().drop_duplicates().sort_values('WellName'))
         labels = opts['WellName'].tolist()
+        if not labels:
+            st.warning("No wells to plot.")
+            return
         pick_label = st.selectbox(
             f"Pick Well ({fluid_name})",
             options=labels,
@@ -543,7 +515,7 @@ st.markdown("---")
 # ================= Type Wells summary + P10/P50/P90 =================
 st.header("Type Wells — Summary (End)")
 
-def _eurs_from_oneline(df: pd.DataFrame, col: str) -> list[float]:
+def _eurs_from_oneline(df: pd.DataFrame, col: str) -> list:
     if df is None or df.empty or col not in df.columns:
         return []
     return pd.to_numeric(df[col], errors="coerce").astype(float).tolist()
