@@ -15,7 +15,12 @@ def _map_daily_columns_ui(raw_df: pd.DataFrame) -> "pd.DataFrame | None":
     """
     If auto-detect fails for the daily CSV, this UI lets you map columns manually.
     Returns a standardized daily df or None if user hasn't confirmed yet.
+    Patch: store result in session_state['mapped_daily_df'] to persist post-mapping.
     """
+    # Check if mapping is already complete in session state
+    if "mapped_daily_df" in st.session_state:
+        return st.session_state["mapped_daily_df"]
+
     st.warning("Couldn’t auto-detect daily columns. Map them below and click **Use these mappings**.")
     cols = list(raw_df.columns)
 
@@ -47,7 +52,11 @@ def _map_daily_columns_ui(raw_df: pd.DataFrame) -> "pd.DataFrame | None":
         df = df.dropna(subset=['Date'])
         st.success(f"Daily file mapped: {df['WellName'].nunique()} wells, {len(df)} rows.")
         st.dataframe(df.head(20), use_container_width=True)
-        return df
+        # Store in session state so subsequent reruns persist the mapping
+        st.session_state["mapped_daily_df"] = df
+        # Ask user to rerun to continue upstream logic
+        st.info("Mapping complete. Please click 'Load / QC / Merge' again to continue.")
+        st.stop()  # This prevents further code execution until rerun
 
     return None
 
@@ -158,25 +167,26 @@ if st.button("Load / QC / Merge"):
                 lateral_col='LateralLength', decimals=int(bin_decimals)
             )
 
-            # Existing:
-            # prod_df  = load_production(BytesIO(prod_file.getvalue())) if prod_file else None
-            # daily_df = load_production_daily(BytesIO(daily_file.getvalue())) if daily_file else None
-
             prod_df  = load_production(BytesIO(prod_file.getvalue())) if prod_file else None
 
             daily_df = None
             if daily_file:
-                try:
-                    daily_df = load_production_daily(BytesIO(daily_file.getvalue()))
-                    st.success("Daily file auto-detected successfully.")
-                except Exception as e:
-                    st.info(f"Daily auto-detect failed: {e}")
-                    # Offer manual mapping UI
-                    raw_daily = pd.read_csv(BytesIO(daily_file.getvalue()))
-                    mapped = _map_daily_columns_ui(raw_daily)
-                    daily_df = mapped if mapped is not None else None
-                    if daily_df is None:
-                        st.stop()  # wait for user to confirm mapping
+                # Always check session state for mapped daily
+                if "mapped_daily_df" in st.session_state:
+                    daily_df = st.session_state["mapped_daily_df"]
+                    st.success("Daily file mapped successfully (manual mapping).")
+                else:
+                    try:
+                        daily_df = load_production_daily(BytesIO(daily_file.getvalue()))
+                        st.success("Daily file auto-detected successfully.")
+                    except Exception as e:
+                        st.info(f"Daily auto-detect failed: {e}")
+                        # Offer manual mapping UI
+                        raw_daily = pd.read_csv(BytesIO(daily_file.getvalue()))
+                        mapped = _map_daily_columns_ui(raw_daily)
+                        daily_df = mapped if mapped is not None else None
+                        if daily_df is None:
+                            st.stop()  # wait for user to confirm mapping
 
             pp_cfg_m = PreprocessConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
             pp_cfg_d = PreprocessDailyConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
@@ -209,6 +219,11 @@ if st.button("Load / QC / Merge"):
             st.session_state.daily_df  = daily_df
             st.session_state.daily_well_set = set(daily_wells)
             st.session_state.merged = picker_df
+            st.session_state['norm_len_pdf'] = int(norm_len)
+
+            # Remove mapped_daily_df if daily_df was loaded successfully (either via mapping or autodetect)
+            if "mapped_daily_df" in st.session_state:
+                del st.session_state["mapped_daily_df"]
 
             # --- Helpful coverage summary ---
             def _coverage_table(merged_m, merged_d):
@@ -682,8 +697,6 @@ def _fluid_section(story, fluid: str, on_key: str, mo_key: str, eur_col: str):
     story.append(PageBreak())
 
 # ============ PDF button ============
-st.session_state['norm_len_pdf'] = int(norm_len)
-
 if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_oneline"]):
     if st.button("Generate PDF Report"):
         tmp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
