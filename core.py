@@ -537,7 +537,6 @@ def forecast_all_hybrid(merged_m: pd.DataFrame | None,
     if merged_d is not None and not merged_d.empty:
         daily_apis = set(merged_d['API10'].astype(str).unique())
         if not monthly_hist.empty:
-            # Keep daily hist for daily wells (already aggregated), remove monthly duplicates
             mask = monthly_hist['API10'].astype(str).isin(daily_apis) & (monthly_hist['Segment'] == 'Historical')
             monthly_hist = monthly_hist[~mask]
 
