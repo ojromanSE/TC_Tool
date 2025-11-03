@@ -1,5 +1,4 @@
-# app.py — SE Oil & Gas Autoforecasting (hybrid daily + monthly)
-# Fully updated
+# app.py — SE Oil & Gas Autoforecasting (WellName-only joins)
 
 import os
 import tempfile
@@ -8,7 +7,7 @@ from io import BytesIO
 import numpy as np
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # safe headless backend for Streamlit
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import streamlit as st
 
@@ -20,14 +19,11 @@ from core import (
     compute_eur_stats, probit_plot, eur_summary_table
 )
 
-# ---------- PAGE CONFIG ----------
 st.set_page_config(page_title="SE Tool", layout="wide")
 
-# ---------- Paths / constants ----------
 LOGO_PATH = os.path.join("static", "logo.png")
-_TMP_PNGS: list[str] = []  # track temp images created for PDF
+_TMP_PNGS: list[str] = []
 
-# ---------- Top header ----------
 cols = st.columns([0.12, 0.88])
 with cols[0]:
     if os.path.exists(LOGO_PATH):
@@ -36,7 +32,6 @@ with cols[1]:
     st.success("All Systems Working")
     st.title("SE Oil & Gas Autoforecasting")
 
-# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Global Parameters")
     norm_len = st.number_input("Normalization Length (ft)", 1000, 30000, 10000, step=500)
@@ -54,7 +49,6 @@ with st.sidebar:
             del st.session_state[k]
         st.experimental_rerun()
 
-# ---------- Helpers ----------
 def _fmt2(value) -> str:
     try:
         f = float(value)
@@ -82,9 +76,7 @@ def _save_fig(fig, dpi=220):
     _TMP_PNGS.append(tmp.name)
     return tmp.name
 
-# ======================================================
-# ============ Upload & Prepare Data ===================
-# ======================================================
+# ================= Upload & Prepare Data =================
 st.header("Upload & Prepare Data")
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -101,7 +93,6 @@ with st.expander("Daily production CSV template"):
         "DailyOil": [120.0, 115.0, 80.0],
         "DailyGas": [800.0, 780.0, 500.0],
         "DailyWater": [30.0, 31.0, 20.0],
-        "API": ["12345678901234","12345678901234","98765432109876"]  # API or API14 OK
     })
     st.dataframe(format_df_2dec(tmp_daily), use_container_width=True)
     st.download_button(
@@ -117,8 +108,8 @@ if st.button("Load / QC / Merge"):
     else:
         try:
             header_bytes = header_file.getvalue()
-            header_df = load_header(BytesIO(header_bytes))   # mapped columns
-            raw_hdr   = pd.read_csv(BytesIO(header_bytes))   # raw (for lat/lon passthrough)
+            header_df = load_header(BytesIO(header_bytes))
+            raw_hdr   = pd.read_csv(BytesIO(header_bytes))
             for col in [lat_col, lon_col]:
                 if col in raw_hdr.columns and col not in header_df.columns:
                     header_df[col] = raw_hdr[col]
@@ -127,84 +118,49 @@ if st.button("Load / QC / Merge"):
                 lateral_col='LateralLength', decimals=int(bin_decimals)
             )
 
-            # Load monthly and/or daily with correct loaders
             prod_df  = load_production(BytesIO(prod_file.getvalue())) if prod_file else None
             daily_df = load_production_daily(BytesIO(daily_file.getvalue())) if daily_file else None
 
-            # Preprocess with the right preprocessors
             pp_cfg_m = PreprocessConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
             pp_cfg_d = PreprocessDailyConfig(normalization_length=int(norm_len), use_normalization=bool(use_norm))
 
             merged_m = preprocess(header_qc, prod_df, pp_cfg_m) if prod_df is not None else None
             merged_d = preprocess_daily(header_qc, daily_df, pp_cfg_d) if daily_df is not None else None
 
-            # ---------- Store merged datasets ----------
+            # Build picker frame (prefer daily wells)
+            daily_wells = set()
+            if merged_d is not None and not merged_d.empty:
+                daily_wells = set(merged_d['WellName'].astype(str))
+                daily_picker = (merged_d.groupby(['WellName','MonthYear'], as_index=False)
+                                [['NormOil','NormGas','NormWater']].sum())
+            else:
+                daily_picker = pd.DataFrame(columns=['WellName','MonthYear','NormOil','NormGas','NormWater'])
+
+            if merged_m is not None and not merged_m.empty:
+                monthly_picker = merged_m[~merged_m['WellName'].astype(str).isin(daily_wells)][
+                    ['WellName','MonthYear','NormOil','NormGas','NormWater']
+                ].copy()
+            else:
+                monthly_picker = pd.DataFrame(columns=['WellName','MonthYear','NormOil','NormGas','NormWater'])
+
+            picker_df = pd.concat([daily_picker, monthly_picker], ignore_index=True)
+
             st.session_state.merged_monthly = merged_m
             st.session_state.merged_daily   = merged_d
             st.session_state.header_qc = header_qc
             st.session_state.prod_df   = prod_df
             st.session_state.daily_df  = daily_df
+            st.session_state.daily_well_set = set(daily_wells)
+            st.session_state.merged = picker_df
 
-            # ---------- Build a combined picker dataset (prefer daily) ----------
-            daily_apis = set()
-
-            def _build_daily_picker(df: pd.DataFrame) -> pd.DataFrame:
-                """Make a daily-preferred picker frame robustly (guarantee required cols)."""
-                if df is None or df.empty:
-                    return pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
-
-                dd = df.copy()
-
-                # Ensure MonthYear exists
-                if 'MonthYear' not in dd.columns:
-                    date_col = None
-                    for name in ['Day','Date','ReportDate','ProductionDate']:
-                        if name in dd.columns:
-                            date_col = name; break
-                    if date_col is None:
-                        return pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
-                    dd['MonthYear'] = pd.to_datetime(dd[date_col]).dt.to_period('M')
-
-                if 'WellName' not in dd.columns:
-                    dd['WellName'] = dd.get('API10', '').astype(str)
-
-                for c in ('NormOil','NormGas','NormWater'):
-                    if c not in dd.columns:
-                        dd[c] = np.nan
-
-                out = (dd.groupby(['API10','WellName','MonthYear'], as_index=False)[['NormOil','NormGas','NormWater']].sum())
-                return out
-
-            # Daily picker (if any daily)
-            if merged_d is not None and not merged_d.empty:
-                daily_apis = set(merged_d['API10'].astype(str).unique())
-                daily_picker = _build_daily_picker(merged_d)
-            else:
-                daily_picker = pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
-
-            # Monthly picker (drop wells that also have daily)
-            if merged_m is not None and not merged_m.empty:
-                monthly_picker = merged_m[~merged_m['API10'].astype(str).isin(daily_apis)][
-                    ['API10','WellName','MonthYear','NormOil','NormGas','NormWater']
-                ].copy()
-            else:
-                monthly_picker = pd.DataFrame(columns=['API10','WellName','MonthYear','NormOil','NormGas','NormWater'])
-
-            picker_df = pd.concat([daily_picker, monthly_picker], ignore_index=True)
-
-            st.session_state.daily_api_set = daily_apis
-            st.session_state.merged = picker_df  # used for per-well selection UI
-
-            # User feedback
             if not picker_df.empty:
-                wells = len(picker_df['API10'].astype(str).unique())
-                if daily_apis:
-                    st.success(f"Hybrid ready. {len(daily_apis)} wells will use DAILY, others MONTHLY. Total wells: {wells}.")
+                wells = len(picker_df['WellName'].astype(str).unique())
+                if daily_wells:
+                    st.success(f"Hybrid ready. {len(daily_wells)} wells will use DAILY, others MONTHLY. Total wells: {wells}.")
                 else:
                     st.success(f"Using MONTHLY only. Total wells: {wells}.")
             else:
                 st.warning("No valid rows found after preprocessing.")
-
         except Exception as e:
             st.exception(e)
 
@@ -233,7 +189,6 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
         return None, None, None, pd.DataFrame([{"message":"no b values"}])
 
     b = pd.to_numeric(df['b'], errors='coerce').dropna().astype(float)
-
     P10 = float(np.percentile(b, 10))
     P25 = float(np.percentile(b, 25))
     P50 = float(np.percentile(b, 50))
@@ -314,16 +269,16 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
     vol_col = f"Monthly_{com}_volume"
     if monthly_df is None or monthly_df.empty or vol_col not in monthly_df.columns:
         return pd.DataFrame(columns=['t','P10','P50','P90']), []
-    hist = monthly_df[monthly_df['Segment'] == 'Historical'][['API10','Date',vol_col]].dropna().copy()
-    hist = hist.sort_values(['API10','Date'])
-    hist['t'] = hist.groupby('API10').cumcount() + 1
+    hist = monthly_df[monthly_df['Segment'] == 'Historical'][['WellName','Date',vol_col]].dropna().copy()
+    hist = hist.sort_values(['WellName','Date'])
+    hist['t'] = hist.groupby('WellName').cumcount() + 1
     lines = []
-    for _, g in hist.groupby('API10'):
+    for _, g in hist.groupby('WellName'):
         t = g['t'].to_numpy()
         y = np.clip(g[vol_col].to_numpy(), 1e-6, None)
         lines.append((t, y))
-    all_df = monthly_df[['API10','Date',vol_col]].dropna().sort_values(['API10','Date']).copy()
-    all_df['t'] = all_df.groupby('API10').cumcount() + 1
+    all_df = monthly_df[['WellName','Date',vol_col]].dropna().sort_values(['WellName','Date']).copy()
+    all_df['t'] = all_df.groupby('WellName').cumcount() + 1
     q = all_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
     q.columns = ['P10','P50','P90']
     q = q.reset_index()
@@ -354,9 +309,7 @@ def plot_type_curves(curves: pd.DataFrame, lines, fluid: str):
     fig.tight_layout()
     return fig
 
-# ======================================================
-# ============ Forecasting UI per fluid ================
-# ======================================================
+# ================= Per-fluid UI block =================
 def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
     st.header(f"{fluid_name} — Run & Analyze")
 
@@ -400,7 +353,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
 
         with tab3:
             oneline = st.session_state[on_key]
-            cols = ['API10','WellName','qi (per day)','b','di (per month)','First-Year Decline (%)']
+            cols = ['WellName','qi (per day)','b','di (per month)','First-Year Decline (%)']
             cols = [c for c in cols if c in oneline.columns]
             btable = oneline[cols].copy().sort_values('b', ascending=False)
             st.subheader(f"{fluid_name} — B-Factor Table")
@@ -434,29 +387,20 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit", color=_phase_color(fluid_name))
                 st.pyplot(fig)
 
-        # ---------- Per-well Plot (daily preferred) ----------
+        # Per-well Plot (daily preferred)
         st.subheader(f"{fluid_name} — Per-well Plot")
         picker = st.session_state.merged
-        base = picker[['API10']].astype({'API10': str}).copy()
-        if 'WellName' in picker.columns:
-            base['WellName'] = picker['WellName'].astype(str)
-        else:
-            base['WellName'] = base['API10']
-        opts = base.dropna().drop_duplicates()
-        opts['label'] = opts.apply(
-            lambda r: r['WellName'] if (r['WellName'] and r['WellName'] != r['API10']) else f"API {r['API10']}",
-            axis=1
-        )
-        label_to_api = dict(zip(opts['label'], opts['API10']))
+        opts = (picker[['WellName']].dropna().drop_duplicates().sort_values('WellName'))
+        labels = opts['WellName'].tolist()
         pick_label = st.selectbox(
             f"Pick Well ({fluid_name})",
-            options=sorted(opts['label'].tolist()),
+            options=labels,
             key=f"{fluid_name}_plot_pick"
         )
-        pick_api = label_to_api[pick_label]
+        pick_well = pick_label
 
-        daily_api_set = st.session_state.get('daily_api_set', set())
-        is_daily = pick_api in daily_api_set
+        daily_well_set = st.session_state.get('daily_well_set', set())
+        is_daily = pick_well in daily_well_set
 
         merged_m = st.session_state.get('merged_monthly')
         merged_d = st.session_state.get('merged_daily')
@@ -464,23 +408,16 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         models = _train_rf_hybrid(merged_m, merged_d, norm_col_for_models)
 
         if is_daily and merged_d is not None:
-            wd_d = merged_d[merged_d['API10'].astype(str) == pick_api].copy()
-            # ensure MonthYear exists
-            if 'MonthYear' not in wd_d.columns:
-                date_col = None
-                for c in ['Date','Day','ReportDate','ProductionDate']:
-                    if c in wd_d.columns: date_col=c; break
-                if date_col:
-                    wd_d['MonthYear'] = pd.to_datetime(wd_d[date_col]).dt.to_period('M')
+            wd_d = merged_d[merged_d['WellName'].astype(str) == pick_well].copy()
             # aggregate daily -> monthly for plotting
             vol_col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[fluid_name.lower()]
-            wd_m = (wd_d.groupby(['API10','WellName','MonthYear'], as_index=False)[vol_col].sum())
+            wd_m = (wd_d.groupby(['WellName','MonthYear'], as_index=False)[vol_col].sum())
             fc = forecast_one_well(wd_m, fluid_name.lower(), float(b_low), float(b_high), 600, models)
             fig = plot_one_well(wd_m, fc, fluid_name.lower())
         else:
             wd_m = pd.DataFrame()
             if merged_m is not None:
-                wd_m = merged_m[merged_m['API10'].astype(str) == pick_api].copy()
+                wd_m = merged_m[merged_m['WellName'].astype(str) == pick_well].copy()
             if wd_m.empty:
                 st.warning("No production data found for this well.")
                 return
@@ -488,9 +425,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             fig = plot_one_well(wd_m, fc, fluid_name.lower())
         st.pyplot(fig, clear_figure=True)
 
-# ======================================================
-# ============ Fluid Sections ==========================
-# ======================================================
+# ================= Per-fluid sections =================
 fluid_block("Oil",   "EUR (Mbbl)",       "NormOil")
 st.markdown("---")
 fluid_block("Gas",   "EUR (MMcf)",       "NormGas")
@@ -498,7 +433,7 @@ st.markdown("---")
 fluid_block("Water", "EUR (Mbbl water)", "NormWater")
 st.markdown("---")
 
-# ================= Final: Type Wells summary + P10/P50/P90 plots =================
+# ================= Type Wells summary + P10/P50/P90 =================
 st.header("Type Wells — Summary (End)")
 
 def _eurs_from_oneline(df: pd.DataFrame, col: str) -> list[float]:
@@ -547,7 +482,7 @@ with tw_tabs[2]:
         st.subheader("Water Type Curve (P10 / P50 / P90)")
         st.pyplot(plot_type_curves(curves, lines, "water"))
 
-st.caption("Hybrid daily + monthly forecasting workflow — SE Tools")
+st.caption("WellName-based hybrid daily + monthly forecasting — SE Tools")
 
 # =========================== PDF REPORT ===========================
 from reportlab.lib.pagesizes import letter
@@ -563,7 +498,6 @@ def _df_to_table(df: pd.DataFrame, title: str, font_size: int = 7):
     styles = getSampleStyleSheet()
     if df is None or df.empty:
         return [Paragraph(f"<b>{title}</b> — (no data)", styles['Heading3']), Spacer(1,6)]
-
     df_str = format_df_2dec(df)
     data = [df_str.columns.tolist()] + df_str.values.tolist()
     tbl = Table(data, repeatRows=1)
@@ -692,7 +626,6 @@ if any(k in st.session_state for k in ["Oil_oneline","Gas_oneline","Water_onelin
 
         doc.build(story, onFirstPage=_logo_on_page, onLaterPages=_logo_on_page)
 
-        # Cleanup temp images used in this build
         for p in list(_TMP_PNGS):
             try: os.unlink(p)
             except Exception: pass
