@@ -434,7 +434,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Probit", color=_phase_color(fluid_name))
                 st.pyplot(fig)
 
-        # ---------- Per-well Plot (robust; daily preferred) ----------
+        # ---------- Per-well Plot (daily preferred) ----------
         st.subheader(f"{fluid_name} — Per-well Plot")
         picker = st.session_state.merged
         base = picker[['API10']].astype({'API10': str}).copy()
