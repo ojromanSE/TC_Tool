@@ -173,22 +173,31 @@ class PreprocessConfig:
     normalization_length: int = 10_000
     use_normalization: bool = True
 
-def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessConfig) -> pd.DataFrame:
-    hd = header_df.copy(); pr = prod_df.copy()
-    hd['API10'] = hd['API10'].astype(str); pr['API10'] = pr['API10'].astype(str)
-    pr['MonthYear'] = pr['ReportDate'].dt.to_period('M')
 
+def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessConfig) -> pd.DataFrame:
+    """
+    Merge monthly production with header using WellName instead of API10.
+    """
+    hd = header_df.copy()
+    pr = prod_df.copy()
+
+    # Normalize WellName
+    hd['WellName'] = hd['WellName'].astype(str).str.strip().str.upper()
+    pr['WellName'] = pr['WellName'].astype(str).str.strip().str.upper()
+
+    pr['MonthYear'] = pr['ReportDate'].dt.to_period('M')
     pr = pr.dropna(subset=['TotalOil','TotalGas','TotalWater'])
     pr = pr[(pr['TotalOil']>0)|(pr['TotalGas']>0)|(pr['TotalWater']>0)]
 
-    pr = pr.sort_values(['API10','MonthYear','TotalOil','TotalGas','TotalWater'],
+    pr = pr.sort_values(['WellName','MonthYear','TotalOil','TotalGas','TotalWater'],
                         ascending=[True,True,False,False,False])
-    pr = pr.drop_duplicates(subset=['API10','MonthYear'], keep='first')
+    pr = pr.drop_duplicates(subset=['WellName','MonthYear'], keep='first')
 
-    keep_hdr = ['API10','WellName','State','County','PrimaryFormation',
-                'LateralLength','CompletionDate','FirstProdDate']
+    keep_hdr = ['WellName','State','County','PrimaryFormation','LateralLength',
+                'CompletionDate','FirstProdDate']
     keep_hdr = [c for c in keep_hdr if c in hd.columns]
-    merged = pr.merge(hd[keep_hdr], on='API10', how='inner')
+
+    merged = pr.merge(hd[keep_hdr], on='WellName', how='inner')
 
     if cfg.use_normalization:
         s = cfg.normalization_length / merged['LateralLength']
@@ -204,24 +213,32 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     merged = merged[(merged['NormOil']>0)|(merged['NormGas']>0)|(merged['NormWater']>0)]
     return merged
 
-# ---------------- Preprocess DAILY: merge + normalization ----------------
+
 @dataclass
 class PreprocessDailyConfig:
     normalization_length: int = 10_000
     use_normalization: bool = True
 
+
 def preprocess_daily(header_df: pd.DataFrame, daily_df: pd.DataFrame,
                      cfg: PreprocessDailyConfig) -> pd.DataFrame:
-    hd = header_df.copy(); pr = daily_df.copy()
-    hd['API10'] = hd['API10'].astype(str); pr['API10'] = pr['API10'].astype(str)
+    """
+    Merge daily production with header using WellName instead of API10.
+    """
+    hd = header_df.copy()
+    pr = daily_df.copy()
+
+    hd['WellName'] = hd['WellName'].astype(str).str.strip().str.upper()
+    pr['WellName'] = pr['WellName'].astype(str).str.strip().str.upper()
 
     pr = pr.dropna(subset=['DailyOil','DailyGas','DailyWater'])
     pr = pr[(pr['DailyOil']>0)|(pr['DailyGas']>0)|(pr['DailyWater']>0)]
 
-    keep_hdr = ['API10','WellName','State','County','PrimaryFormation',
-                'LateralLength','CompletionDate','FirstProdDate']
+    keep_hdr = ['WellName','State','County','PrimaryFormation','LateralLength',
+                'CompletionDate','FirstProdDate']
     keep_hdr = [c for c in keep_hdr if c in hd.columns]
-    merged = pr.merge(hd[keep_hdr], on='API10', how='inner')
+
+    merged = pr.merge(hd[keep_hdr], on='WellName', how='inner')
 
     if cfg.use_normalization:
         s = cfg.normalization_length / merged['LateralLength']
@@ -235,10 +252,10 @@ def preprocess_daily(header_df: pd.DataFrame, daily_df: pd.DataFrame,
 
     merged.replace([np.inf,-np.inf], np.finfo(np.float64).max, inplace=True)
     merged = merged[(merged['NormOil']>0)|(merged['NormGas']>0)|(merged['NormWater']>0)]
-    # Keep a daily timestamp; also store month for later aggregation
-    merged['Day'] = pd.to_datetime(merged['Date']).dt.normalize()
+    merged['Day'] = pd.to_datetime(merged['Date'], errors='coerce').dt.normalize()
     merged['MonthYear'] = merged['Day'].dt.to_period('M')
     return merged
+
 
 # ---------------- Decline model + RF seeding ----------------
 def arps(qi: float, b: float, di: float, t: np.ndarray) -> np.ndarray:
