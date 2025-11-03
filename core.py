@@ -390,31 +390,71 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
 def _aggregate_daily_to_monthly(df: pd.DataFrame, com: str) -> pd.DataFrame:
     """
     Convert a daily, normalized dataframe to monthly totals.
-    Requires NormOil/NormGas/NormWater already present (from preprocess_daily).
+    Robust to missing MonthYear / WellName and to Norm* not present.
+    Returns columns: ['API10','WellName','Date', f'Monthly_{com}_volume', 'Segment']
     """
+    out_cols = ['API10','WellName','Date', f'Monthly_{com}_volume', 'Segment']
+
     if df is None or df.empty:
-        return pd.DataFrame(columns=['API10','WellName','Date',f'Monthly_{com}_volume','Segment'])
+        return pd.DataFrame(columns=out_cols)
 
     df = df.copy()
-    # Ensure MonthYear exists
+
+    # ---- Ensure API10 as string
+    if 'API10' not in df.columns:
+        raise KeyError("Daily data missing 'API10' column after preprocess_daily().")
+    df['API10'] = df['API10'].astype(str)
+
+    # ---- Ensure WellName present (fallback to API10)
+    if 'WellName' not in df.columns:
+        df['WellName'] = df['API10']
+    else:
+        # If fully/mostly missing, fill from API10
+        if df['WellName'].isna().all():
+            df['WellName'] = df['API10']
+        else:
+            df['WellName'] = df['WellName'].fillna(df['API10'])
+
+    # ---- Find a usable date column and build MonthYear
     if 'MonthYear' not in df.columns:
         date_col = None
         for cand in ['Day', 'Date', 'ReportDate', 'ProductionDate']:
             if cand in df.columns:
-                date_col = cand; break
+                date_col = cand
+                break
         if date_col is None:
-            raise KeyError("Daily data missing date column (Day/Date/ReportDate).")
-        df['MonthYear'] = pd.to_datetime(df[date_col]).dt.to_period('M')
+            raise KeyError(
+                f"Daily data missing a date column (expected one of Day/Date/ReportDate/ProductionDate). "
+                f"Columns seen: {list(df.columns)}"
+            )
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df = df.dropna(subset=[date_col])
+        df['MonthYear'] = df[date_col].dt.to_period('M')
 
-    vol_col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[com]
-    out_col = f"Monthly_{com}_volume"
+    # ---- Pick the correct volume column
+    norm_map = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}
+    daily_map = {'oil': 'DailyOil', 'gas': 'DailyGas', 'water': 'DailyWater'}
+    vol_col = norm_map[com]
 
-    g = (df.groupby(['API10','WellName','MonthYear'], as_index=False)[vol_col]
-           .sum()
-           .rename(columns={vol_col: out_col}))
+    if vol_col not in df.columns:
+        # Fallback to daily raw if normalization somehow wasn’t applied (shouldn’t happen, but safe)
+        if daily_map[com] in df.columns:
+            vol_col = daily_map[com]
+        else:
+            raise KeyError(
+                f"Neither '{norm_map[com]}' nor '{daily_map[com]}' present in daily data for commodity '{com}'. "
+                f"Columns: {list(df.columns)}"
+            )
+
+    # ---- Group and output
+    g = (
+        df.groupby(['API10','WellName','MonthYear'], as_index=False)[vol_col]
+          .sum()
+          .rename(columns={vol_col: f"Monthly_{com}_volume"})
+    )
     g['Date'] = g['MonthYear'].dt.to_timestamp(how='start')
     g['Segment'] = 'Historical'
-    return g[['API10','WellName','Date',out_col,'Segment']]
+    return g[['API10','WellName','Date', f'Monthly_{com}_volume', 'Segment']]
 
 def forecast_one_well_daily(wd: pd.DataFrame, commodity: str,
                             b_low: float, b_high: float, max_days: int,
