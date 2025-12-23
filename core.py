@@ -24,7 +24,6 @@ REQUIRED_PROD_COLUMNS = [
 ]
 
 # Maps: {Target Name : Source Name}
-# The code will look for the 'Source Name' in your CSV and rename it to 'Target Name'.
 HEADER_COLUMN_MAPS = [
     # WDB-style
     {'WellName':'WellName','County':'County','LateralLength':'LateralLength',
@@ -45,29 +44,22 @@ PROD_COLUMN_MAPS = [
 ]
 
 def _normalize_columns_before_map(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Pre-processes the raw CSV dataframe to handle aliases and missing APIs
-    BEFORE we attempt strict mapping.
-    """
-    # 1. API Logic: Try to create a valid 'API10' column from various common names
-    # If API10 exists, we are good. If not, try API14, API12, API/UWI, or API.
+    """Pre-processes the raw CSV to handle aliases and missing APIs."""
+    # 1. API Logic
     if 'API10' not in df.columns:
         for alias in ['API14', 'API12', 'API/UWI', 'API']:
             if alias in df.columns:
-                # Clean and slice to 10 chars
                 df['API10'] = df[alias].astype(str).str.replace(r'\.0$', '', regex=True).str[:10]
                 break
 
-    # 2. Lateral Length Logic: If 'DI Lateral Length' is missing but 'Horizontal Length' exists, alias it.
-    # We only alias if the target map key is missing to avoid overwriting.
+    # 2. Lateral Length Aliases
     if 'DI Lateral Length' not in df.columns and 'LateralLength' not in df.columns:
         for alias in ['HorizontalLength', 'Horizontal Length', 'Lateral Length']:
             if alias in df.columns:
                 df['LateralLength'] = df[alias]
                 break
 
-    # 3. Create NaN placeholder for LateralLength if completely missing
-    # This allows the code to proceed so you can use the "Fill by Geo" feature in the UI.
+    # 3. Create NaN placeholder if completely missing
     if 'LateralLength' not in df.columns and 'DI Lateral Length' not in df.columns:
         df['LateralLength'] = np.nan
 
@@ -77,45 +69,32 @@ def _normalize_columns_before_map(df: pd.DataFrame) -> pd.DataFrame:
             if alias in df.columns:
                 df['Completion Date'] = df[alias]
                 break
-                
     if 'First Prod Date' not in df.columns and 'FirstProdDate' not in df.columns:
         for alias in ['FirstProductionDate']:
             if alias in df.columns:
                 df['First Prod Date'] = df[alias]
-                break
-                
+                break       
     return df
 
 def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
-    """
-    Safely maps source columns to target columns.
-    CRITICAL FIX: strictly selects source columns first to avoid duplicate column errors.
-    """
+    """Safely maps source columns to target columns without collisions."""
     for m in maps:
-        # Check if all source columns (values in the map) exist in the dataframe
         if all(c in df.columns for c in m.values()):
-            # 1. Create a dictionary of {Target: Series} to build a clean new DataFrame
-            # This avoids any issues with duplicate column names in the original df
             new_data = {}
             for target_name, source_name in m.items():
                 new_data[target_name] = df[source_name]
             
             subset = pd.DataFrame(new_data)
             
-            # 2. Check if we are missing any required columns that weren't in the map
-            # (In this design, the map should cover everything, or we handle it via _normalize)
+            # Check for missing required columns not in the map (e.g. LateralLength placeholder)
             missing = [c for c in required if c not in subset.columns]
-            
-            # If 'LateralLength' is missing from the subset but we put a NaN placeholder in raw df, grab it
             if 'LateralLength' in missing and 'LateralLength' in df.columns:
                  subset['LateralLength'] = df['LateralLength']
 
-            # Double check requirements
             final_miss = [c for c in required if c not in subset.columns]
             if not final_miss:
                 return subset[required].copy()
             
-    # If we get here, no map matched.
     raise ValueError(f"Could not map columns. Found in file: {list(df.columns)}")
 
 def load_header(file_like) -> pd.DataFrame:
@@ -177,7 +156,6 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     hd['API10'] = hd['API10'].astype(str); pr['API10'] = pr['API10'].astype(str)
     pr['MonthYear'] = pr['ReportDate'].dt.to_period('M')
 
-    # Keep all production (including 0s)
     pr = pr.dropna(subset=['TotalOil','TotalGas','TotalWater'])
     
     pr = pr.sort_values(['API10','MonthYear','TotalOil','TotalGas','TotalWater'],
@@ -187,16 +165,12 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     keep_hdr = ['API10','WellName','State','County','PrimaryFormation',
                 'LateralLength','CompletionDate','FirstProdDate']
     keep_hdr = [c for c in keep_hdr if c in hd.columns]
-    
-    # Merge on API10 (The only reliable way)
     merged = pr.merge(hd[keep_hdr], on='API10', how='inner')
 
     if cfg.use_normalization:
-        # Avoid division by zero/NaN if lateral is missing/zero
         merged['LateralLength'] = pd.to_numeric(merged['LateralLength'], errors='coerce').replace(0, np.nan)
         s = cfg.normalization_length / merged['LateralLength']
         
-        # Ensure numeric types
         for c in ['TotalOil','TotalGas','TotalWater']:
             merged[c] = pd.to_numeric(merged[c], errors='coerce').fillna(0)
 
@@ -209,8 +183,6 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
         merged['NormWater'] = merged['TotalWater']
 
     merged = merged.replace([np.inf, -np.inf], np.finfo(np.float64).max)
-    
-    # Drop rows where normalization failed (NaN/Inf) but keep 0s.
     merged = merged.dropna(subset=['NormOil','NormGas','NormWater'])
     return merged
 
@@ -228,7 +200,6 @@ def _smooth(x, w=3):
     return s.rolling(window=w, center=True, min_periods=1).mean().values
 
 def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegressor]:
-    # Train only on non-zero averages
     agg = (df.groupby('API10')[['NormOil','NormGas','NormWater']]
              .mean().reset_index())
     agg = agg.dropna(subset=[target_col])
@@ -290,6 +261,13 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     return dict(qi=qi, b=b, di=di, t_hist=t_hist, hist=y_hist,
                 fit_hist=fit_hist, f_months=np.array(f_m,int), f_vals=np.array(f_v,float),
                 EUR_total=eur_hist+eur_fcst, EUR_fcst=eur_fcst)
+
+@dataclass
+class ForecastConfig:
+    commodity: str      # 'oil'|'gas'|'water'
+    b_low: float = 0.8
+    b_high: float = 1.2
+    max_months: int = 600
 
 def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
     com = cfg.commodity.lower()
