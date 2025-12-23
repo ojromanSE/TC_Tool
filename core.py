@@ -24,6 +24,7 @@ REQUIRED_PROD_COLUMNS = [
 ]
 
 # Maps: {Target Name : Source Name}
+# The code will look for the 'Source Name' in your CSV and rename it to 'Target Name'.
 HEADER_COLUMN_MAPS = [
     # WDB-style
     {'WellName':'WellName','County':'County','LateralLength':'LateralLength',
@@ -43,66 +44,88 @@ PROD_COLUMN_MAPS = [
      'TotalGas':'Monthly Gas','TotalWater':'Monthly Water','API10':'API10'}
 ]
 
-def _normalize_header_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Helper: Create missing columns from known aliases/derivations."""
-    # 1. Fix API
-    if 'API14' in df.columns and 'API10' not in df.columns:
-        df['API10'] = df['API14'].astype(str).str[:10]
-    if 'API10' in df.columns and 'API' not in df.columns:
-        df['API'] = df['API10']
-    
-    # 2. Fix LateralLength aliases
-    if 'LateralLength' not in df.columns:
+def _normalize_columns_before_map(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pre-processes the raw CSV dataframe to handle aliases and missing APIs
+    BEFORE we attempt strict mapping.
+    """
+    # 1. API Logic: Try to create a valid 'API10' column from various common names
+    # If API10 exists, we are good. If not, try API14, API12, API/UWI, or API.
+    if 'API10' not in df.columns:
+        for alias in ['API14', 'API12', 'API/UWI', 'API']:
+            if alias in df.columns:
+                # Clean and slice to 10 chars
+                df['API10'] = df[alias].astype(str).str.replace(r'\.0$', '', regex=True).str[:10]
+                break
+
+    # 2. Lateral Length Logic: If 'DI Lateral Length' is missing but 'Horizontal Length' exists, alias it.
+    # We only alias if the target map key is missing to avoid overwriting.
+    if 'DI Lateral Length' not in df.columns and 'LateralLength' not in df.columns:
         for alias in ['HorizontalLength', 'Horizontal Length', 'Lateral Length']:
             if alias in df.columns:
                 df['LateralLength'] = df[alias]
                 break
-    
-    # 3. Create NaN placeholder if completely missing (allows load to proceed)
-    if 'LateralLength' not in df.columns and 'Latitude' in df.columns:
+
+    # 3. Create NaN placeholder for LateralLength if completely missing
+    # This allows the code to proceed so you can use the "Fill by Geo" feature in the UI.
+    if 'LateralLength' not in df.columns and 'DI Lateral Length' not in df.columns:
         df['LateralLength'] = np.nan
 
-    # 4. Dates
-    if 'CompletionDate' not in df.columns:
-        for alias in ['Completion Date', 'SpudDate', 'Spud Date']:
+    # 4. Date Aliases
+    if 'Completion Date' not in df.columns and 'CompletionDate' not in df.columns:
+        for alias in ['SpudDate', 'Spud Date']:
             if alias in df.columns:
-                df['CompletionDate'] = df[alias]
+                df['Completion Date'] = df[alias]
                 break
-    if 'FirstProdDate' not in df.columns:
-        for alias in ['First Prod Date', 'FirstProductionDate']:
+                
+    if 'First Prod Date' not in df.columns and 'FirstProdDate' not in df.columns:
+        for alias in ['FirstProductionDate']:
             if alias in df.columns:
-                df['FirstProdDate'] = df[alias]
+                df['First Prod Date'] = df[alias]
                 break
+                
     return df
 
 def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
-    """Safely maps source columns to target columns without collisions."""
+    """
+    Safely maps source columns to target columns.
+    CRITICAL FIX: strictly selects source columns first to avoid duplicate column errors.
+    """
     for m in maps:
+        # Check if all source columns (values in the map) exist in the dataframe
         if all(c in df.columns for c in m.values()):
-            # Select ONLY source columns first to avoid collision
-            sources = list(m.values())
-            subset = df[sources].copy()
-            # Rename
-            subset = subset.rename(columns={v:k for k,v in m.items()})
-            # Return subset matching required
-            return subset[required].copy()
+            # 1. Create a dictionary of {Target: Series} to build a clean new DataFrame
+            # This avoids any issues with duplicate column names in the original df
+            new_data = {}
+            for target_name, source_name in m.items():
+                new_data[target_name] = df[source_name]
             
-    # If we get here, no map matched completely.
+            subset = pd.DataFrame(new_data)
+            
+            # 2. Check if we are missing any required columns that weren't in the map
+            # (In this design, the map should cover everything, or we handle it via _normalize)
+            missing = [c for c in required if c not in subset.columns]
+            
+            # If 'LateralLength' is missing from the subset but we put a NaN placeholder in raw df, grab it
+            if 'LateralLength' in missing and 'LateralLength' in df.columns:
+                 subset['LateralLength'] = df['LateralLength']
+
+            # Double check requirements
+            final_miss = [c for c in required if c not in subset.columns]
+            if not final_miss:
+                return subset[required].copy()
+            
+    # If we get here, no map matched.
     raise ValueError(f"Could not map columns. Found in file: {list(df.columns)}")
 
 def load_header(file_like) -> pd.DataFrame:
     df = pd.read_csv(file_like)
-    df = _normalize_header_columns(df)
+    df = _normalize_columns_before_map(df)
     return _translate(df, HEADER_COLUMN_MAPS, REQUIRED_HEADER_COLUMNS)
 
 def load_production(file_like) -> pd.DataFrame:
     df = pd.read_csv(file_like)
-    # Normalize Prod columns (API)
-    if 'API/UWI' in df.columns and 'API10' not in df.columns:
-        df['API10'] = df['API/UWI'].astype(str).str[:10]
-    if 'API10' in df.columns and 'API' not in df.columns:
-        df['API'] = df['API10']
-        
+    df = _normalize_columns_before_map(df)
     out = _translate(df, PROD_COLUMN_MAPS, REQUIRED_PROD_COLUMNS)
     out['ReportDate'] = pd.to_datetime(out['ReportDate'])
     return out
@@ -164,10 +187,12 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     keep_hdr = ['API10','WellName','State','County','PrimaryFormation',
                 'LateralLength','CompletionDate','FirstProdDate']
     keep_hdr = [c for c in keep_hdr if c in hd.columns]
+    
+    # Merge on API10 (The only reliable way)
     merged = pr.merge(hd[keep_hdr], on='API10', how='inner')
 
     if cfg.use_normalization:
-        # Avoid division by zero/NaN
+        # Avoid division by zero/NaN if lateral is missing/zero
         merged['LateralLength'] = pd.to_numeric(merged['LateralLength'], errors='coerce').replace(0, np.nan)
         s = cfg.normalization_length / merged['LateralLength']
         
@@ -184,7 +209,8 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
         merged['NormWater'] = merged['TotalWater']
 
     merged = merged.replace([np.inf, -np.inf], np.finfo(np.float64).max)
-    # Only drop rows where normalization failed (NaN/Inf), keep 0s.
+    
+    # Drop rows where normalization failed (NaN/Inf) but keep 0s.
     merged = merged.dropna(subset=['NormOil','NormGas','NormWater'])
     return merged
 
