@@ -24,7 +24,6 @@ from core import (
 st.set_page_config(page_title="SE Tool", layout="wide")
 
 # ---------- Paths / constants ----------
-# FIX: Use pathlib for robust cross-platform/container paths
 LOGO_PATH = pathlib.Path(__file__).parent / "static" / "logo.png"
 
 # ---------- Top header with logo (left) + status/title (right) ----------
@@ -52,7 +51,6 @@ with st.sidebar:
     if st.button("Reset All"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
-        # FIX: experimental_rerun is deprecated
         st.rerun()
 
 # ================= Formatting helpers (2 decimals everywhere) =================
@@ -370,7 +368,6 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         models = _train_rf(merged, norm_col_for_models)
         fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
         fig = plot_one_well(wd, fc, fluid_name.lower())
-        # FIX: clear_figure=True removed
         st.pyplot(fig)
 
 # ================= Per-fluid sections =================
