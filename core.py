@@ -1,6 +1,6 @@
 from __future__ import annotations
 import matplotlib
-# Fix for headless/cloud environments to prevent crash on import
+# Fix for headless/cloud environments
 matplotlib.use('Agg')
 
 import numpy as np
@@ -15,55 +15,59 @@ from matplotlib.ticker import LogLocator, FuncFormatter
 from scipy import stats
 
 # ---------------- Provider column maps ----------------
+# Added 'WellNumber' to requirements and maps
 REQUIRED_HEADER_COLUMNS = [
-    'WellName','County','LateralLength','PrimaryFormation',
+    'WellName','WellNumber','County','LateralLength','PrimaryFormation',
     'CompletionDate','FirstProdDate','State','API10'
 ]
 REQUIRED_PROD_COLUMNS = [
-    'WellName','ReportDate','TotalOil','TotalGas','TotalWater','API10'
+    'WellName','WellNumber','ReportDate','TotalOil','TotalGas','TotalWater','API10'
 ]
 
-# Maps: {Target Name : Source Name}
 HEADER_COLUMN_MAPS = [
     # WDB-style
-    {'WellName':'WellName','County':'County','LateralLength':'LateralLength',
+    {'WellName':'WellName','WellNumber':'WellNumber','County':'County','LateralLength':'LateralLength',
      'PrimaryFormation':'PrimaryFormation','CompletionDate':'CompletionDate',
      'FirstProdDate':'FirstProdDate','State':'State','API10':'API'},
     # DI / IHS-style
-    {'WellName':'Well Name','County':'County/Parish','LateralLength':'DI Lateral Length',
+    {'WellName':'Well Name','WellNumber':'Well Number','County':'County/Parish','LateralLength':'DI Lateral Length',
      'PrimaryFormation':'Producing Reservoir','CompletionDate':'Completion Date',
      'FirstProdDate':'First Prod Date','State':'State','API10':'API10'}
 ]
 PROD_COLUMN_MAPS = [
     # WDB-style
-    {'WellName':'WellName','ReportDate':'ReportDate','TotalOil':'TotalOil',
+    {'WellName':'WellName','WellNumber':'WellNumber','ReportDate':'ReportDate','TotalOil':'TotalOil',
      'TotalGas':'TotalGas','TotalWater':'TotalWater','API10':'API'},
     # DI / IHS-style
-    {'WellName':'Well Name','ReportDate':'Monthly Production Date','TotalOil':'Monthly Oil',
+    {'WellName':'Well Name','WellNumber':'Well Number','ReportDate':'Monthly Production Date','TotalOil':'Monthly Oil',
      'TotalGas':'Monthly Gas','TotalWater':'Monthly Water','API10':'API10'}
 ]
 
 def _normalize_columns_before_map(df: pd.DataFrame) -> pd.DataFrame:
-    """Pre-processes the raw CSV to handle aliases and missing APIs."""
-    # 1. API Logic
+    # 1. API Logic (still useful for display/QC)
     if 'API10' not in df.columns:
         for alias in ['API14', 'API12', 'API/UWI', 'API']:
             if alias in df.columns:
                 df['API10'] = df[alias].astype(str).str.replace(r'\.0$', '', regex=True).str[:10]
                 break
+    
+    # 2. Well Number Aliases
+    if 'Well Number' not in df.columns and 'WellNumber' not in df.columns:
+        if 'WellNumber' in df.columns:
+            df['Well Number'] = df['WellNumber']
 
-    # 2. Lateral Length Aliases
+    # 3. Lateral Length Aliases
     if 'DI Lateral Length' not in df.columns and 'LateralLength' not in df.columns:
         for alias in ['HorizontalLength', 'Horizontal Length', 'Lateral Length']:
             if alias in df.columns:
                 df['LateralLength'] = df[alias]
                 break
 
-    # 3. Create NaN placeholder if completely missing
+    # 4. Create NaN placeholder if completely missing
     if 'LateralLength' not in df.columns and 'DI Lateral Length' not in df.columns:
         df['LateralLength'] = np.nan
 
-    # 4. Date Aliases
+    # 5. Date Aliases
     if 'Completion Date' not in df.columns and 'CompletionDate' not in df.columns:
         for alias in ['SpudDate', 'Spud Date']:
             if alias in df.columns:
@@ -77,7 +81,6 @@ def _normalize_columns_before_map(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
-    """Safely maps source columns to target columns without collisions."""
     for m in maps:
         if all(c in df.columns for c in m.values()):
             new_data = {}
@@ -86,7 +89,6 @@ def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
             
             subset = pd.DataFrame(new_data)
             
-            # Check for missing required columns not in the map (e.g. LateralLength placeholder)
             missing = [c for c in required if c not in subset.columns]
             if 'LateralLength' in missing and 'LateralLength' in df.columns:
                  subset['LateralLength'] = df['LateralLength']
@@ -151,21 +153,46 @@ class PreprocessConfig:
     normalization_length: int = 10_000
     use_normalization: bool = True
 
+def _make_well_id(df: pd.DataFrame) -> pd.Series:
+    """Creates composite ID from WellName + WellNumber"""
+    wn = df['WellName'].astype(str).str.strip().str.upper()
+    # Remove .0 from float-like strings (e.g. "1.0" -> "1")
+    num = df['WellNumber'].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
+    return wn + "_" + num
+
 def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessConfig) -> pd.DataFrame:
     hd = header_df.copy(); pr = prod_df.copy()
-    hd['API10'] = hd['API10'].astype(str); pr['API10'] = pr['API10'].astype(str)
+    
+    # Create WellID for merging
+    hd['WellID'] = _make_well_id(hd)
+    pr['WellID'] = _make_well_id(pr)
+    
     pr['MonthYear'] = pr['ReportDate'].dt.to_period('M')
 
     pr = pr.dropna(subset=['TotalOil','TotalGas','TotalWater'])
     
-    pr = pr.sort_values(['API10','MonthYear','TotalOil','TotalGas','TotalWater'],
+    # Sort and Deduplicate
+    pr = pr.sort_values(['WellID','MonthYear','TotalOil','TotalGas','TotalWater'],
                         ascending=[True,True,False,False,False])
-    pr = pr.drop_duplicates(subset=['API10','MonthYear'], keep='first')
+    pr = pr.drop_duplicates(subset=['WellID','MonthYear'], keep='first')
 
-    keep_hdr = ['API10','WellName','State','County','PrimaryFormation',
+    keep_hdr = ['WellID','API10','WellName','WellNumber','State','County','PrimaryFormation',
                 'LateralLength','CompletionDate','FirstProdDate']
     keep_hdr = [c for c in keep_hdr if c in hd.columns]
-    merged = pr.merge(hd[keep_hdr], on='API10', how='inner')
+    
+    # MERGE ON WellID instead of API10
+    merged = pr.merge(hd[keep_hdr], on='WellID', how='inner', suffixes=('', '_hdr'))
+    
+    # Clean up name/number collisions if any
+    if 'WellName_hdr' in merged.columns: 
+        merged['WellName'] = merged['WellName_hdr']
+        merged = merged.drop(columns=['WellName_hdr'])
+    if 'WellNumber_hdr' in merged.columns:
+        merged['WellNumber'] = merged['WellNumber_hdr']
+        merged = merged.drop(columns=['WellNumber_hdr'])
+    if 'API10_hdr' in merged.columns:
+        merged['API10'] = merged['API10_hdr']
+        merged = merged.drop(columns=['API10_hdr'])
 
     if cfg.use_normalization:
         merged['LateralLength'] = pd.to_numeric(merged['LateralLength'], errors='coerce').replace(0, np.nan)
@@ -200,7 +227,8 @@ def _smooth(x, w=3):
     return s.rolling(window=w, center=True, min_periods=1).mean().values
 
 def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegressor]:
-    agg = (df.groupby('API10')[['NormOil','NormGas','NormWater']]
+    # Group by WellID for training
+    agg = (df.groupby('WellID')[['NormOil','NormGas','NormWater']]
              .mean().reset_index())
     agg = agg.dropna(subset=[target_col])
     
@@ -275,19 +303,27 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
     models = _train_rf(merged, col)
 
     oneline, monthly = [], []
-    for api10, wd in merged.groupby('API10'):
+    
+    # Group by WellID
+    for well_id, wd in merged.groupby('WellID'):
         if wd[col].max()<=0 or wd[col].sum()<=0:
             continue
         fc = forecast_one_well(wd, com, cfg.b_low, cfg.b_high, cfg.max_months, models)
-        hdr = wd.iloc[0]; well = hdr.get('WellName','N/A')
+        hdr = wd.iloc[0]; 
+        well = hdr.get('WellName','N/A')
+        api10 = hdr.get('API10','N/A')
 
         qi_day = fc['qi']/30.4
         q12 = float(arps(fc['qi'], fc['b'], fc['di'], np.array([12.0]))[0])
         decline_yr = (1.0 - (q12/fc['qi']))*100.0 if fc['qi']>0 else 0.0
 
         row = {
-            'API10': str(api10), 'WellName': well,
-            'State': hdr.get('State'), 'County': hdr.get('County'),
+            'WellID': str(well_id),
+            'API10': str(api10), 
+            'WellName': well,
+            'WellNumber': str(hdr.get('WellNumber','')),
+            'State': hdr.get('State'), 
+            'County': hdr.get('County'),
             'PrimaryFormation': hdr.get('PrimaryFormation'),
             'LateralLength': hdr.get('LateralLength'),
             'CompletionDate': hdr.get('CompletionDate'),
@@ -315,14 +351,16 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
         f_dates = pd.date_range(start=start, periods=len(fc['f_vals']), freq='MS')
 
         for d,v in zip(hist_dates, hist_vals):
-            monthly.append({'API10':str(api10),'WellName':well,'Date':d,
+            monthly.append({'WellID':str(well_id), 'API10':str(api10),
+                            'WellName':well, 'Date':d,
                             f'Monthly_{com}_volume':float(v),'Segment':'Historical'})
         for d,v in zip(f_dates, fc['f_vals']):
-            monthly.append({'API10':str(api10),'WellName':well,'Date':d,
+            monthly.append({'WellID':str(well_id), 'API10':str(api10),
+                            'WellName':well, 'Date':d,
                             f'Monthly_{com}_volume':float(v),'Segment':'Forecast'})
 
     oneline_df = pd.DataFrame(oneline)
-    monthly_df = pd.DataFrame(monthly).sort_values(['API10','Date','Segment'])
+    monthly_df = pd.DataFrame(monthly).sort_values(['WellID','Date','Segment'])
     return oneline_df, monthly_df
 
 def compute_eur_stats(eur_array: List[float]) -> Dict[str, float]:
@@ -415,6 +453,9 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     unit = {"oil":"(norm bbl/mo)","gas":"(norm Mcf/mo)","water":"(norm bbl/mo)"}[com]
     well = wd.iloc[0].get('WellName','N/A')
     api  = str(wd.iloc[0].get('API10',''))
+    # Use WellID for title if API is empty
+    if not api or api == 'nan':
+        api = wd.iloc[0].get('WellID','N/A')
 
     fig, ax = plt.subplots(figsize=(10,6))
     if len(hist_dates) > 0:
@@ -423,7 +464,7 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     if len(f_dates) > 0:
         ax.plot(f_dates, f_vals, label="Forecast", linestyle="--", linewidth=2, color=color)
 
-    ax.set_title(f"{well} | API {api} | {commodity.capitalize()}")
+    ax.set_title(f"{well} | ID: {api} | {commodity.capitalize()}")
     ax.set_xlabel("Month")
     ax.set_ylabel(f"Monthly {commodity} {unit}")
     ax.set_yscale('log')
