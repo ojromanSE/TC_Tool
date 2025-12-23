@@ -48,6 +48,9 @@ def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
 
 def load_header(file_like) -> pd.DataFrame:
     df = pd.read_csv(file_like)
+    # FIX: If API10 is missing but API14 exists, derive API10
+    if 'API14' in df.columns and 'API10' not in df.columns:
+        df['API10'] = df['API14'].astype(str).str[:10]
     return _translate(df, HEADER_COLUMN_MAPS, REQUIRED_HEADER_COLUMNS)
 
 def load_production(file_like) -> pd.DataFrame:
@@ -96,8 +99,9 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     hd['API10'] = hd['API10'].astype(str); pr['API10'] = pr['API10'].astype(str)
     pr['MonthYear'] = pr['ReportDate'].dt.to_period('M')
 
+    # FIX: Don't filter out 0-production rows. "Use all production".
     pr = pr.dropna(subset=['TotalOil','TotalGas','TotalWater'])
-    pr = pr[(pr['TotalOil']>0)|(pr['TotalGas']>0)|(pr['TotalWater']>0)]
+    # pr = pr[(pr['TotalOil']>0)|(pr['TotalGas']>0)|(pr['TotalWater']>0)]
 
     pr = pr.sort_values(['API10','MonthYear','TotalOil','TotalGas','TotalWater'],
                         ascending=[True,True,False,False,False])
@@ -118,8 +122,11 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
         merged['NormGas']   = merged['TotalGas']
         merged['NormWater'] = merged['TotalWater']
 
-    merged.replace([np.inf,-np.inf], np.finfo(np.float64).max, inplace=True)
-    merged = merged[(merged['NormOil']>0)|(merged['NormGas']>0)|(merged['NormWater']>0)]
+    # FIX: inplace=True is deprecated
+    merged = merged.replace([np.inf, -np.inf], np.finfo(np.float64).max)
+    
+    # FIX: Don't filter out 0-production rows.
+    # merged = merged[(merged['NormOil']>0)|(merged['NormGas']>0)|(merged['NormWater']>0)]
     return merged
 
 # ---------------- Decline model + RF seeding ----------------
@@ -136,8 +143,13 @@ def _smooth(x, w=3):
     return s.rolling(window=w, center=True, min_periods=1).mean().values
 
 def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegressor]:
+    # For training RF, we still likely want to train only on non-zero averages
+    # to avoid training on dead wells.
     agg = (df.groupby('API10')[['NormOil','NormGas','NormWater']]
-             .mean().reset_index().dropna(subset=[target_col]))
+             .mean().reset_index())
+    # Drop rows where target col is NaN/Inf (just in case)
+    agg = agg.dropna(subset=[target_col])
+    
     X = agg[['NormOil','NormGas','NormWater']].values
     qi_model = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, agg[target_col].values)
     b_model  = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, np.full(len(agg), 1.0))
@@ -195,6 +207,7 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
 
     oneline, monthly = [], []
     for api10, wd in merged.groupby('API10'):
+        # Still skip if *all* history is <= 0 (dead well), otherwise we can't fit
         if wd[col].max()<=0 or wd[col].sum()<=0:
             continue
         fc = forecast_one_well(wd, com, cfg.b_low, cfg.b_high, cfg.max_months, models)
