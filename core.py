@@ -1,4 +1,8 @@
 from __future__ import annotations
+import matplotlib
+# Fix for headless/cloud environments to prevent crash on import
+matplotlib.use('Agg')
+
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -10,8 +14,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, FuncFormatter
 from scipy import stats
 
-# ---------------- Provider column maps (WDB & DI/IHS) ----------------
-# Internal target column names
+# ---------------- Provider column maps ----------------
 REQUIRED_HEADER_COLUMNS = [
     'WellName','County','LateralLength','PrimaryFormation',
     'CompletionDate','FirstProdDate','State','API10'
@@ -20,7 +23,7 @@ REQUIRED_PROD_COLUMNS = [
     'WellName','ReportDate','TotalOil','TotalGas','TotalWater','API10'
 ]
 
-# Maps are {Target Name : Source Name in CSV}
+# Maps: {Target Name : Source Name}
 HEADER_COLUMN_MAPS = [
     # WDB-style
     {'WellName':'WellName','County':'County','LateralLength':'LateralLength',
@@ -41,25 +44,21 @@ PROD_COLUMN_MAPS = [
 ]
 
 def _normalize_header_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Helper: Create missing columns from known aliases/derivations.
-    This runs BEFORE mapping to bridge gaps (e.g. creating API10 from API14).
-    """
-    # 1. Fix API: Ensure we have 'API' and 'API10' available
+    """Helper: Create missing columns from known aliases/derivations."""
+    # 1. Fix API
     if 'API14' in df.columns and 'API10' not in df.columns:
         df['API10'] = df['API14'].astype(str).str[:10]
     if 'API10' in df.columns and 'API' not in df.columns:
         df['API'] = df['API10']
     
-    # 2. Fix LateralLength: Check aliases if strict match missing
-    # (Only alias if strict match missing to avoid stomping on DI Lateral Length)
+    # 2. Fix LateralLength aliases
     if 'LateralLength' not in df.columns:
         for alias in ['HorizontalLength', 'Horizontal Length', 'Lateral Length']:
             if alias in df.columns:
                 df['LateralLength'] = df[alias]
                 break
     
-    # 3. Create NaN placeholder if completely missing (allows load to proceed, QC fills later)
+    # 3. Create NaN placeholder if completely missing (allows load to proceed)
     if 'LateralLength' not in df.columns and 'Latitude' in df.columns:
         df['LateralLength'] = np.nan
 
@@ -74,30 +73,19 @@ def _normalize_header_columns(df: pd.DataFrame) -> pd.DataFrame:
             if alias in df.columns:
                 df['FirstProdDate'] = df[alias]
                 break
-
     return df
 
 def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
-    """
-    Safely maps source columns to target columns.
-    PREVENTS COLLISIONS by selecting only the source columns before renaming.
-    """
+    """Safely maps source columns to target columns without collisions."""
     for m in maps:
-        # Check if all source columns (values in map) exist in df
         if all(c in df.columns for c in m.values()):
-            # 1. Select ONLY the source columns needed for this map
+            # Select ONLY source columns first to avoid collision
             sources = list(m.values())
             subset = df[sources].copy()
-            
-            # 2. Rename them to the target names
-            # This avoids "Duplicate Column" errors if a target name already existed in df
+            # Rename
             subset = subset.rename(columns={v:k for k,v in m.items()})
-            
-            # 3. Return only the required columns
-            # (We assume the map covers all required cols, or they were identity mapped)
-            miss = [c for c in required if c not in subset.columns]
-            if not miss:
-                return subset[required].copy()
+            # Return subset matching required
+            return subset[required].copy()
             
     # If we get here, no map matched completely.
     raise ValueError(f"Could not map columns. Found in file: {list(df.columns)}")
@@ -109,7 +97,7 @@ def load_header(file_like) -> pd.DataFrame:
 
 def load_production(file_like) -> pd.DataFrame:
     df = pd.read_csv(file_like)
-    # Normalize Prod columns (API handling)
+    # Normalize Prod columns (API)
     if 'API/UWI' in df.columns and 'API10' not in df.columns:
         df['API10'] = df['API/UWI'].astype(str).str[:10]
     if 'API10' in df.columns and 'API' not in df.columns:
@@ -183,7 +171,7 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
         merged['LateralLength'] = pd.to_numeric(merged['LateralLength'], errors='coerce').replace(0, np.nan)
         s = cfg.normalization_length / merged['LateralLength']
         
-        # Ensure numeric types for calc
+        # Ensure numeric types
         for c in ['TotalOil','TotalGas','TotalWater']:
             merged[c] = pd.to_numeric(merged[c], errors='coerce').fillna(0)
 
@@ -195,8 +183,8 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
         merged['NormGas']   = merged['TotalGas']
         merged['NormWater'] = merged['TotalWater']
 
-    # Deprecated replace cleanup
     merged = merged.replace([np.inf, -np.inf], np.finfo(np.float64).max)
+    # Only drop rows where normalization failed (NaN/Inf), keep 0s.
     merged = merged.dropna(subset=['NormOil','NormGas','NormWater'])
     return merged
 
@@ -214,14 +202,13 @@ def _smooth(x, w=3):
     return s.rolling(window=w, center=True, min_periods=1).mean().values
 
 def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegressor]:
-    # Train only on non-zero averages to avoid fitting dead wells
+    # Train only on non-zero averages
     agg = (df.groupby('API10')[['NormOil','NormGas','NormWater']]
              .mean().reset_index())
     agg = agg.dropna(subset=[target_col])
     
     X = agg[['NormOil','NormGas','NormWater']].values
     if len(X) == 0:
-        # Fallback dummy model if no valid training data
         dummy = RandomForestRegressor(n_estimators=1, random_state=42)
         dummy.fit([[0,0,0]], [0])
         return {'qi': dummy, 'b': dummy, 'di': dummy}
@@ -243,7 +230,6 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
 
     feats = np.array([[wd['NormOil'].mean(), wd['NormGas'].mean(), wd['NormWater'].mean()]], dtype=float)
     
-    # Safe predict
     try:
         qi_pred = float(models['qi'].predict(feats)[0])
         b_pred = float(models['b'].predict(feats)[0])
