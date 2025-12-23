@@ -4,6 +4,7 @@
 #      B-factor page uses a 2-column layout (plots left, stats table right)
 
 import os
+import pathlib
 import tempfile
 from io import BytesIO
 
@@ -23,13 +24,14 @@ from core import (
 st.set_page_config(page_title="SE Tool", layout="wide")
 
 # ---------- Paths / constants ----------
-LOGO_PATH = os.path.join("static", "logo.png")  # ensure tc_tool/static/logo.png exists
+# FIX: Use pathlib for robust cross-platform/container paths
+LOGO_PATH = pathlib.Path(__file__).parent / "static" / "logo.png"
 
 # ---------- Top header with logo (left) + status/title (right) ----------
 cols = st.columns([0.12, 0.88])
 with cols[0]:
-    if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, use_column_width=True)
+    if LOGO_PATH.exists():
+        st.image(str(LOGO_PATH), use_column_width=True)
 with cols[1]:
     st.success("All Systems Working")
     st.title("SE Oil & Gas Autoforecasting")
@@ -50,7 +52,8 @@ with st.sidebar:
     if st.button("Reset All"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
-        st.experimental_rerun()
+        # FIX: experimental_rerun is deprecated
+        st.rerun()
 
 # ================= Formatting helpers (2 decimals everywhere) =================
 def _fmt2(value) -> str:
@@ -367,7 +370,8 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         models = _train_rf(merged, norm_col_for_models)
         fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
         fig = plot_one_well(wd, fc, fluid_name.lower())
-        st.pyplot(fig, clear_figure=True)
+        # FIX: clear_figure=True removed
+        st.pyplot(fig)
 
 # ================= Per-fluid sections =================
 fluid_block("Oil",   "EUR (Mbbl)",        "NormOil")
@@ -467,8 +471,8 @@ def _df_to_table(df: pd.DataFrame, title: str, font_size: int = 7):
 def _logo_on_page(canvas, doc):
     """Draw logo at top-right and page number bottom-right, leaving a header band."""
     try:
-        if os.path.exists(LOGO_PATH):
-            img = ImageReader(LOGO_PATH)
+        if LOGO_PATH.exists():
+            img = ImageReader(str(LOGO_PATH))
             w, h = 0.9*inch, 0.9*inch
             canvas.drawImage(img, doc.pagesize[0]-w-0.4*inch, doc.pagesize[1]-h-0.35*inch,
                              width=w, height=h, preserveAspectRatio=True, mask='auto')
