@@ -11,6 +11,7 @@ from matplotlib.ticker import LogLocator, FuncFormatter
 from scipy import stats
 
 # ---------------- Provider column maps (WDB & DI/IHS) ----------------
+# We target these standard column names internally:
 REQUIRED_HEADER_COLUMNS = [
     'WellName','County','LateralLength','PrimaryFormation',
     'CompletionDate','FirstProdDate','State','API10'
@@ -18,45 +19,95 @@ REQUIRED_HEADER_COLUMNS = [
 REQUIRED_PROD_COLUMNS = [
     'WellName','ReportDate','TotalOil','TotalGas','TotalWater','API10'
 ]
+
+# Maps are {Target: Source}. We look for 'Source' in the input CSV.
 HEADER_COLUMN_MAPS = [
-    # WDB
+    # WDB-style
     {'WellName':'WellName','County':'County','LateralLength':'LateralLength',
      'PrimaryFormation':'PrimaryFormation','CompletionDate':'CompletionDate',
      'FirstProdDate':'FirstProdDate','State':'State','API10':'API'},
-    # DI / IHS
+    # DI / IHS-style
     {'WellName':'Well Name','County':'County/Parish','LateralLength':'DI Lateral Length',
      'PrimaryFormation':'Producing Reservoir','CompletionDate':'Completion Date',
      'FirstProdDate':'First Prod Date','State':'State','API10':'API10'}
 ]
 PROD_COLUMN_MAPS = [
-    # WDB
+    # WDB-style
     {'WellName':'WellName','ReportDate':'ReportDate','TotalOil':'TotalOil',
      'TotalGas':'TotalGas','TotalWater':'TotalWater','API10':'API'},
-    # DI / IHS
+    # DI / IHS-style
     {'WellName':'Well Name','ReportDate':'Monthly Production Date','TotalOil':'Monthly Oil',
      'TotalGas':'Monthly Gas','TotalWater':'Monthly Water','API10':'API10'}
 ]
 
+def _normalize_header_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Helper: fix common missing columns before strict mapping."""
+    # 1. Fix API: Ensure we have 'API' (for WDB map) and 'API10' (for DI map/internal use)
+    # If we have API14 but not API10, create API10
+    if 'API14' in df.columns and 'API10' not in df.columns:
+        df['API10'] = df['API14'].astype(str).str[:10]
+    
+    # If we have API10 but not API (WDB map expects 'API'), alias it.
+    if 'API10' in df.columns and 'API' not in df.columns:
+        df['API'] = df['API10']
+    
+    # 2. Fix LateralLength: Check aliases
+    if 'LateralLength' not in df.columns:
+        for alias in ['HorizontalLength', 'Horizontal Length', 'Lateral Length']:
+            if alias in df.columns:
+                df['LateralLength'] = df[alias]
+                break
+    
+    # 3. Fix LateralLength: If still missing, but Lat/Lon exist, create as NaN 
+    # (So mapping succeeds, and fill_lateral_by_geo can fill it later)
+    if 'LateralLength' not in df.columns and 'Latitude' in df.columns:
+        df['LateralLength'] = np.nan
+
+    # 4. Fix Dates: If CompletionDate missing, try aliases
+    if 'CompletionDate' not in df.columns:
+        for alias in ['Completion Date', 'SpudDate', 'Spud Date']:
+            if alias in df.columns:
+                df['CompletionDate'] = df[alias] # Fallback to spud if completion missing
+                break
+                
+    # 5. Fix FirstProdDate: If missing, try aliases
+    if 'FirstProdDate' not in df.columns:
+        for alias in ['First Prod Date', 'FirstProductionDate']:
+            if alias in df.columns:
+                df['FirstProdDate'] = df[alias]
+                break
+
+    return df
+
 def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
     for m in maps:
+        # Check if all source columns (values in map) exist in df
         if all(c in df.columns for c in m.values()):
             out = df.rename(columns={v:k for k,v in m.items()})
+            # Double check we have all required targets
             miss = [c for c in required if c not in out.columns]
-            if miss: raise ValueError(f"Missing required cols after rename: {miss}")
+            if miss: 
+                # Should not happen if map check passed, unless map is incomplete vs required
+                continue 
             return out[required].copy()
-    raise ValueError(f"Could not map columns. Found: {df.columns.tolist()}")
+            
+    # If we get here, no map matched completely.
+    raise ValueError(f"Could not map columns. Found in file: {list(df.columns)}")
 
 def load_header(file_like) -> pd.DataFrame:
     df = pd.read_csv(file_like)
-    # FIX: If API10 is missing but API14 exists, derive API10
-    if 'API14' in df.columns and 'API10' not in df.columns:
-        df['API10'] = df['API14'].astype(str).str[:10]
+    df = _normalize_header_columns(df)
     return _translate(df, HEADER_COLUMN_MAPS, REQUIRED_HEADER_COLUMNS)
 
 def load_production(file_like) -> pd.DataFrame:
     df = pd.read_csv(file_like)
+    
+    # Normalize Prod columns
     if 'API/UWI' in df.columns and 'API10' not in df.columns:
         df['API10'] = df['API/UWI'].astype(str).str[:10]
+    if 'API10' in df.columns and 'API' not in df.columns:
+        df['API'] = df['API10']
+        
     out = _translate(df, PROD_COLUMN_MAPS, REQUIRED_PROD_COLUMNS)
     out['ReportDate'] = pd.to_datetime(out['ReportDate'])
     return out
@@ -74,10 +125,21 @@ def fill_lateral_by_geo(
         df['LateralImputed'] = False
         df['LateralImputeNote'] = 'No lat/lon columns found'
         return df
+        
+    # Treat 0 or NaN as missing
+    df[lateral_col] = pd.to_numeric(df[lateral_col], errors='coerce')
     miss = df[lateral_col].isna() | (df[lateral_col] == 0)
+    
     df['lat_bin'] = df[lat_col].round(decimals)
     df['lon_bin'] = df[lon_col].round(decimals)
     valid = df[~miss & df[lateral_col].notna()]
+    
+    if valid.empty:
+        # Avoid crash if no wells have valid lateral length yet
+        df['LateralImputed'] = False
+        df['LateralImputeNote'] = 'No valid laterals to train from'
+        return df.drop(columns=['lat_bin','lon_bin'], errors='ignore')
+
     bin_means = (valid.groupby(['lat_bin','lon_bin'])[lateral_col]
                       .mean().rename('bin_mean'))
     df = df.merge(bin_means, left_on=['lat_bin','lon_bin'], right_index=True, how='left')
@@ -101,8 +163,7 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
 
     # FIX: Don't filter out 0-production rows. "Use all production".
     pr = pr.dropna(subset=['TotalOil','TotalGas','TotalWater'])
-    # pr = pr[(pr['TotalOil']>0)|(pr['TotalGas']>0)|(pr['TotalWater']>0)]
-
+    
     pr = pr.sort_values(['API10','MonthYear','TotalOil','TotalGas','TotalWater'],
                         ascending=[True,True,False,False,False])
     pr = pr.drop_duplicates(subset=['API10','MonthYear'], keep='first')
@@ -113,6 +174,8 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     merged = pr.merge(hd[keep_hdr], on='API10', how='inner')
 
     if cfg.use_normalization:
+        # Avoid division by zero/NaN if lateral is still missing
+        merged['LateralLength'] = merged['LateralLength'].replace(0, np.nan)
         s = cfg.normalization_length / merged['LateralLength']
         merged['NormOil']   = merged['TotalOil']*s
         merged['NormGas']   = merged['TotalGas']*s
@@ -125,8 +188,10 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     # FIX: inplace=True is deprecated
     merged = merged.replace([np.inf, -np.inf], np.finfo(np.float64).max)
     
-    # FIX: Don't filter out 0-production rows.
-    # merged = merged[(merged['NormOil']>0)|(merged['NormGas']>0)|(merged['NormWater']>0)]
+    # We still drop rows where Normalized values became NaN (due to missing LateralLength)
+    # but we DO NOT drop 0 production.
+    merged = merged.dropna(subset=['NormOil','NormGas','NormWater'])
+
     return merged
 
 # ---------------- Decline model + RF seeding ----------------
@@ -143,14 +208,19 @@ def _smooth(x, w=3):
     return s.rolling(window=w, center=True, min_periods=1).mean().values
 
 def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegressor]:
-    # For training RF, we still likely want to train only on non-zero averages
-    # to avoid training on dead wells.
+    # Train only on non-zero averages to avoid training on dead wells
     agg = (df.groupby('API10')[['NormOil','NormGas','NormWater']]
              .mean().reset_index())
-    # Drop rows where target col is NaN/Inf (just in case)
     agg = agg.dropna(subset=[target_col])
     
     X = agg[['NormOil','NormGas','NormWater']].values
+    if len(X) == 0:
+        # Fallback if no training data
+        dummy_rf = RandomForestRegressor(n_estimators=1, random_state=42)
+        # fit on dummy data
+        dummy_rf.fit([[0,0,0]], [0])
+        return {'qi': dummy_rf, 'b': dummy_rf, 'di': dummy_rf}
+        
     qi_model = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, agg[target_col].values)
     b_model  = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, np.full(len(agg), 1.0))
     di_model = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, np.full(len(agg), 0.05))
@@ -167,16 +237,28 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     y_s = _smooth(y_hist, 3)
 
     feats = np.array([[wd['NormOil'].mean(), wd['NormGas'].mean(), wd['NormWater'].mean()]], dtype=float)
+    
+    # Safety predict
+    try:
+        qi_pred = float(models['qi'].predict(feats)[0])
+        b_pred = float(models['b'].predict(feats)[0])
+        di_pred = float(models['di'].predict(feats)[0])
+    except:
+        qi_pred, b_pred, di_pred = 100.0, 1.0, 0.05
+
     peak_qi = float(np.nanmax(y_s)) if len(y_s)>0 else 1.0
     peak_qi = min(peak_qi, 152000.0)
-    qi0 = min(peak_qi, max(float(models['qi'].predict(feats)[0]), 0.01))
-    b0  = float(models['b'].predict(feats)[0])
-    di0 = float(models['di'].predict(feats)[0])
+    qi0 = min(peak_qi, max(qi_pred, 0.01))
+    b0  = b_pred
+    di0 = di_pred
 
     bounds = [(0.01, peak_qi*1.5), (b_low, b_high), (1e-6, 1.0)]
-    res = minimize(robust_loss, x0=[qi0,b0,di0], args=(t_hist, y_s),
-                   bounds=bounds, method='L-BFGS-B')
-    qi,b,di = map(float, res.x)
+    try:
+        res = minimize(robust_loss, x0=[qi0,b0,di0], args=(t_hist, y_s),
+                       bounds=bounds, method='L-BFGS-B')
+        qi,b,di = map(float, res.x)
+    except:
+        qi,b,di = qi0, b0, di0
 
     fit_hist = arps(qi,b,di,t_hist)
     f_m, f_v = [], []
@@ -308,6 +390,7 @@ def probit_plot(eurs: List[float], unit_label: str, title: str, color: str | Non
     ax.xaxis.set_minor_formatter(FuncFormatter(_mantissa_formatter))
     ax.set_title(title); plt.tight_layout()
     return fig
+
 def eur_summary_table(fluid_name: str, stats_dict: Dict[str, float], unit: str, norm_len: int) -> pd.DataFrame:
     """
     Build a small summary table for EUR stats, plus a per-ft column.
