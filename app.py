@@ -439,7 +439,7 @@ def generate_comprehensive_pdf():
                 story.append(b_table)
                 story.append(Spacer(1, 18))
         
-        # Add plots
+       # Add plots
         hist_png, box_png, scatter_png, _ = bfactor_analytics_figures(oneline, fluid_name, eur_col)
         
         if hist_png:
@@ -448,11 +448,17 @@ def generate_comprehensive_pdf():
             story.append(Image(hist_png, width=5*inch, height=2.5*inch))
             story.append(Spacer(1, 12))
         
+        # Create a new page for the three plots together
+        story.append(PageBreak())
+        story.append(Paragraph(f"{fluid_name} Analysis Charts", heading_style))
+        story.append(Spacer(1, 12))
+        
+        # EUR vs B-Factor
         if scatter_png:
             story.append(Paragraph("EUR vs B-Factor", styles['Heading2']))
             story.append(Spacer(1, 6))
-            story.append(Image(scatter_png, width=5*inch, height=2.4*inch))
-            story.append(Spacer(1, 12))
+            story.append(Image(scatter_png, width=5.5*inch, height=2.6*inch))
+            story.append(Spacer(1, 10))
         
         # Type curves
         if monthly_key in st.session_state:
@@ -462,8 +468,8 @@ def generate_comprehensive_pdf():
                 story.append(Spacer(1, 6))
                 fig = plot_type_curves(curves, lines, fluid_name.lower())
                 tc_png = _save_fig(fig)
-                story.append(Image(tc_png, width=6*inch, height=3.5*inch))
-                story.append(Spacer(1, 12))
+                story.append(Image(tc_png, width=5.5*inch, height=2.6*inch))
+                story.append(Spacer(1, 10))
         
         # Probit plot
         if eur_col in oneline.columns:
@@ -476,7 +482,7 @@ def generate_comprehensive_pdf():
                 story.append(Spacer(1, 6))
                 fig = probit_plot(eurs, unit, f"{fluid_name} EUR Distribution", _phase_color(fluid_name))
                 probit_png = _save_fig(fig)
-                story.append(Image(probit_png, width=5.5*inch, height=4*inch))
+                story.append(Image(probit_png, width=5.5*inch, height=2.6*inch))
                 story.append(Spacer(1, 12))
         
         story.append(PageBreak())
