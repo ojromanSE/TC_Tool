@@ -358,16 +358,38 @@ def generate_comprehensive_pdf():
                 story.append(Paragraph(f"EUR Statistics ({unit})", styles['Heading2']))
                 story.append(Spacer(1, 6))
                 
-                eur_data = [
-                    ["Metric", "Value"],
-                    ["Count", f"{stats['count']:.0f}"],
-                    ["Mean", f"{stats['mean']:.2f}"],
-                    ["Median (P50)", f"{stats['p50']:.2f}"],
-                    ["P10", f"{stats['p10']:.2f}"],
-                    ["P90", f"{stats['p90']:.2f}"],
-                    ["Min", f"{stats['min']:.2f}"],
-                    ["Max", f"{stats['max']:.2f}"]
-                ]
+                # Build EUR data table with available stats
+                eur_data = [["Metric", "Value"]]
+                
+                # Handle different possible key formats
+                count_key = next((k for k in stats.keys() if 'count' in k.lower()), None)
+                if count_key:
+                    eur_data.append(["Count", f"{stats[count_key]:.0f}"])
+                
+                mean_key = next((k for k in stats.keys() if 'mean' in k.lower()), None)
+                if mean_key:
+                    eur_data.append(["Mean", f"{stats[mean_key]:.2f}"])
+                
+                # Try P50 or median
+                p50_key = next((k for k in stats.keys() if 'p50' in k.lower() or 'median' in k.lower()), None)
+                if p50_key:
+                    eur_data.append(["Median (P50)", f"{stats[p50_key]:.2f}"])
+                
+                p10_key = next((k for k in stats.keys() if 'p10' in k.lower()), None)
+                if p10_key:
+                    eur_data.append(["P10", f"{stats[p10_key]:.2f}"])
+                
+                p90_key = next((k for k in stats.keys() if 'p90' in k.lower()), None)
+                if p90_key:
+                    eur_data.append(["P90", f"{stats[p90_key]:.2f}"])
+                
+                min_key = next((k for k in stats.keys() if 'min' in k.lower()), None)
+                if min_key:
+                    eur_data.append(["Min", f"{stats[min_key]:.2f}"])
+                
+                max_key = next((k for k in stats.keys() if 'max' in k.lower()), None)
+                if max_key:
+                    eur_data.append(["Max", f"{stats[max_key]:.2f}"])
                 
                 eur_table = Table(eur_data, colWidths=[2.5*inch, 2*inch])
                 eur_table.setStyle(TableStyle([
@@ -474,12 +496,22 @@ def generate_comprehensive_pdf():
                 if eurs:
                     stats = compute_eur_stats(eurs)
                     unit = "MMcf" if fluid == "Gas" else "Mbbl"
+                    
+                    # Get the actual key names from stats dict
+                    mean_key = next((k for k in stats.keys() if 'mean' in k.lower()), None)
+                    p50_key = next((k for k in stats.keys() if 'p50' in k.lower() or 'median' in k.lower()), None)
+                    p10_key = next((k for k in stats.keys() if 'p10' in k.lower()), None)
+                    
+                    mean_val = f"{stats[mean_key]:.2f} {unit}" if mean_key else "N/A"
+                    p50_val = f"{stats[p50_key]:.2f} {unit}" if p50_key else "N/A"
+                    p10_val = f"{stats[p10_key]:.2f} {unit}" if p10_key else "N/A"
+                    
                     summary_data.append([
                         fluid,
                         str(well_count),
-                        f"{stats['mean']:.2f} {unit}",
-                        f"{stats['p50']:.2f} {unit}",
-                        f"{stats['p10']:.2f} {unit}"
+                        mean_val,
+                        p50_val,
+                        p10_val
                     ])
     
     if len(summary_data) > 1:
