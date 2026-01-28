@@ -110,7 +110,7 @@ if st.button("Load / QC / Merge"):
             st.exception(e)
 
 if "merged" in st.session_state:
-    with st.expander("Preview: Header (QC’d)"):
+    with st.expander("Preview: Header (QC'd)"):
         st.dataframe(format_df_2dec(st.session_state.header_qc.head(20)), use_container_width=True)
     with st.expander("Preview: Production"):
         st.dataframe(format_df_2dec(st.session_state.prod_df.head(20)), use_container_width=True)
@@ -281,20 +281,242 @@ with tw_tabs[0]: _render_tw("Oil", "Oil_oneline", "Oil_monthly", "EUR (Mbbl)")
 with tw_tabs[1]: _render_tw("Gas", "Gas_oneline", "Gas_monthly", "EUR (MMcf)")
 with tw_tabs[2]: _render_tw("Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
 
-# ================= PDF =================
+# ================= PDF EXPORT =================
 from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
+from datetime import datetime
+
+def generate_comprehensive_pdf():
+    """Generate a comprehensive PDF report with all sections."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    doc = SimpleDocTemplate(tmp.name, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+    story = []
+    styles = getSampleStyleSheet()
+    
+    # Custom styles
+    title_style = ParagraphStyle('CustomTitle', parent=styles['Title'], fontSize=20, textColor=colors.HexColor('#2E7D32'))
+    heading_style = ParagraphStyle('CustomHeading', parent=styles['Heading1'], fontSize=14, textColor=colors.HexColor('#1976D2'))
+    
+    # Title page
+    story.append(Paragraph("SE Oil & Gas Autoforecasting Report", title_style))
+    story.append(Spacer(1, 12))
+    story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
+    story.append(Spacer(1, 24))
+    
+    # Parameters section
+    story.append(Paragraph("Analysis Parameters", heading_style))
+    story.append(Spacer(1, 12))
+    params_data = [
+        ["Parameter", "Value"],
+        ["Normalization Length", f"{norm_len} ft"],
+        ["Apply Normalization", "Yes" if use_norm else "No"],
+        ["B-factor Range", f"{b_low:.3f} - {b_high:.3f}"],
+        ["Geographic Bin Decimals", str(bin_decimals)]
+    ]
+    params_table = Table(params_data, colWidths=[3*inch, 2*inch])
+    params_table.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, 0), 10),
+        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+        ('GRID', (0, 0), (-1, -1), 1, colors.black)
+    ]))
+    story.append(params_table)
+    story.append(PageBreak())
+    
+    # Function to add fluid section
+    def add_fluid_section(fluid_name, oneline_key, monthly_key, eur_col):
+        if oneline_key not in st.session_state:
+            return
+        
+        story.append(Paragraph(f"{fluid_name} Analysis", heading_style))
+        story.append(Spacer(1, 12))
+        
+        oneline = st.session_state[oneline_key]
+        
+        # Well count
+        well_count = len(oneline)
+        story.append(Paragraph(f"Total Wells Analyzed: {well_count}", styles['Normal']))
+        story.append(Spacer(1, 12))
+        
+        # EUR Statistics
+        if eur_col in oneline.columns:
+            eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
+            if fluid_name == "Gas":
+                eurs = [x * 1000 for x in eurs]
+            
+            if eurs:
+                stats = compute_eur_stats(eurs)
+                unit = "Mbbl" if fluid_name != "Gas" else "MMcf"
+                
+                story.append(Paragraph(f"EUR Statistics ({unit})", styles['Heading2']))
+                story.append(Spacer(1, 6))
+                
+                eur_data = [
+                    ["Metric", "Value"],
+                    ["Count", f"{stats['count']:.0f}"],
+                    ["Mean", f"{stats['mean']:.2f}"],
+                    ["Median (P50)", f"{stats['p50']:.2f}"],
+                    ["P10", f"{stats['p10']:.2f}"],
+                    ["P90", f"{stats['p90']:.2f}"],
+                    ["Min", f"{stats['min']:.2f}"],
+                    ["Max", f"{stats['max']:.2f}"]
+                ]
+                
+                eur_table = Table(eur_data, colWidths=[2.5*inch, 2*inch])
+                eur_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(_phase_color(fluid_name))),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ]))
+                story.append(eur_table)
+                story.append(Spacer(1, 18))
+        
+        # B-factor statistics
+        if 'b' in oneline.columns:
+            b_vals = pd.to_numeric(oneline['b'], errors='coerce').dropna()
+            if not b_vals.empty:
+                story.append(Paragraph("B-Factor Statistics", styles['Heading2']))
+                story.append(Spacer(1, 6))
+                
+                b_data = [
+                    ["Metric", "Value"],
+                    ["Count", f"{len(b_vals):.0f}"],
+                    ["Mean", f"{b_vals.mean():.3f}"],
+                    ["Median", f"{b_vals.median():.3f}"],
+                    ["P10", f"{np.percentile(b_vals, 10):.3f}"],
+                    ["P90", f"{np.percentile(b_vals, 90):.3f}"]
+                ]
+                
+                b_table = Table(b_data, colWidths=[2.5*inch, 2*inch])
+                b_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ]))
+                story.append(b_table)
+                story.append(Spacer(1, 18))
+        
+        # Add plots
+        hist_png, box_png, scatter_png, _ = bfactor_analytics_figures(oneline, fluid_name, eur_col)
+        
+        if hist_png:
+            story.append(Paragraph("B-Factor Distribution", styles['Heading2']))
+            story.append(Spacer(1, 6))
+            story.append(Image(hist_png, width=5*inch, height=2.5*inch))
+            story.append(Spacer(1, 12))
+        
+        if scatter_png:
+            story.append(Paragraph("EUR vs B-Factor", styles['Heading2']))
+            story.append(Spacer(1, 6))
+            story.append(Image(scatter_png, width=5*inch, height=2.4*inch))
+            story.append(Spacer(1, 12))
+        
+        # Type curves
+        if monthly_key in st.session_state:
+            curves, lines = build_type_curves_and_lines(st.session_state[monthly_key], fluid_name.lower())
+            if not curves.empty:
+                story.append(Paragraph("Type Curve", styles['Heading2']))
+                story.append(Spacer(1, 6))
+                fig = plot_type_curves(curves, lines, fluid_name.lower())
+                tc_png = _save_fig(fig)
+                story.append(Image(tc_png, width=6*inch, height=3.5*inch))
+                story.append(Spacer(1, 12))
+        
+        # Probit plot
+        if eur_col in oneline.columns:
+            eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
+            if fluid_name == "Gas":
+                eurs = [x * 1000 for x in eurs]
+            if eurs:
+                unit = "Mbbl" if fluid_name != "Gas" else "MMcf"
+                story.append(Paragraph("Probit Plot", styles['Heading2']))
+                story.append(Spacer(1, 6))
+                fig = probit_plot(eurs, unit, f"{fluid_name} EUR Distribution", _phase_color(fluid_name))
+                probit_png = _save_fig(fig)
+                story.append(Image(probit_png, width=5.5*inch, height=4*inch))
+                story.append(Spacer(1, 12))
+        
+        story.append(PageBreak())
+    
+    # Add each fluid section
+    add_fluid_section("Oil", "Oil_oneline", "Oil_monthly", "EUR (Mbbl)")
+    add_fluid_section("Gas", "Gas_oneline", "Gas_monthly", "EUR (MMcf)")
+    add_fluid_section("Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
+    
+    # Summary section
+    story.append(Paragraph("Executive Summary", heading_style))
+    story.append(Spacer(1, 12))
+    
+    summary_data = [["Fluid", "Wells", "Mean EUR", "P50 EUR", "P10 EUR"]]
+    
+    for fluid, key, eur_col in [("Oil", "Oil_oneline", "EUR (Mbbl)"), 
+                                  ("Gas", "Gas_oneline", "EUR (MMcf)"), 
+                                  ("Water", "Water_oneline", "EUR (Mbbl water)")]:
+        if key in st.session_state:
+            oneline = st.session_state[key]
+            well_count = len(oneline)
+            if eur_col in oneline.columns:
+                eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
+                if fluid == "Gas":
+                    eurs = [x * 1000 for x in eurs]
+                if eurs:
+                    stats = compute_eur_stats(eurs)
+                    unit = "MMcf" if fluid == "Gas" else "Mbbl"
+                    summary_data.append([
+                        fluid,
+                        str(well_count),
+                        f"{stats['mean']:.2f} {unit}",
+                        f"{stats['p50']:.2f} {unit}",
+                        f"{stats['p10']:.2f} {unit}"
+                    ])
+    
+    if len(summary_data) > 1:
+        summary_table = Table(summary_data, colWidths=[1*inch, 1*inch, 1.5*inch, 1.5*inch, 1.5*inch])
+        summary_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1976D2')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        story.append(summary_table)
+    
+    # Build PDF
+    doc.build(story)
+    return tmp.name
+
+st.markdown("---")
+st.header("📄 Export Report")
 
 if st.button("Generate PDF Report"):
-    if "Oil_oneline" not in st.session_state:
-        st.error("Run Oil forecast first.")
+    if "Oil_oneline" not in st.session_state and "Gas_oneline" not in st.session_state and "Water_oneline" not in st.session_state:
+        st.error("Please run at least one forecast (Oil, Gas, or Water) before generating a PDF report.")
     else:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        doc = SimpleDocTemplate(tmp.name, pagesize=letter)
-        story = [Paragraph("<b>SE Autoforecast Report</b>", getSampleStyleSheet()['Title'])]
-        # (Simplified PDF generation for brevity - full logic similar to previous version)
-        story.append(Paragraph("Forecasts generated successfully.", getSampleStyleSheet()['Normal']))
-        doc.build(story)
-        with open(tmp.name, "rb") as f:
-            st.download_button("Download PDF", f.read(), "report.pdf", "application/pdf")
+        try:
+            with st.spinner("Generating comprehensive PDF report..."):
+                pdf_path = generate_comprehensive_pdf()
+            with open(pdf_path, "rb") as f:
+                st.download_button(
+                    label="📥 Download PDF Report",
+                    data=f.read(),
+                    file_name=f"SE_Autoforecast_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    mime="application/pdf"
+                )
+            st.success("PDF report generated successfully!")
+        except Exception as e:
+            st.error(f"Error generating PDF: {str(e)}")
+            st.exception(e)
