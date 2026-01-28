@@ -64,6 +64,15 @@ def format_df_2dec(df: pd.DataFrame) -> pd.DataFrame:
 def _phase_color(fluid: str) -> str:
     return {'oil': 'green', 'gas': 'red', 'water': 'blue'}[fluid.lower()]
 
+def _phase_color_rgb(fluid: str):
+    """Return ReportLab color object for PDF generation"""
+    color_map = {
+        'oil': colors.HexColor('#2E7D32'),    # Green
+        'gas': colors.HexColor('#D32F2F'),    # Red
+        'water': colors.HexColor('#1976D2')   # Blue
+    }
+    return color_map.get(fluid.lower(), colors.grey)
+
 def _save_fig(fig, dpi=220):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     fig.savefig(tmp.name, dpi=dpi, bbox_inches="tight")
@@ -393,7 +402,7 @@ def generate_comprehensive_pdf():
                 
                 eur_table = Table(eur_data, colWidths=[2.5*inch, 2*inch])
                 eur_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(_phase_color(fluid_name))),
+                    ('BACKGROUND', (0, 0), (-1, 0), _phase_color_rgb(fluid_name)),
                     ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                     ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
                     ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
