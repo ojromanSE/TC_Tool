@@ -193,6 +193,14 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
         
     all_df = monthly_df[['WellID','Date',vol_col]].dropna().sort_values(['WellID','Date']).copy()
     all_df['t'] = all_df.groupby('WellID').cumcount() + 1
+
+    # --- Survivorship-bias guard: drop months with too few wells ---
+    well_counts = all_df.groupby('t')['WellID'].nunique()
+    max_wells = well_counts.iloc[0] if len(well_counts) > 0 else 0
+    min_wells = max(5, int(max_wells * 0.25))          # at least 25% of peak or 5
+    valid_months = well_counts[well_counts >= min_wells].index
+    all_df = all_df[all_df['t'].isin(valid_months)]
+
     q = all_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
     q.columns = ['P10','P50','P90']
     q = q.reset_index()
