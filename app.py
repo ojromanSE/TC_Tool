@@ -231,21 +231,44 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             b_low=float(b_low), b_high=float(b_high), max_months=600,
             dmin=float(dmin)
         )
-        oneline, monthly = forecast_all(merged, cfg)
+        with st.spinner(f"Forecasting {fluid_name}..."):
+            oneline, monthly, models = forecast_all(merged, cfg)
         st.session_state[f"{fluid_name}_oneline"] = oneline
         st.session_state[f"{fluid_name}_monthly"] = monthly
+        st.session_state[f"{fluid_name}_models"] = models
         st.success(f"{fluid_name} forecast completed.")
 
     on_key = f"{fluid_name}_oneline"
     mo_key = f"{fluid_name}_monthly"
 
     if on_key in st.session_state:
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "Oneline", "Monthly", "B-Factor", "Probit"
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "Oneline", "Monthly", "Type Curve", "B-Factor", "Probit"
         ])
         with tab1: st.dataframe(format_df_2dec(st.session_state[on_key]), use_container_width=True)
         with tab2: st.dataframe(format_df_2dec(st.session_state[mo_key]), use_container_width=True)
         with tab3:
+            if mo_key in st.session_state:
+                monthly = st.session_state[mo_key]
+                curves, lines = build_type_curves_and_lines(monthly, fluid_name.lower())
+                if not curves.empty:
+                    fig_tc = plot_type_curves(curves, lines, fluid_name.lower())
+                    st.pyplot(fig_tc)
+                    plt.close(fig_tc)
+                    # EUR summary alongside type curve
+                    oneline = st.session_state[on_key]
+                    if eur_col in oneline.columns:
+                        eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
+                        if fluid_name == "Gas" or "MMcf" in eur_col:
+                            eurs = [x * 1000 if x is not None else None for x in eurs]
+                        unit = "Mbbl" if "Mbbl" in eur_col else "MMcf"
+                        stats = compute_eur_stats(eurs)
+                        st.dataframe(format_df_2dec(eur_summary_table(fluid_name, stats, unit, int(norm_len))))
+                else:
+                    st.info("Not enough data to build type curves.")
+            else:
+                st.info(f"Run {fluid_name} forecast first to see type curves.")
+        with tab4:
             oneline = st.session_state[on_key]
             hist_png, box_png, scatter_png, bstats = bfactor_analytics_figures(oneline, fluid_name, eur_col)
             c1, c2 = st.columns([2,1])
@@ -255,7 +278,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             with c2:
                 if box_png: st.image(box_png)
                 st.dataframe(format_df_2dec(bstats))
-        with tab4:
+        with tab5:
             oneline = st.session_state[on_key]
             if eur_col in oneline.columns:
                 eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
@@ -272,9 +295,15 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         # Use WellID for selection
         opts = merged[['WellID']].drop_duplicates().sort_values('WellID')
         pick_id = st.selectbox(f"Pick Well ({fluid_name})", opts['WellID'], key=f"{fluid_name}_pick")
-        
+
         wd = merged[merged['WellID'] == pick_id]
-        models = _train_rf(merged, norm_col_for_models)
+        # Reuse cached models from forecast run instead of retraining
+        models_key = f"{fluid_name}_models"
+        if models_key in st.session_state:
+            models = st.session_state[models_key]
+        else:
+            models = _train_rf(merged, norm_col_for_models)
+            st.session_state[models_key] = models
         fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models,
                               dmin=float(dmin))
         fig = plot_one_well(wd, fc, fluid_name.lower())

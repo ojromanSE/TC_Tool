@@ -563,29 +563,29 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
 
     best = _select_best_model(candidates)
 
-    # --- Generate forecast using the winning model ---
+    # --- Generate forecast using the winning model (vectorized) ---
     fit_hist = best['pred']
-
-    f_m, f_v = [], []
-    m_idx = len(t_hist)
     model_name = best['model']
 
-    while m_idx < len(t_hist) + max_months:
-        t_arr = np.array([m_idx], dtype=float)
-        if model_name == 'ModifiedArps':
-            q = float(modified_arps(best['qi'], best['b'], best['di'], best['dmin'], t_arr)[0])
-        elif model_name == 'SEPD':
-            q = float(sepd(best['qi'], best['tau'], best['n'], t_arr)[0])
-        elif model_name == 'Duong':
-            q = float(duong(best['qi'], best['a'], best['m'], t_arr + 1.0)[0])
-        else:
-            q = float(arps(best['qi'], best.get('b', 1.0), best.get('di', 0.05), t_arr)[0])
+    t_forecast = np.arange(len(t_hist), len(t_hist) + max_months, dtype=float)
+    if model_name == 'ModifiedArps':
+        f_vals_all = modified_arps(best['qi'], best['b'], best['di'], best['dmin'], t_forecast)
+    elif model_name == 'SEPD':
+        f_vals_all = sepd(best['qi'], best['tau'], best['n'], t_forecast)
+    elif model_name == 'Duong':
+        f_vals_all = duong(best['qi'], best['a'], best['m'], t_forecast + 1.0)
+    else:
+        f_vals_all = arps(best['qi'], best.get('b', 1.0), best.get('di', 0.05), t_forecast)
 
-        if q < 1e-6:
-            break
-        f_m.append(m_idx)
-        f_v.append(q)
-        m_idx += 1
+    # Truncate at economic limit
+    valid_mask = f_vals_all >= 1e-6
+    if not valid_mask.all():
+        first_invalid = np.argmin(valid_mask)
+        t_forecast = t_forecast[:first_invalid]
+        f_vals_all = f_vals_all[:first_invalid]
+
+    f_m = t_forecast.astype(int)
+    f_v = f_vals_all
 
     eur_hist = float(y_hist.sum())
     eur_fcst = float(np.sum(f_v))
@@ -603,7 +603,7 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
         aicc=best['aicc'],
         t_hist=t_hist, hist=y_hist,
         fit_hist=fit_hist,
-        f_months=np.array(f_m, int), f_vals=np.array(f_v, float),
+        f_months=np.asarray(f_m, dtype=int), f_vals=np.asarray(f_v, dtype=float),
         EUR_total=eur_hist + eur_fcst, EUR_fcst=eur_fcst,
     )
 
@@ -620,7 +620,7 @@ class ForecastConfig:
     max_months: int = 600
     dmin: float = 0.006  # terminal decline ~7% annual effective
 
-def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
     com = cfg.commodity.lower()
     col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[com]
     models = _train_rf(merged, col)
@@ -697,7 +697,7 @@ def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFram
 
     oneline_df = pd.DataFrame(oneline)
     monthly_df = pd.DataFrame(monthly).sort_values(['WellID', 'Date', 'Segment'])
-    return oneline_df, monthly_df
+    return oneline_df, monthly_df, models
 
 # ====================================================================
 # Statistics & visualization (unchanged public API)
