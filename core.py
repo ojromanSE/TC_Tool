@@ -5,20 +5,14 @@ matplotlib.use('Agg')
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass, field
-from typing import Dict, Tuple, List, Optional
+from dataclasses import dataclass
+from typing import Dict, Tuple, List
 from scipy.optimize import minimize
 from scipy.special import huber
 from sklearn.ensemble import RandomForestRegressor
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, FuncFormatter
 from scipy import stats
-
-try:
-    from xgboost import XGBRegressor
-    _HAS_XGBOOST = True
-except ImportError:
-    _HAS_XGBOOST = False
 
 # ---------------- Provider column maps ----------------
 # Added 'WellNumber' to requirements and maps
@@ -56,7 +50,7 @@ def _normalize_columns_before_map(df: pd.DataFrame) -> pd.DataFrame:
             if alias in df.columns:
                 df['API10'] = df[alias].astype(str).str.replace(r'\.0$', '', regex=True).str[:10]
                 break
-
+    
     # 2. Well Number Aliases
     if 'Well Number' not in df.columns and 'WellNumber' not in df.columns:
         if 'WellNumber' in df.columns:
@@ -83,7 +77,7 @@ def _normalize_columns_before_map(df: pd.DataFrame) -> pd.DataFrame:
         for alias in ['FirstProductionDate']:
             if alias in df.columns:
                 df['First Prod Date'] = df[alias]
-                break
+                break       
     return df
 
 def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
@@ -92,9 +86,9 @@ def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
             new_data = {}
             for target_name, source_name in m.items():
                 new_data[target_name] = df[source_name]
-
+            
             subset = pd.DataFrame(new_data)
-
+            
             missing = [c for c in required if c not in subset.columns]
             if 'LateralLength' in missing and 'LateralLength' in df.columns:
                  subset['LateralLength'] = df['LateralLength']
@@ -102,7 +96,7 @@ def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
             final_miss = [c for c in required if c not in subset.columns]
             if not final_miss:
                 return subset[required].copy()
-
+            
     raise ValueError(f"Could not map columns. Found in file: {list(df.columns)}")
 
 def load_header(file_like) -> pd.DataFrame:
@@ -130,14 +124,14 @@ def fill_lateral_by_geo(
         df['LateralImputed'] = False
         df['LateralImputeNote'] = 'No lat/lon columns found'
         return df
-
+        
     df[lateral_col] = pd.to_numeric(df[lateral_col], errors='coerce')
     miss = df[lateral_col].isna() | (df[lateral_col] == 0)
-
+    
     df['lat_bin'] = df[lat_col].round(decimals)
     df['lon_bin'] = df[lon_col].round(decimals)
     valid = df[~miss & df[lateral_col].notna()]
-
+    
     if valid.empty:
         df['LateralImputed'] = False
         df['LateralImputeNote'] = 'No valid laterals to train from'
@@ -168,15 +162,15 @@ def _make_well_id(df: pd.DataFrame) -> pd.Series:
 
 def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessConfig) -> pd.DataFrame:
     hd = header_df.copy(); pr = prod_df.copy()
-
+    
     # Create WellID for merging
     hd['WellID'] = _make_well_id(hd)
     pr['WellID'] = _make_well_id(pr)
-
+    
     pr['MonthYear'] = pr['ReportDate'].dt.to_period('M')
 
     pr = pr.dropna(subset=['TotalOil','TotalGas','TotalWater'])
-
+    
     # Sort and Deduplicate
     pr = pr.sort_values(['WellID','MonthYear','TotalOil','TotalGas','TotalWater'],
                         ascending=[True,True,False,False,False])
@@ -185,12 +179,12 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     keep_hdr = ['WellID','API10','WellName','WellNumber','State','County','PrimaryFormation',
                 'LateralLength','CompletionDate','FirstProdDate']
     keep_hdr = [c for c in keep_hdr if c in hd.columns]
-
+    
     # MERGE ON WellID instead of API10
     merged = pr.merge(hd[keep_hdr], on='WellID', how='inner', suffixes=('', '_hdr'))
-
+    
     # Clean up name/number collisions if any
-    if 'WellName_hdr' in merged.columns:
+    if 'WellName_hdr' in merged.columns: 
         merged['WellName'] = merged['WellName_hdr']
         merged = merged.drop(columns=['WellName_hdr'])
     if 'WellNumber_hdr' in merged.columns:
@@ -203,7 +197,7 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     if cfg.use_normalization:
         merged['LateralLength'] = pd.to_numeric(merged['LateralLength'], errors='coerce').replace(0, np.nan)
         s = cfg.normalization_length / merged['LateralLength']
-
+        
         for c in ['TotalOil','TotalGas','TotalWater']:
             merged[c] = pd.to_numeric(merged[c], errors='coerce').fillna(0)
 
@@ -219,489 +213,155 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     merged = merged.dropna(subset=['NormOil','NormGas','NormWater'])
     return merged
 
-# ====================================================================
-# DCA Models — Modified Arps, SEPD (Stretched Exponential), Duong
-# ====================================================================
-
-# ---------- 1. Arps (legacy, kept for backward compat) ----------
+# ---------------- Models ----------------
 def arps(qi: float, b: float, di: float, t: np.ndarray) -> np.ndarray:
-    t = np.asarray(t, dtype=float)
-    if b == 0:
-        return qi * np.exp(-di * t)
-    if b == 1:
-        return qi / (1.0 + di * t)
-    return qi / ((1.0 + b * di * t) ** (1.0 / b))
+    if b==0 or b==1: return qi/(1.0+di*t)
+    return qi/((1.0+b*di*t)**(1.0/b))
 
-# ---------- 2. Modified Arps with terminal decline (Dmin) ----------
-def modified_arps(qi: float, b: float, di: float, dmin: float,
-                  t: np.ndarray) -> np.ndarray:
-    """Hyperbolic decline that switches to exponential at Dmin.
-
-    Parameters
-    ----------
-    qi   : initial rate (monthly volume)
-    b    : Arps b-factor
-    di   : initial nominal decline rate (per month)
-    dmin : terminal (minimum) nominal decline rate (per month).
-           Typical values: 0.004-0.008 monthly (≈5-10% annual effective).
-    t    : time array in months
-    """
-    t = np.asarray(t, dtype=float)
-    result = np.empty_like(t, dtype=float)
-
-    if b <= 0 or di <= dmin:
-        # Pure exponential at terminal rate
-        return qi * np.exp(-dmin * t)
-
-    # Time at which instantaneous decline D(t) = di/(1+b*di*t) reaches dmin
-    t_switch = (1.0 / (b * di)) * ((di / dmin) - 1.0)
-    q_switch = arps(qi, b, di, np.array([t_switch]))[0]
-
-    hyp_mask = t <= t_switch
-    result[hyp_mask] = arps(qi, b, di, t[hyp_mask])
-    result[~hyp_mask] = q_switch * np.exp(-dmin * (t[~hyp_mask] - t_switch))
-    return result
-
-def _modified_arps_cum(qi: float, b: float, di: float, dmin: float,
-                       t: np.ndarray) -> np.ndarray:
-    """Cumulative production for Modified Arps (numerical via trapezoidal)."""
-    rates = modified_arps(qi, b, di, dmin, t)
-    return np.cumsum(rates)
-
-# ---------- 3. Stretched Exponential Production Decline (SEPD) ----------
-def sepd(qi: float, tau: float, n: float, t: np.ndarray) -> np.ndarray:
-    """q(t) = qi * exp(-(t/tau)^n)
-
-    Parameters
-    ----------
-    qi  : initial rate
-    tau : characteristic time constant (months)
-    n   : stretching exponent (0 < n <= 1 typical for unconventionals)
-    """
-    t = np.asarray(t, dtype=float)
-    t_safe = np.maximum(t, 1e-12)
-    return qi * np.exp(-((t_safe / tau) ** n))
-
-# ---------- 4. Duong Model ----------
-def duong(qi: float, a: float, m: float, t: np.ndarray) -> np.ndarray:
-    """q(t) = qi * t^(-m) * exp(a/(1-m) * (t^(1-m) - 1))
-
-    Designed for fracture-dominated flow in shale/unconventional wells.
-
-    Parameters
-    ----------
-    qi : rate scalar
-    a  : intercept parameter
-    m  : slope parameter (typically 1.0 - 1.5)
-    """
-    t = np.asarray(t, dtype=float)
-    t_safe = np.maximum(t, 0.1)  # avoid log(0) / 0^(-m)
-    exponent = (a / (1.0 - m)) * (t_safe ** (1.0 - m) - 1.0)
-    return qi * (t_safe ** (-m)) * np.exp(exponent)
-
-# ====================================================================
-# Model fitting helpers
-# ====================================================================
+def robust_loss(params: np.ndarray, t: np.ndarray, y: np.ndarray, delta: float=1.0) -> float:
+    qi,b,di = params
+    return huber(delta, arps(qi,b,di,t) - y).mean()
 
 def _smooth(x, w=3):
     s = pd.Series(x, dtype=float)
     return s.rolling(window=w, center=True, min_periods=1).mean().values
 
-def robust_loss(params: np.ndarray, t: np.ndarray, y: np.ndarray, delta: float=1.0) -> float:
-    qi, b, di = params
-    return huber(delta, arps(qi, b, di, t) - y).mean()
-
-def _sse(pred: np.ndarray, obs: np.ndarray) -> float:
-    return float(np.sum((pred - obs) ** 2))
-
-def _aicc(n: int, k: int, sse: float) -> float:
-    """Corrected Akaike Information Criterion.
-    Lower is better.  Returns +inf if model is degenerate."""
-    if n <= k + 1 or sse <= 0:
-        return np.inf
-    ll = -0.5 * n * np.log(sse / n)
-    aic = 2.0 * k - 2.0 * ll
-    correction = (2.0 * k * (k + 1.0)) / max(n - k - 1.0, 1.0)
-    return aic + correction
-
-# --------------- Per-model fitters ---------------
-
-def _fit_modified_arps(t: np.ndarray, y: np.ndarray, y_s: np.ndarray,
-                       b_low: float, b_high: float,
-                       dmin: float) -> Dict:
-    """Fit Modified Arps and return result dict."""
-    peak_qi = float(np.nanmax(y_s)) if len(y_s) > 0 else 1.0
-    peak_qi = min(peak_qi, 152_000.0)
-
-    # Estimate initial decline from first few data points
-    di_est = 0.05
-    if len(y_s) >= 3 and y_s[0] > 0:
-        ratio = y_s[min(len(y_s)-1, 6)] / max(y_s[0], 1e-6)
-        if 0 < ratio < 1:
-            di_est = np.clip(-np.log(ratio) / min(len(y_s)-1, 6), 0.005, 0.5)
-
-    b_mid = (b_low + b_high) / 2
-    bounds = [(0.01, peak_qi * 1.5), (b_low, b_high), (1e-6, 1.0)]
-
-    best_sse, best_params = np.inf, (peak_qi, b_mid, di_est)
-    for qi0, b0, di0 in [(peak_qi, b_mid, di_est),
-                          (peak_qi * 0.8, b_low, di_est * 2),
-                          (peak_qi, b_high, di_est * 0.5)]:
-        try:
-            def _loss(p):
-                pred = modified_arps(p[0], p[1], p[2], dmin, t)
-                return huber(1.0, pred - y_s).mean()
-            res = minimize(_loss, x0=[qi0, b0, di0],
-                           bounds=bounds, method='L-BFGS-B',
-                           options={'maxiter': 200})
-            if res.fun < best_sse:
-                best_sse = res.fun
-                best_params = tuple(map(float, res.x))
-        except Exception:
-            pass
-
-    qi, b, di = best_params
-    pred = modified_arps(qi, b, di, dmin, t)
-    sse = _sse(pred, y_s)
-    aicc = _aicc(len(t), 3, sse)  # 3 free params (qi, b, di); dmin fixed
-    return dict(model='ModifiedArps', qi=qi, b=b, di=di, dmin=dmin,
-                pred=pred, sse=sse, aicc=aicc)
-
-
-def _fit_sepd(t: np.ndarray, y: np.ndarray, y_s: np.ndarray) -> Dict:
-    """Fit SEPD and return result dict."""
-    peak_qi = float(np.nanmax(y_s)) if len(y_s) > 0 else 1.0
-    peak_qi = min(peak_qi, 152_000.0)
-
-    bounds = [(0.01, peak_qi * 1.5), (1.0, 500.0), (0.05, 1.0)]
-    best_sse, best_params = np.inf, (peak_qi, 20.0, 0.5)
-    for qi0, tau0, n0 in [(peak_qi, 30.0, 0.5),
-                           (peak_qi * 0.8, 10.0, 0.3),
-                           (peak_qi, 80.0, 0.8)]:
-        try:
-            def _loss(p):
-                pred = sepd(p[0], p[1], p[2], t)
-                return huber(1.0, pred - y_s).mean()
-            res = minimize(_loss, x0=[qi0, tau0, n0],
-                           bounds=bounds, method='L-BFGS-B',
-                           options={'maxiter': 200})
-            if res.fun < best_sse:
-                best_sse = res.fun
-                best_params = tuple(map(float, res.x))
-        except Exception:
-            pass
-
-    qi, tau, n = best_params
-    pred = sepd(qi, tau, n, t)
-    sse = _sse(pred, y_s)
-    aicc = _aicc(len(t), 3, sse)
-    return dict(model='SEPD', qi=qi, tau=tau, n=n,
-                pred=pred, sse=sse, aicc=aicc)
-
-
-def _fit_duong(t: np.ndarray, y: np.ndarray, y_s: np.ndarray) -> Dict:
-    """Fit Duong model and return result dict."""
-    peak_qi = float(np.nanmax(y_s)) if len(y_s) > 0 else 1.0
-    peak_qi = min(peak_qi, 152_000.0)
-
-    # Duong uses t starting at 1 (month 1, 2, ...)
-    t_duong = t + 1.0  # shift so first month = 1
-
-    bounds = [(0.01, peak_qi * 2.0), (0.01, 5.0), (0.5, 2.5)]
-    best_sse, best_params = np.inf, (peak_qi, 1.0, 1.1)
-    for qi0, a0, m0 in [(peak_qi, 1.0, 1.1),
-                          (peak_qi * 0.8, 0.5, 1.0),
-                          (peak_qi, 2.0, 1.3)]:
-        try:
-            def _loss(p):
-                pred = duong(p[0], p[1], p[2], t_duong)
-                return huber(1.0, pred - y_s).mean()
-            res = minimize(_loss, x0=[qi0, a0, m0],
-                           bounds=bounds, method='L-BFGS-B',
-                           options={'maxiter': 200})
-            if res.fun < best_sse:
-                best_sse = res.fun
-                best_params = tuple(map(float, res.x))
-        except Exception:
-            pass
-
-    qi, a, m = best_params
-    pred = duong(qi, a, m, t_duong)
-    sse = _sse(pred, y_s)
-    aicc = _aicc(len(t), 3, sse)
-    return dict(model='Duong', qi=qi, a=a, m=m,
-                pred=pred, sse=sse, aicc=aicc)
-
-
-def _select_best_model(candidates: List[Dict]) -> Dict:
-    """Pick the candidate with the lowest AICc."""
-    valid = [c for c in candidates if np.isfinite(c['aicc'])]
-    if not valid:
-        return candidates[0]
-    return min(valid, key=lambda c: c['aicc'])
-
-
-# ====================================================================
-# XGBoost / RF training — learns REAL per-well DCA parameters
-# ====================================================================
-
-def _fit_arps_quick(t: np.ndarray, y_s: np.ndarray,
-                    b_low: float, b_high: float) -> Tuple[float, float, float]:
-    """Quick Arps fit for a single well (used to build training labels)."""
-    peak_qi = float(np.nanmax(y_s)) if len(y_s) > 0 else 1.0
-    peak_qi = min(peak_qi, 152_000.0)
-    b_mid = (b_low + b_high) / 2
-    bounds = [(0.01, peak_qi * 1.5), (b_low, b_high), (1e-6, 1.0)]
-    try:
-        res = minimize(robust_loss, x0=[peak_qi * 0.9, b_mid, 0.05],
-                       args=(t, y_s), bounds=bounds, method='L-BFGS-B',
-                       options={'maxiter': 150})
-        return tuple(map(float, res.x))
-    except Exception:
-        return (peak_qi, b_mid, 0.05)
-
-
-def _train_rf(df: pd.DataFrame, target_col: str) -> Dict:
-    """Train ML models on real per-well fitted Arps parameters.
-
-    Returns a dict with keys 'qi', 'b', 'di' mapping to trained regressors.
-    Backward-compatible signature (still called _train_rf).
-    """
-    col = target_col
-    well_params = []
-    for well_id, wd in df.groupby('WellID'):
-        wd = wd.sort_values('MonthYear')
-        y = wd[col].values.astype(float)
-        if len(y) < 3 or np.nanmax(y) <= 0:
-            continue
-        t = np.arange(len(y), dtype=float)
-        y_s = _smooth(y, 3)
-        qi, b, di = _fit_arps_quick(t, y_s, 0.0, 2.5)
-        well_params.append({
-            'WellID': well_id,
-            'NormOil': wd['NormOil'].mean(),
-            'NormGas': wd['NormGas'].mean(),
-            'NormWater': wd['NormWater'].mean(),
-            'LateralLength': pd.to_numeric(wd['LateralLength'].iloc[0], errors='coerce'),
-            'n_months': len(y),
-            'qi_fit': qi,
-            'b_fit': b,
-            'di_fit': di,
-        })
-
-    if len(well_params) < 3:
-        # Not enough data — return dummy models
+def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegressor]:
+    # Group by WellID for training
+    agg = (df.groupby('WellID')[['NormOil','NormGas','NormWater']]
+             .mean().reset_index())
+    agg = agg.dropna(subset=[target_col])
+    
+    X = agg[['NormOil','NormGas','NormWater']].values
+    if len(X) == 0:
         dummy = RandomForestRegressor(n_estimators=1, random_state=42)
-        dummy.fit([[0, 0, 0, 0, 0]], [0])
+        dummy.fit([[0,0,0]], [0])
         return {'qi': dummy, 'b': dummy, 'di': dummy}
-
-    wp = pd.DataFrame(well_params)
-    feat_cols = ['NormOil', 'NormGas', 'NormWater', 'LateralLength', 'n_months']
-    wp['LateralLength'] = wp['LateralLength'].fillna(wp['LateralLength'].median())
-    X = wp[feat_cols].values
-
-    models = {}
-    for target, label in [('qi_fit', 'qi'), ('b_fit', 'b'), ('di_fit', 'di')]:
-        y_target = wp[target].values
-        if _HAS_XGBOOST:
-            mdl = XGBRegressor(
-                n_estimators=80, max_depth=4, learning_rate=0.15,
-                subsample=0.8, colsample_bytree=0.8,
-                random_state=42, verbosity=0
-            )
-        else:
-            mdl = RandomForestRegressor(n_estimators=80, max_depth=6, random_state=42)
-        mdl.fit(X, y_target)
-        models[label] = mdl
-
-    return models
-
-
-# ====================================================================
-# Forecasting — single well
-# ====================================================================
+        
+    qi_model = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, agg[target_col].values)
+    b_model  = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, np.full(len(agg), 1.0))
+    di_model = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, np.full(len(agg), 0.05))
+    return {'qi': qi_model, 'b': b_model, 'di': di_model}
 
 def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: float,
-                      max_months: int, models: Dict,
-                      dmin: float = 0.006) -> Dict[str, object]:
-    """Forecast a single well using multi-model DCA with AICc selection.
-
-    The function fits Modified Arps, SEPD, and Duong, then picks the best
-    model via corrected Akaike Information Criterion (AICc).
-
-    Parameters
-    ----------
-    wd         : DataFrame for one well (sorted by MonthYear)
-    commodity  : 'oil' | 'gas' | 'water'
-    b_low      : lower bound for Arps b-factor
-    b_high     : upper bound for Arps b-factor
-    max_months : forecast horizon in months
-    models     : dict of trained ML models (from _train_rf)
-    dmin       : terminal decline rate per month for Modified Arps
-                 (default 0.006 ≈ 7% annual effective decline)
-    """
+                      max_months: int, models: Dict[str, RandomForestRegressor]) -> Dict[str, object]:
     commodity = commodity.lower()
-    col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[commodity]
+    col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[commodity]
 
     wd = wd.sort_values('MonthYear').copy()
     t_hist = np.arange(len(wd), dtype=float)
     y_hist = wd[col].values.astype(float)
     y_s = _smooth(y_hist, 3)
 
-    # --- Fit all three models ---
-    candidates = []
-    ma_result = _fit_modified_arps(t_hist, y_hist, y_s, b_low, b_high, dmin)
-    candidates.append(ma_result)
+    feats = np.array([[wd['NormOil'].mean(), wd['NormGas'].mean(), wd['NormWater'].mean()]], dtype=float)
+    
+    try:
+        qi_pred = float(models['qi'].predict(feats)[0])
+        b_pred = float(models['b'].predict(feats)[0])
+        di_pred = float(models['di'].predict(feats)[0])
+    except:
+        qi_pred, b_pred, di_pred = 100.0, 1.0, 0.05
 
-    if len(t_hist) >= 4:
-        sepd_result = _fit_sepd(t_hist, y_hist, y_s)
-        candidates.append(sepd_result)
+    peak_qi = float(np.nanmax(y_s)) if len(y_s)>0 else 1.0
+    peak_qi = min(peak_qi, 152000.0)
+    qi0 = min(peak_qi, max(qi_pred, 0.01))
+    b0  = b_pred
+    di0 = di_pred
 
-    if len(t_hist) >= 6:
-        duong_result = _fit_duong(t_hist, y_hist, y_s)
-        candidates.append(duong_result)
+    bounds = [(0.01, peak_qi*1.5), (b_low, b_high), (1e-6, 1.0)]
+    try:
+        res = minimize(robust_loss, x0=[qi0,b0,di0], args=(t_hist, y_s),
+                       bounds=bounds, method='L-BFGS-B')
+        qi,b,di = map(float, res.x)
+    except:
+        qi,b,di = qi0, b0, di0
 
-    best = _select_best_model(candidates)
-
-    # --- Generate forecast using the winning model (vectorized) ---
-    fit_hist = best['pred']
-    model_name = best['model']
-
-    t_forecast = np.arange(len(t_hist), len(t_hist) + max_months, dtype=float)
-    if model_name == 'ModifiedArps':
-        f_vals_all = modified_arps(best['qi'], best['b'], best['di'], best['dmin'], t_forecast)
-    elif model_name == 'SEPD':
-        f_vals_all = sepd(best['qi'], best['tau'], best['n'], t_forecast)
-    elif model_name == 'Duong':
-        f_vals_all = duong(best['qi'], best['a'], best['m'], t_forecast + 1.0)
-    else:
-        f_vals_all = arps(best['qi'], best.get('b', 1.0), best.get('di', 0.05), t_forecast)
-
-    # Truncate at economic limit
-    valid_mask = f_vals_all >= 1e-6
-    if not valid_mask.all():
-        first_invalid = np.argmin(valid_mask)
-        t_forecast = t_forecast[:first_invalid]
-        f_vals_all = f_vals_all[:first_invalid]
-
-    f_m = t_forecast.astype(int)
-    f_v = f_vals_all
+    fit_hist = arps(qi,b,di,t_hist)
+    f_m, f_v = [], []
+    m = len(t_hist)
+    while m < len(t_hist)+max_months:
+        q = float(arps(qi,b,di,np.array([m],float))[0])
+        if q < 1e-6: break
+        f_m.append(m); f_v.append(q); m += 1
 
     eur_hist = float(y_hist.sum())
     eur_fcst = float(np.sum(f_v))
-
-    # Compute Arps-equivalent params for the oneline table
-    qi_out = best.get('qi', 0.0)
-    b_out = best.get('b', np.nan)
-    di_out = best.get('di', np.nan)
-
-    return dict(
-        qi=qi_out, b=b_out, di=di_out,
-        model=model_name,
-        model_params={k: v for k, v in best.items()
-                      if k not in ('pred', 'sse', 'aicc', 'model')},
-        aicc=best['aicc'],
-        t_hist=t_hist, hist=y_hist,
-        fit_hist=fit_hist,
-        f_months=np.asarray(f_m, dtype=int), f_vals=np.asarray(f_v, dtype=float),
-        EUR_total=eur_hist + eur_fcst, EUR_fcst=eur_fcst,
-    )
-
-
-# ====================================================================
-# Forecast config & batch runner
-# ====================================================================
+    return dict(qi=qi, b=b, di=di, t_hist=t_hist, hist=y_hist,
+                fit_hist=fit_hist, f_months=np.array(f_m,int), f_vals=np.array(f_v,float),
+                EUR_total=eur_hist+eur_fcst, EUR_fcst=eur_fcst)
 
 @dataclass
 class ForecastConfig:
     commodity: str      # 'oil'|'gas'|'water'
-    b_low: float = 0.0
+    b_low: float = 0.8
     b_high: float = 1.2
     max_months: int = 600
-    dmin: float = 0.006  # terminal decline ~7% annual effective
 
-def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
     com = cfg.commodity.lower()
-    col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[com]
+    col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[com]
     models = _train_rf(merged, col)
 
     oneline, monthly = [], []
-
+    
+    # Group by WellID
     for well_id, wd in merged.groupby('WellID'):
-        if wd[col].max() <= 0 or wd[col].sum() <= 0:
+        if wd[col].max()<=0 or wd[col].sum()<=0:
             continue
-        fc = forecast_one_well(wd, com, cfg.b_low, cfg.b_high, cfg.max_months,
-                               models, dmin=cfg.dmin)
-        hdr = wd.iloc[0]
-        well = hdr.get('WellName', 'N/A')
-        api10 = hdr.get('API10', 'N/A')
+        fc = forecast_one_well(wd, com, cfg.b_low, cfg.b_high, cfg.max_months, models)
+        hdr = wd.iloc[0]; 
+        well = hdr.get('WellName','N/A')
+        api10 = hdr.get('API10','N/A')
 
-        qi_day = fc['qi'] / 30.4
-        # First-year decline via the winning model
-        t12 = np.array([12.0], dtype=float)
-        model_name = fc['model']
-        mp = fc['model_params']
-        if model_name == 'ModifiedArps':
-            q12 = float(modified_arps(mp['qi'], mp['b'], mp['di'], mp['dmin'], t12)[0])
-        elif model_name == 'SEPD':
-            q12 = float(sepd(mp['qi'], mp['tau'], mp['n'], t12)[0])
-        elif model_name == 'Duong':
-            q12 = float(duong(mp['qi'], mp['a'], mp['m'], t12 + 1.0)[0])
-        else:
-            q12 = float(arps(fc['qi'], fc['b'], fc['di'], t12)[0])
-
-        decline_yr = (1.0 - (q12 / fc['qi'])) * 100.0 if fc['qi'] > 0 else 0.0
+        qi_day = fc['qi']/30.4
+        q12 = float(arps(fc['qi'], fc['b'], fc['di'], np.array([12.0]))[0])
+        decline_yr = (1.0 - (q12/fc['qi']))*100.0 if fc['qi']>0 else 0.0
 
         row = {
             'WellID': str(well_id),
-            'API10': str(api10),
+            'API10': str(api10), 
             'WellName': well,
-            'WellNumber': str(hdr.get('WellNumber', '')),
-            'State': hdr.get('State'),
+            'WellNumber': str(hdr.get('WellNumber','')),
+            'State': hdr.get('State'), 
             'County': hdr.get('County'),
             'PrimaryFormation': hdr.get('PrimaryFormation'),
             'LateralLength': hdr.get('LateralLength'),
             'CompletionDate': hdr.get('CompletionDate'),
             'FirstProdDate': hdr.get('FirstProdDate'),
-            'qi (per day)': round(qi_day, 0),
-            'b': round(fc['b'], 3) if np.isfinite(fc['b']) else '',
-            'di (per month)': round(fc['di'], 4) if np.isfinite(fc['di']) else '',
-            'First-Year Decline (%)': round(decline_yr, 1),
-            'Best Model': fc['model'],
+            'qi (per day)': round(qi_day,0),
+            'b': round(fc['b'],3),
+            'di (per month)': round(fc['di'],4),
+            'First-Year Decline (%)': round(decline_yr,1),
         }
-        if com == 'oil':
-            row.update({'EUR (Mbbl)': round(fc['EUR_total'] / 1_000.0, 2),
-                        'Remaining (Mbbl)': round(fc['EUR_fcst'] / 1_000.0, 2)})
-        elif com == 'gas':
-            row.update({'EUR (MMcf)': round(fc['EUR_total'] / 1_000_000.0, 2),
-                        'Remaining (MMcf)': round(fc['EUR_fcst'] / 1_000_000.0, 2)})
+        if com=='oil':
+            row.update({'EUR (Mbbl)': round(fc['EUR_total']/1_000.0,2),
+                        'Remaining (Mbbl)': round(fc['EUR_fcst']/1_000.0,2)})
+        elif com=='gas':
+            row.update({'EUR (MMcf)': round(fc['EUR_total']/1_000_000.0,2),
+                        'Remaining (MMcf)': round(fc['EUR_fcst']/1_000_000.0,2)})
         else:
-            row.update({'EUR (Mbbl water)': round(fc['EUR_total'] / 1_000.0, 2),
-                        'Remaining (Mbbl water)': round(fc['EUR_fcst'] / 1_000.0, 2)})
+            row.update({'EUR (Mbbl water)': round(fc['EUR_total']/1_000.0,2),
+                        'Remaining (Mbbl water)': round(fc['EUR_fcst']/1_000.0,2)})
         oneline.append(row)
 
         hist_dates = wd.sort_values('MonthYear')['MonthYear'].dt.to_timestamp(how='start')
-        hist_vals = wd[col].values.astype(float)
-        start = hist_dates.iloc[-1] + pd.offsets.MonthBegin(1) if len(hist_dates) > 0 \
-            else merged['MonthYear'].min().to_timestamp(how='start')
+        hist_vals  = wd[col].values.astype(float)
+        start = hist_dates.iloc[-1] + pd.offsets.MonthBegin(1) if len(hist_dates)>0 \
+                else merged['MonthYear'].min().to_timestamp(how='start')
         f_dates = pd.date_range(start=start, periods=len(fc['f_vals']), freq='MS')
 
-        for d, v in zip(hist_dates, hist_vals):
-            monthly.append({'WellID': str(well_id), 'API10': str(api10),
-                            'WellName': well, 'Date': d,
-                            f'Monthly_{com}_volume': float(v), 'Segment': 'Historical'})
-        for d, v in zip(f_dates, fc['f_vals']):
-            monthly.append({'WellID': str(well_id), 'API10': str(api10),
-                            'WellName': well, 'Date': d,
-                            f'Monthly_{com}_volume': float(v), 'Segment': 'Forecast'})
+        for d,v in zip(hist_dates, hist_vals):
+            monthly.append({'WellID':str(well_id), 'API10':str(api10),
+                            'WellName':well, 'Date':d,
+                            f'Monthly_{com}_volume':float(v),'Segment':'Historical'})
+        for d,v in zip(f_dates, fc['f_vals']):
+            monthly.append({'WellID':str(well_id), 'API10':str(api10),
+                            'WellName':well, 'Date':d,
+                            f'Monthly_{com}_volume':float(v),'Segment':'Forecast'})
 
     oneline_df = pd.DataFrame(oneline)
-    monthly_df = pd.DataFrame(monthly).sort_values(['WellID', 'Date', 'Segment'])
-    return oneline_df, monthly_df, models
-
-# ====================================================================
-# Statistics & visualization (unchanged public API)
-# ====================================================================
+    monthly_df = pd.DataFrame(monthly).sort_values(['WellID','Date','Segment'])
+    return oneline_df, monthly_df
 
 def compute_eur_stats(eur_array: List[float]) -> Dict[str, float]:
     eur = np.array(eur_array, dtype=float)
@@ -793,23 +453,22 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     unit = {"oil":"(norm bbl/mo)","gas":"(norm Mcf/mo)","water":"(norm bbl/mo)"}[com]
     well = wd.iloc[0].get('WellName','N/A')
     api  = str(wd.iloc[0].get('API10',''))
+    # Use WellID for title if API is empty
     if not api or api == 'nan':
         api = wd.iloc[0].get('WellID','N/A')
-
-    model_label = fc.get('model', 'Arps')
 
     fig, ax = plt.subplots(figsize=(10,6))
     if len(hist_dates) > 0:
         ax.scatter(hist_dates, hist_vals, label="Historical", s=22, color=color)
-        ax.plot(fit_dates, fit_hist, label=f"Fit ({model_label})", linewidth=2, color=color)
+        ax.plot(fit_dates, fit_hist, label="Fit (history)", linewidth=2, color=color)
     if len(f_dates) > 0:
-        ax.plot(f_dates, f_vals, label=f"Forecast ({model_label})", linestyle="--", linewidth=2, color=color)
+        ax.plot(f_dates, f_vals, label="Forecast", linestyle="--", linewidth=2, color=color)
 
-    ax.set_title(f"{well} | ID: {api} | {commodity.capitalize()} | Model: {model_label}")
+    ax.set_title(f"{well} | ID: {api} | {commodity.capitalize()}")
     ax.set_xlabel("Month")
     ax.set_ylabel(f"Monthly {commodity} {unit}")
     ax.set_yscale('log')
-    ax.set_ylim(bottom=1)
+    ax.set_ylim(bottom=1)  
     ax.grid(True, linestyle="--", alpha=0.4, which='both')
     ax.legend()
     fig.tight_layout()

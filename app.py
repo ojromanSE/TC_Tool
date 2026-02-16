@@ -20,9 +20,6 @@ from core import (
 st.set_page_config(page_title="SE Tool", layout="wide")
 LOGO_PATH = pathlib.Path(__file__).parent / "static" / "logo.png"
 
-# Terminal decline rate (background default, ~7% annual effective)
-DMIN = 0.006
-
 # ---------- Header ----------
 cols = st.columns([0.12, 0.88])
 with cols[0]:
@@ -38,12 +35,8 @@ with st.sidebar:
     norm_len = st.number_input("Normalization Length (ft)", 1000, 30000, 10000, step=500)
     use_norm = st.checkbox("Apply Normalization", value=True)
     st.markdown("---")
-    st.subheader("DCA Parameters")
-    b_low  = st.number_input("b-factor Low", value=0.0, step=0.1, format="%.3f",
-                              help="Lower bound for Arps b-factor (0 = exponential)")
-    b_high = st.number_input("b-factor High", value=1.2, step=0.1, format="%.3f",
-                              help="Upper bound for Arps b-factor (>1 for unconventionals)")
-    st.caption("Models: Modified Arps, SEPD, Duong — best selected via AICc")
+    b_low  = st.number_input("b-factor Low", value=0.8, step=0.1, format="%.3f")
+    b_high = st.number_input("b-factor High", value=1.2, step=0.1, format="%.3f")
     st.markdown("---")
     lat_col = st.text_input("Latitude column (optional QC)", value="Latitude")
     lon_col = st.text_input("Longitude column (optional QC)", value="Longitude")
@@ -176,14 +169,10 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     return hist_png, box_png, scatter_png, stats_df
 
 def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
-    from core import modified_arps, _smooth
-    from scipy.optimize import minimize
-    from scipy.special import huber
-
     vol_col = f"Monthly_{com}_volume"
     if monthly_df.empty or vol_col not in monthly_df.columns:
         return pd.DataFrame(columns=['t','P10','P50','P90']), []
-
+    
     # Use WellID for grouping
     hist = monthly_df[monthly_df['Segment'] == 'Historical'][['WellID','Date',vol_col]].dropna().copy()
     hist = hist.sort_values(['WellID','Date'])
@@ -193,65 +182,13 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
         t = g['t'].to_numpy()
         y = np.clip(g[vol_col].to_numpy(), 1e-6, None)
         lines.append((t, y))
-
+        
     all_df = monthly_df[['WellID','Date',vol_col]].dropna().sort_values(['WellID','Date']).copy()
     all_df['t'] = all_df.groupby('WellID').cumcount() + 1
-
-    # --- Survivorship-bias guard: only use months with enough wells for percentiles ---
-    well_counts = all_df.groupby('t')['WellID'].nunique()
-    max_wells = well_counts.iloc[0] if len(well_counts) > 0 else 0
-    min_wells = max(5, int(max_wells * 0.25))
-    valid_months = well_counts[well_counts >= min_wells].index
-    stat_df = all_df[all_df['t'].isin(valid_months)]
-
-    q = stat_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
+    q = all_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
     q.columns = ['P10','P50','P90']
     q = q.reset_index()
-
-    if q.empty or len(q) < 3:
-        return q, lines
-
-    # --- Fit Modified Arps to each percentile curve and extend smoothly ---
-    max_hist_t = int(q['t'].max())
-    # Determine longest well's forecast extent
-    max_all_t = int(all_df['t'].max())
-    forecast_horizon = max(max_all_t, max_hist_t + 360)  # at least 30 years beyond data
-    t_extend = np.arange(1, forecast_horizon + 1, dtype=float)
-
-    def _fit_type_curve(t_obs, y_obs):
-        """Fit Modified Arps to a percentile curve for smooth extension."""
-        t_arr = t_obs.astype(float)
-        y_s = _smooth(y_obs, 3)
-        peak = float(np.nanmax(y_s))
-        if peak <= 0:
-            return y_obs, np.zeros(len(t_extend))
-        dmin = 0.006
-        bounds = [(0.01, peak * 1.5), (0.0, 1.2), (1e-6, 1.0)]
-        best_loss, best_p = np.inf, (peak, 0.5, 0.05)
-        for qi0, b0, di0 in [(peak, 0.5, 0.05), (peak * 0.8, 0.8, 0.02)]:
-            try:
-                def _loss(p):
-                    pred = modified_arps(p[0], p[1], p[2], dmin, t_arr)
-                    return huber(1.0, pred - y_s).mean()
-                res = minimize(_loss, x0=[qi0, b0, di0], bounds=bounds,
-                               method='L-BFGS-B', options={'maxiter': 150})
-                if res.fun < best_loss:
-                    best_loss = res.fun
-                    best_p = tuple(map(float, res.x))
-            except Exception:
-                pass
-        qi, b, di = best_p
-        full_curve = modified_arps(qi, b, di, dmin, t_extend)
-        return full_curve
-
-    extended = pd.DataFrame({'t': t_extend.astype(int)})
-    for pct in ['P10', 'P50', 'P90']:
-        t_obs = q['t'].values
-        y_obs = q[pct].values
-        full_curve = _fit_type_curve(t_obs, y_obs)
-        extended[pct] = full_curve
-
-    return extended, lines
+    return q, lines
 
 def plot_type_curves(curves, lines, fluid):
     color = _phase_color(fluid)
@@ -275,47 +212,23 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         merged = st.session_state.merged
         cfg = ForecastConfig(
             commodity=fluid_name.lower(),
-            b_low=float(b_low), b_high=float(b_high), max_months=600,
-            dmin=DMIN
+            b_low=float(b_low), b_high=float(b_high), max_months=600
         )
-        with st.spinner(f"Forecasting {fluid_name}..."):
-            oneline, monthly, models = forecast_all(merged, cfg)
+        oneline, monthly = forecast_all(merged, cfg)
         st.session_state[f"{fluid_name}_oneline"] = oneline
         st.session_state[f"{fluid_name}_monthly"] = monthly
-        st.session_state[f"{fluid_name}_models"] = models
         st.success(f"{fluid_name} forecast completed.")
 
     on_key = f"{fluid_name}_oneline"
     mo_key = f"{fluid_name}_monthly"
 
     if on_key in st.session_state:
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
-            "Oneline", "Monthly", "Type Curve", "B-Factor", "Probit"
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "Oneline", "Monthly", "B-Factor", "Probit"
         ])
         with tab1: st.dataframe(format_df_2dec(st.session_state[on_key]), use_container_width=True)
         with tab2: st.dataframe(format_df_2dec(st.session_state[mo_key]), use_container_width=True)
         with tab3:
-            if mo_key in st.session_state:
-                monthly = st.session_state[mo_key]
-                curves, lines = build_type_curves_and_lines(monthly, fluid_name.lower())
-                if not curves.empty:
-                    fig_tc = plot_type_curves(curves, lines, fluid_name.lower())
-                    st.pyplot(fig_tc)
-                    plt.close(fig_tc)
-                    # EUR summary alongside type curve
-                    oneline = st.session_state[on_key]
-                    if eur_col in oneline.columns:
-                        eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
-                        if fluid_name == "Gas" or "MMcf" in eur_col:
-                            eurs = [x * 1000 if x is not None else None for x in eurs]
-                        unit = "Mbbl" if "Mbbl" in eur_col else "MMcf"
-                        stats = compute_eur_stats(eurs)
-                        st.dataframe(format_df_2dec(eur_summary_table(fluid_name, stats, unit, int(norm_len))))
-                else:
-                    st.info("Not enough data to build type curves.")
-            else:
-                st.info(f"Run {fluid_name} forecast first to see type curves.")
-        with tab4:
             oneline = st.session_state[on_key]
             hist_png, box_png, scatter_png, bstats = bfactor_analytics_figures(oneline, fluid_name, eur_col)
             c1, c2 = st.columns([2,1])
@@ -325,7 +238,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             with c2:
                 if box_png: st.image(box_png)
                 st.dataframe(format_df_2dec(bstats))
-        with tab5:
+        with tab4:
             oneline = st.session_state[on_key]
             if eur_col in oneline.columns:
                 eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
@@ -342,17 +255,10 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         # Use WellID for selection
         opts = merged[['WellID']].drop_duplicates().sort_values('WellID')
         pick_id = st.selectbox(f"Pick Well ({fluid_name})", opts['WellID'], key=f"{fluid_name}_pick")
-
+        
         wd = merged[merged['WellID'] == pick_id]
-        # Reuse cached models from forecast run instead of retraining
-        models_key = f"{fluid_name}_models"
-        if models_key in st.session_state:
-            models = st.session_state[models_key]
-        else:
-            models = _train_rf(merged, norm_col_for_models)
-            st.session_state[models_key] = models
-        fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models,
-                              dmin=DMIN)
+        models = _train_rf(merged, norm_col_for_models)
+        fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
         fig = plot_one_well(wd, fc, fluid_name.lower())
         st.pyplot(fig)
 
@@ -417,7 +323,6 @@ def generate_comprehensive_pdf():
         ["Normalization Length", f"{norm_len} ft"],
         ["Apply Normalization", "Yes" if use_norm else "No"],
         ["B-factor Range", f"{b_low:.3f} - {b_high:.3f}"],
-        ["Dmin (terminal decline)", f"{DMIN:.4f} /month (~7% annual)"],
         ["Geographic Bin Decimals", str(bin_decimals)]
     ]
     params_table = Table(params_data, colWidths=[3*inch, 2*inch])
