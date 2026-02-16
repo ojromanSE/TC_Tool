@@ -333,25 +333,32 @@ def _fit_modified_arps(t: np.ndarray, y: np.ndarray, y_s: np.ndarray,
     peak_qi = float(np.nanmax(y_s)) if len(y_s) > 0 else 1.0
     peak_qi = min(peak_qi, 152_000.0)
 
-    # Multi-start: try a few initial guesses
-    best_sse, best_params = np.inf, (peak_qi, 1.0, 0.05)
-    for qi0_frac in [1.0, 0.8, 1.2]:
-        for b0 in [b_low, (b_low + b_high) / 2, b_high]:
-            for di0 in [0.02, 0.05, 0.10, 0.20]:
-                qi0 = min(peak_qi * qi0_frac, max(peak_qi * 0.5, 0.01))
-                bounds = [(0.01, peak_qi * 1.5), (b_low, b_high), (1e-6, 1.0)]
-                try:
-                    def _loss(p):
-                        pred = modified_arps(p[0], p[1], p[2], dmin, t)
-                        return huber(1.0, pred - y_s).mean()
-                    res = minimize(_loss, x0=[qi0, b0, di0],
-                                   bounds=bounds, method='L-BFGS-B',
-                                   options={'maxiter': 300})
-                    if res.fun < best_sse:
-                        best_sse = res.fun
-                        best_params = tuple(map(float, res.x))
-                except Exception:
-                    pass
+    # Estimate initial decline from first few data points
+    di_est = 0.05
+    if len(y_s) >= 3 and y_s[0] > 0:
+        ratio = y_s[min(len(y_s)-1, 6)] / max(y_s[0], 1e-6)
+        if 0 < ratio < 1:
+            di_est = np.clip(-np.log(ratio) / min(len(y_s)-1, 6), 0.005, 0.5)
+
+    b_mid = (b_low + b_high) / 2
+    bounds = [(0.01, peak_qi * 1.5), (b_low, b_high), (1e-6, 1.0)]
+
+    best_sse, best_params = np.inf, (peak_qi, b_mid, di_est)
+    for qi0, b0, di0 in [(peak_qi, b_mid, di_est),
+                          (peak_qi * 0.8, b_low, di_est * 2),
+                          (peak_qi, b_high, di_est * 0.5)]:
+        try:
+            def _loss(p):
+                pred = modified_arps(p[0], p[1], p[2], dmin, t)
+                return huber(1.0, pred - y_s).mean()
+            res = minimize(_loss, x0=[qi0, b0, di0],
+                           bounds=bounds, method='L-BFGS-B',
+                           options={'maxiter': 200})
+            if res.fun < best_sse:
+                best_sse = res.fun
+                best_params = tuple(map(float, res.x))
+        except Exception:
+            pass
 
     qi, b, di = best_params
     pred = modified_arps(qi, b, di, dmin, t)
@@ -366,24 +373,23 @@ def _fit_sepd(t: np.ndarray, y: np.ndarray, y_s: np.ndarray) -> Dict:
     peak_qi = float(np.nanmax(y_s)) if len(y_s) > 0 else 1.0
     peak_qi = min(peak_qi, 152_000.0)
 
+    bounds = [(0.01, peak_qi * 1.5), (1.0, 500.0), (0.05, 1.0)]
     best_sse, best_params = np.inf, (peak_qi, 20.0, 0.5)
-    for qi0_frac in [1.0, 0.8]:
-        for tau0 in [10.0, 30.0, 80.0]:
-            for n0 in [0.3, 0.5, 0.8]:
-                qi0 = peak_qi * qi0_frac
-                bounds = [(0.01, peak_qi * 1.5), (1.0, 500.0), (0.05, 1.0)]
-                try:
-                    def _loss(p):
-                        pred = sepd(p[0], p[1], p[2], t)
-                        return huber(1.0, pred - y_s).mean()
-                    res = minimize(_loss, x0=[qi0, tau0, n0],
-                                   bounds=bounds, method='L-BFGS-B',
-                                   options={'maxiter': 300})
-                    if res.fun < best_sse:
-                        best_sse = res.fun
-                        best_params = tuple(map(float, res.x))
-                except Exception:
-                    pass
+    for qi0, tau0, n0 in [(peak_qi, 30.0, 0.5),
+                           (peak_qi * 0.8, 10.0, 0.3),
+                           (peak_qi, 80.0, 0.8)]:
+        try:
+            def _loss(p):
+                pred = sepd(p[0], p[1], p[2], t)
+                return huber(1.0, pred - y_s).mean()
+            res = minimize(_loss, x0=[qi0, tau0, n0],
+                           bounds=bounds, method='L-BFGS-B',
+                           options={'maxiter': 200})
+            if res.fun < best_sse:
+                best_sse = res.fun
+                best_params = tuple(map(float, res.x))
+        except Exception:
+            pass
 
     qi, tau, n = best_params
     pred = sepd(qi, tau, n, t)
@@ -401,24 +407,23 @@ def _fit_duong(t: np.ndarray, y: np.ndarray, y_s: np.ndarray) -> Dict:
     # Duong uses t starting at 1 (month 1, 2, ...)
     t_duong = t + 1.0  # shift so first month = 1
 
+    bounds = [(0.01, peak_qi * 2.0), (0.01, 5.0), (0.5, 2.5)]
     best_sse, best_params = np.inf, (peak_qi, 1.0, 1.1)
-    for qi0_frac in [1.0, 0.8]:
-        for a0 in [0.5, 1.0, 2.0]:
-            for m0 in [1.0, 1.1, 1.3]:
-                qi0 = peak_qi * qi0_frac
-                bounds = [(0.01, peak_qi * 2.0), (0.01, 5.0), (0.5, 2.5)]
-                try:
-                    def _loss(p):
-                        pred = duong(p[0], p[1], p[2], t_duong)
-                        return huber(1.0, pred - y_s).mean()
-                    res = minimize(_loss, x0=[qi0, a0, m0],
-                                   bounds=bounds, method='L-BFGS-B',
-                                   options={'maxiter': 300})
-                    if res.fun < best_sse:
-                        best_sse = res.fun
-                        best_params = tuple(map(float, res.x))
-                except Exception:
-                    pass
+    for qi0, a0, m0 in [(peak_qi, 1.0, 1.1),
+                          (peak_qi * 0.8, 0.5, 1.0),
+                          (peak_qi, 2.0, 1.3)]:
+        try:
+            def _loss(p):
+                pred = duong(p[0], p[1], p[2], t_duong)
+                return huber(1.0, pred - y_s).mean()
+            res = minimize(_loss, x0=[qi0, a0, m0],
+                           bounds=bounds, method='L-BFGS-B',
+                           options={'maxiter': 200})
+            if res.fun < best_sse:
+                best_sse = res.fun
+                best_params = tuple(map(float, res.x))
+        except Exception:
+            pass
 
     qi, a, m = best_params
     pred = duong(qi, a, m, t_duong)
@@ -445,20 +450,15 @@ def _fit_arps_quick(t: np.ndarray, y_s: np.ndarray,
     """Quick Arps fit for a single well (used to build training labels)."""
     peak_qi = float(np.nanmax(y_s)) if len(y_s) > 0 else 1.0
     peak_qi = min(peak_qi, 152_000.0)
+    b_mid = (b_low + b_high) / 2
     bounds = [(0.01, peak_qi * 1.5), (b_low, b_high), (1e-6, 1.0)]
-    best_sse, best_params = np.inf, (peak_qi, 1.0, 0.05)
-    for b0 in [(b_low + b_high) / 2]:
-        for di0 in [0.05, 0.10]:
-            try:
-                res = minimize(robust_loss, x0=[peak_qi * 0.9, b0, di0],
-                               args=(t, y_s), bounds=bounds, method='L-BFGS-B',
-                               options={'maxiter': 200})
-                if res.fun < best_sse:
-                    best_sse = res.fun
-                    best_params = tuple(map(float, res.x))
-            except Exception:
-                pass
-    return best_params
+    try:
+        res = minimize(robust_loss, x0=[peak_qi * 0.9, b_mid, 0.05],
+                       args=(t, y_s), bounds=bounds, method='L-BFGS-B',
+                       options={'maxiter': 150})
+        return tuple(map(float, res.x))
+    except Exception:
+        return (peak_qi, b_mid, 0.05)
 
 
 def _train_rf(df: pd.DataFrame, target_col: str) -> Dict:
@@ -505,12 +505,12 @@ def _train_rf(df: pd.DataFrame, target_col: str) -> Dict:
         y_target = wp[target].values
         if _HAS_XGBOOST:
             mdl = XGBRegressor(
-                n_estimators=150, max_depth=5, learning_rate=0.1,
+                n_estimators=80, max_depth=4, learning_rate=0.15,
                 subsample=0.8, colsample_bytree=0.8,
                 random_state=42, verbosity=0
             )
         else:
-            mdl = RandomForestRegressor(n_estimators=150, max_depth=8, random_state=42)
+            mdl = RandomForestRegressor(n_estimators=80, max_depth=6, random_state=42)
         mdl.fit(X, y_target)
         models[label] = mdl
 
@@ -616,7 +616,7 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
 class ForecastConfig:
     commodity: str      # 'oil'|'gas'|'water'
     b_low: float = 0.0
-    b_high: float = 2.0
+    b_high: float = 1.2
     max_months: int = 600
     dmin: float = 0.006  # terminal decline ~7% annual effective
 

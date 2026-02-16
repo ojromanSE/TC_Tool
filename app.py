@@ -20,6 +20,9 @@ from core import (
 st.set_page_config(page_title="SE Tool", layout="wide")
 LOGO_PATH = pathlib.Path(__file__).parent / "static" / "logo.png"
 
+# Terminal decline rate (background default, ~7% annual effective)
+DMIN = 0.006
+
 # ---------- Header ----------
 cols = st.columns([0.12, 0.88])
 with cols[0]:
@@ -38,12 +41,8 @@ with st.sidebar:
     st.subheader("DCA Parameters")
     b_low  = st.number_input("b-factor Low", value=0.0, step=0.1, format="%.3f",
                               help="Lower bound for Arps b-factor (0 = exponential)")
-    b_high = st.number_input("b-factor High", value=2.0, step=0.1, format="%.3f",
+    b_high = st.number_input("b-factor High", value=1.2, step=0.1, format="%.3f",
                               help="Upper bound for Arps b-factor (>1 for unconventionals)")
-    dmin   = st.number_input("Dmin (terminal decline, monthly)", value=0.006, step=0.001,
-                              format="%.4f",
-                              help="Terminal decline rate per month for Modified Arps. "
-                                   "0.004≈5%/yr, 0.006≈7%/yr, 0.008≈10%/yr effective.")
     st.caption("Models: Modified Arps, SEPD, Duong — best selected via AICc")
     st.markdown("---")
     lat_col = st.text_input("Latitude column (optional QC)", value="Latitude")
@@ -177,10 +176,14 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
     return hist_png, box_png, scatter_png, stats_df
 
 def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
+    from core import modified_arps, _smooth
+    from scipy.optimize import minimize
+    from scipy.special import huber
+
     vol_col = f"Monthly_{com}_volume"
     if monthly_df.empty or vol_col not in monthly_df.columns:
         return pd.DataFrame(columns=['t','P10','P50','P90']), []
-    
+
     # Use WellID for grouping
     hist = monthly_df[monthly_df['Segment'] == 'Historical'][['WellID','Date',vol_col]].dropna().copy()
     hist = hist.sort_values(['WellID','Date'])
@@ -190,21 +193,65 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
         t = g['t'].to_numpy()
         y = np.clip(g[vol_col].to_numpy(), 1e-6, None)
         lines.append((t, y))
-        
+
     all_df = monthly_df[['WellID','Date',vol_col]].dropna().sort_values(['WellID','Date']).copy()
     all_df['t'] = all_df.groupby('WellID').cumcount() + 1
 
-    # --- Survivorship-bias guard: drop months with too few wells ---
+    # --- Survivorship-bias guard: only use months with enough wells for percentiles ---
     well_counts = all_df.groupby('t')['WellID'].nunique()
     max_wells = well_counts.iloc[0] if len(well_counts) > 0 else 0
-    min_wells = max(5, int(max_wells * 0.25))          # at least 25% of peak or 5
+    min_wells = max(5, int(max_wells * 0.25))
     valid_months = well_counts[well_counts >= min_wells].index
-    all_df = all_df[all_df['t'].isin(valid_months)]
+    stat_df = all_df[all_df['t'].isin(valid_months)]
 
-    q = all_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
+    q = stat_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
     q.columns = ['P10','P50','P90']
     q = q.reset_index()
-    return q, lines
+
+    if q.empty or len(q) < 3:
+        return q, lines
+
+    # --- Fit Modified Arps to each percentile curve and extend smoothly ---
+    max_hist_t = int(q['t'].max())
+    # Determine longest well's forecast extent
+    max_all_t = int(all_df['t'].max())
+    forecast_horizon = max(max_all_t, max_hist_t + 360)  # at least 30 years beyond data
+    t_extend = np.arange(1, forecast_horizon + 1, dtype=float)
+
+    def _fit_type_curve(t_obs, y_obs):
+        """Fit Modified Arps to a percentile curve for smooth extension."""
+        t_arr = t_obs.astype(float)
+        y_s = _smooth(y_obs, 3)
+        peak = float(np.nanmax(y_s))
+        if peak <= 0:
+            return y_obs, np.zeros(len(t_extend))
+        dmin = 0.006
+        bounds = [(0.01, peak * 1.5), (0.0, 1.2), (1e-6, 1.0)]
+        best_loss, best_p = np.inf, (peak, 0.5, 0.05)
+        for qi0, b0, di0 in [(peak, 0.5, 0.05), (peak * 0.8, 0.8, 0.02)]:
+            try:
+                def _loss(p):
+                    pred = modified_arps(p[0], p[1], p[2], dmin, t_arr)
+                    return huber(1.0, pred - y_s).mean()
+                res = minimize(_loss, x0=[qi0, b0, di0], bounds=bounds,
+                               method='L-BFGS-B', options={'maxiter': 150})
+                if res.fun < best_loss:
+                    best_loss = res.fun
+                    best_p = tuple(map(float, res.x))
+            except Exception:
+                pass
+        qi, b, di = best_p
+        full_curve = modified_arps(qi, b, di, dmin, t_extend)
+        return full_curve
+
+    extended = pd.DataFrame({'t': t_extend.astype(int)})
+    for pct in ['P10', 'P50', 'P90']:
+        t_obs = q['t'].values
+        y_obs = q[pct].values
+        full_curve = _fit_type_curve(t_obs, y_obs)
+        extended[pct] = full_curve
+
+    return extended, lines
 
 def plot_type_curves(curves, lines, fluid):
     color = _phase_color(fluid)
@@ -229,7 +276,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         cfg = ForecastConfig(
             commodity=fluid_name.lower(),
             b_low=float(b_low), b_high=float(b_high), max_months=600,
-            dmin=float(dmin)
+            dmin=DMIN
         )
         with st.spinner(f"Forecasting {fluid_name}..."):
             oneline, monthly, models = forecast_all(merged, cfg)
@@ -305,7 +352,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             models = _train_rf(merged, norm_col_for_models)
             st.session_state[models_key] = models
         fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models,
-                              dmin=float(dmin))
+                              dmin=DMIN)
         fig = plot_one_well(wd, fc, fluid_name.lower())
         st.pyplot(fig)
 
@@ -370,6 +417,7 @@ def generate_comprehensive_pdf():
         ["Normalization Length", f"{norm_len} ft"],
         ["Apply Normalization", "Yes" if use_norm else "No"],
         ["B-factor Range", f"{b_low:.3f} - {b_high:.3f}"],
+        ["Dmin (terminal decline)", f"{DMIN:.4f} /month (~7% annual)"],
         ["Geographic Bin Decimals", str(bin_decimals)]
     ]
     params_table = Table(params_data, colWidths=[3*inch, 2*inch])
