@@ -35,8 +35,16 @@ with st.sidebar:
     norm_len = st.number_input("Normalization Length (ft)", 1000, 30000, 10000, step=500)
     use_norm = st.checkbox("Apply Normalization", value=True)
     st.markdown("---")
-    b_low  = st.number_input("b-factor Low", value=0.8, step=0.1, format="%.3f")
-    b_high = st.number_input("b-factor High", value=1.2, step=0.1, format="%.3f")
+    st.subheader("DCA Parameters")
+    b_low  = st.number_input("b-factor Low", value=0.0, step=0.1, format="%.3f",
+                              help="Lower bound for Arps b-factor (0 = exponential)")
+    b_high = st.number_input("b-factor High", value=2.0, step=0.1, format="%.3f",
+                              help="Upper bound for Arps b-factor (>1 for unconventionals)")
+    dmin   = st.number_input("Dmin (terminal decline, monthly)", value=0.006, step=0.001,
+                              format="%.4f",
+                              help="Terminal decline rate per month for Modified Arps. "
+                                   "0.004≈5%/yr, 0.006≈7%/yr, 0.008≈10%/yr effective.")
+    st.caption("Models: Modified Arps, SEPD, Duong — best selected via AICc")
     st.markdown("---")
     lat_col = st.text_input("Latitude column (optional QC)", value="Latitude")
     lon_col = st.text_input("Longitude column (optional QC)", value="Longitude")
@@ -185,6 +193,14 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
         
     all_df = monthly_df[['WellID','Date',vol_col]].dropna().sort_values(['WellID','Date']).copy()
     all_df['t'] = all_df.groupby('WellID').cumcount() + 1
+
+    # --- Survivorship-bias guard: drop months with too few wells ---
+    well_counts = all_df.groupby('t')['WellID'].nunique()
+    max_wells = well_counts.iloc[0] if len(well_counts) > 0 else 0
+    min_wells = max(5, int(max_wells * 0.25))          # at least 25% of peak or 5
+    valid_months = well_counts[well_counts >= min_wells].index
+    all_df = all_df[all_df['t'].isin(valid_months)]
+
     q = all_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
     q.columns = ['P10','P50','P90']
     q = q.reset_index()
@@ -212,7 +228,8 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         merged = st.session_state.merged
         cfg = ForecastConfig(
             commodity=fluid_name.lower(),
-            b_low=float(b_low), b_high=float(b_high), max_months=600
+            b_low=float(b_low), b_high=float(b_high), max_months=600,
+            dmin=float(dmin)
         )
         oneline, monthly = forecast_all(merged, cfg)
         st.session_state[f"{fluid_name}_oneline"] = oneline
@@ -258,7 +275,8 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         
         wd = merged[merged['WellID'] == pick_id]
         models = _train_rf(merged, norm_col_for_models)
-        fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
+        fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models,
+                              dmin=float(dmin))
         fig = plot_one_well(wd, fc, fluid_name.lower())
         st.pyplot(fig)
 
