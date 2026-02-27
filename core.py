@@ -5,11 +5,12 @@ matplotlib.use('Agg')
 
 import numpy as np
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Tuple, List
 from scipy.optimize import minimize
 from scipy.special import huber
 from sklearn.ensemble import RandomForestRegressor
+from joblib import Parallel, delayed
 import matplotlib.pyplot as plt
 from matplotlib.ticker import LogLocator, FuncFormatter
 from scipy import stats
@@ -50,7 +51,7 @@ def _normalize_columns_before_map(df: pd.DataFrame) -> pd.DataFrame:
             if alias in df.columns:
                 df['API10'] = df[alias].astype(str).str.replace(r'\.0$', '', regex=True).str[:10]
                 break
-    
+
     # 2. Well Number Aliases
     if 'Well Number' not in df.columns and 'WellNumber' not in df.columns:
         if 'WellNumber' in df.columns:
@@ -77,7 +78,7 @@ def _normalize_columns_before_map(df: pd.DataFrame) -> pd.DataFrame:
         for alias in ['FirstProductionDate']:
             if alias in df.columns:
                 df['First Prod Date'] = df[alias]
-                break       
+                break
     return df
 
 def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
@@ -86,9 +87,9 @@ def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
             new_data = {}
             for target_name, source_name in m.items():
                 new_data[target_name] = df[source_name]
-            
+
             subset = pd.DataFrame(new_data)
-            
+
             missing = [c for c in required if c not in subset.columns]
             if 'LateralLength' in missing and 'LateralLength' in df.columns:
                  subset['LateralLength'] = df['LateralLength']
@@ -96,7 +97,7 @@ def _translate(df: pd.DataFrame, maps, required) -> pd.DataFrame:
             final_miss = [c for c in required if c not in subset.columns]
             if not final_miss:
                 return subset[required].copy()
-            
+
     raise ValueError(f"Could not map columns. Found in file: {list(df.columns)}")
 
 def load_header(file_like) -> pd.DataFrame:
@@ -124,14 +125,14 @@ def fill_lateral_by_geo(
         df['LateralImputed'] = False
         df['LateralImputeNote'] = 'No lat/lon columns found'
         return df
-        
+
     df[lateral_col] = pd.to_numeric(df[lateral_col], errors='coerce')
     miss = df[lateral_col].isna() | (df[lateral_col] == 0)
-    
+
     df['lat_bin'] = df[lat_col].round(decimals)
     df['lon_bin'] = df[lon_col].round(decimals)
     valid = df[~miss & df[lateral_col].notna()]
-    
+
     if valid.empty:
         df['LateralImputed'] = False
         df['LateralImputeNote'] = 'No valid laterals to train from'
@@ -162,15 +163,15 @@ def _make_well_id(df: pd.DataFrame) -> pd.Series:
 
 def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessConfig) -> pd.DataFrame:
     hd = header_df.copy(); pr = prod_df.copy()
-    
+
     # Create WellID for merging
     hd['WellID'] = _make_well_id(hd)
     pr['WellID'] = _make_well_id(pr)
-    
+
     pr['MonthYear'] = pr['ReportDate'].dt.to_period('M')
 
     pr = pr.dropna(subset=['TotalOil','TotalGas','TotalWater'])
-    
+
     # Sort and Deduplicate
     pr = pr.sort_values(['WellID','MonthYear','TotalOil','TotalGas','TotalWater'],
                         ascending=[True,True,False,False,False])
@@ -179,12 +180,12 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     keep_hdr = ['WellID','API10','WellName','WellNumber','State','County','PrimaryFormation',
                 'LateralLength','CompletionDate','FirstProdDate']
     keep_hdr = [c for c in keep_hdr if c in hd.columns]
-    
+
     # MERGE ON WellID instead of API10
     merged = pr.merge(hd[keep_hdr], on='WellID', how='inner', suffixes=('', '_hdr'))
-    
+
     # Clean up name/number collisions if any
-    if 'WellName_hdr' in merged.columns: 
+    if 'WellName_hdr' in merged.columns:
         merged['WellName'] = merged['WellName_hdr']
         merged = merged.drop(columns=['WellName_hdr'])
     if 'WellNumber_hdr' in merged.columns:
@@ -197,7 +198,7 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     if cfg.use_normalization:
         merged['LateralLength'] = pd.to_numeric(merged['LateralLength'], errors='coerce').replace(0, np.nan)
         s = cfg.normalization_length / merged['LateralLength']
-        
+
         for c in ['TotalOil','TotalGas','TotalWater']:
             merged[c] = pd.to_numeric(merged[c], errors='coerce').fillna(0)
 
@@ -214,154 +215,292 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
     return merged
 
 # ---------------- Models ----------------
-def arps(qi: float, b: float, di: float, t: np.ndarray) -> np.ndarray:
-    if b==0 or b==1: return qi/(1.0+di*t)
-    return qi/((1.0+b*di*t)**(1.0/b))
 
-def robust_loss(params: np.ndarray, t: np.ndarray, y: np.ndarray, delta: float=1.0) -> float:
-    qi,b,di = params
-    return huber(delta, arps(qi,b,di,t) - y).mean()
+# Terminal decline rate: ~5% effective annual / 12 months
+# Industry standard for Modified Arps (Robertson 1988 / SPE-78695)
+D_LIM_DEFAULT: float = 0.00417
+
+def arps(qi: float, b: float, di: float, t: np.ndarray) -> np.ndarray:
+    """Classic hyperbolic Arps decline (legacy, no terminal floor)."""
+    if b == 0 or b == 1:
+        return qi / (1.0 + di * t)
+    return qi / ((1.0 + b * di * t) ** (1.0 / b))
+
+
+def modified_arps(qi: float, b: float, di: float, d_lim: float, t: np.ndarray) -> np.ndarray:
+    """
+    Modified Arps with terminal exponential decline (Robertson 1988 / SPE-78695).
+
+    When the instantaneous nominal decline rate falls to d_lim the model
+    switches from hyperbolic to exponential, preventing the long tail that
+    causes EUR over-estimation in unconventional wells.
+
+    Switch time:  t_sw = (di/d_lim - 1) / (b * di)
+    Switch rate:  q_sw = qi / (1 + b*di*t_sw)^(1/b)
+    After switch: q(t) = q_sw * exp(-d_lim * (t - t_sw))
+    """
+    t = np.asarray(t, dtype=float)
+
+    # Degenerate case — preserve legacy harmonic behaviour
+    if b <= 0:
+        return qi / (1.0 + di * t)
+
+    # Initial decline already at or below terminal: pure exponential
+    if di <= d_lim:
+        return qi * np.exp(-d_lim * t)
+
+    # Switch time where D_nom(t_sw) = d_lim
+    t_sw = (di / d_lim - 1.0) / (b * di)
+    q_sw = qi / ((1.0 + b * di * t_sw) ** (1.0 / b))
+
+    q_hyp = qi / ((1.0 + b * di * t) ** (1.0 / b))
+    q_exp = q_sw * np.exp(-d_lim * (t - t_sw))
+    return np.where(t <= t_sw, q_hyp, q_exp)
+
+
+def robust_loss(params: np.ndarray, t: np.ndarray, y: np.ndarray,
+                d_lim: float = D_LIM_DEFAULT, delta: float = 1.0) -> float:
+    qi, b, di = params
+    return huber(delta, modified_arps(qi, b, di, d_lim, t) - y).mean()
+
 
 def _smooth(x, w=3):
     s = pd.Series(x, dtype=float)
     return s.rolling(window=w, center=True, min_periods=1).mean().values
 
+
 def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegressor]:
-    # Group by WellID for training
-    agg = (df.groupby('WellID')[['NormOil','NormGas','NormWater']]
-             .mean().reset_index())
-    agg = agg.dropna(subset=[target_col])
-    
-    X = agg[['NormOil','NormGas','NormWater']].values
+    """
+    Train RF model for qi warm-start prediction.
+
+    Uses per-well PEAK production as the target (a proper proxy for initial
+    rate qi) instead of the mean.  Estimator count reduced to 60 and n_jobs=-1
+    so training is faster and uses all available cores.
+    b and di initial estimates are derived analytically per-well inside
+    forecast_one_well, so stub models are returned for those keys.
+    """
+    agg_peak = (df.groupby('WellID')[['NormOil', 'NormGas', 'NormWater']]
+                  .max().reset_index())
+    agg_peak = agg_peak.dropna(subset=[target_col])
+
+    X = agg_peak[['NormOil', 'NormGas', 'NormWater']].values
     if len(X) == 0:
         dummy = RandomForestRegressor(n_estimators=1, random_state=42)
-        dummy.fit([[0,0,0]], [0])
+        dummy.fit([[0, 0, 0]], [0])
         return {'qi': dummy, 'b': dummy, 'di': dummy}
-        
-    qi_model = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, agg[target_col].values)
-    b_model  = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, np.full(len(agg), 1.0))
-    di_model = RandomForestRegressor(n_estimators=120, random_state=42).fit(X, np.full(len(agg), 0.05))
-    return {'qi': qi_model, 'b': b_model, 'di': di_model}
+
+    # qi: trained on peak production per well — best proxy for initial rate
+    qi_model = RandomForestRegressor(
+        n_estimators=60, random_state=42, n_jobs=-1
+    ).fit(X, agg_peak[target_col].values)
+
+    # b and di: single-node stubs; actual estimates computed analytically below
+    stub = RandomForestRegressor(n_estimators=1, random_state=42)
+    stub.fit([[0], [1]], [1.0, 1.0])
+    return {'qi': qi_model, 'b': stub, 'di': stub}
+
 
 def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: float,
-                      max_months: int, models: Dict[str, RandomForestRegressor]) -> Dict[str, object]:
+                      max_months: int, models: Dict[str, RandomForestRegressor],
+                      d_lim: float = D_LIM_DEFAULT) -> Dict[str, object]:
     commodity = commodity.lower()
-    col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[commodity]
+    col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[commodity]
 
     wd = wd.sort_values('MonthYear').copy()
     t_hist = np.arange(len(wd), dtype=float)
     y_hist = wd[col].values.astype(float)
     y_s = _smooth(y_hist, 3)
 
-    feats = np.array([[wd['NormOil'].mean(), wd['NormGas'].mean(), wd['NormWater'].mean()]], dtype=float)
-    
-    try:
-        qi_pred = float(models['qi'].predict(feats)[0])
-        b_pred = float(models['b'].predict(feats)[0])
-        di_pred = float(models['di'].predict(feats)[0])
-    except:
-        qi_pred, b_pred, di_pred = 100.0, 1.0, 0.05
-
-    peak_qi = float(np.nanmax(y_s)) if len(y_s)>0 else 1.0
+    peak_qi = float(np.nanmax(y_s)) if len(y_s) > 0 else 1.0
     peak_qi = min(peak_qi, 152000.0)
-    qi0 = min(peak_qi, max(qi_pred, 0.01))
-    b0  = b_pred
-    di0 = di_pred
 
-    bounds = [(0.01, peak_qi*1.5), (b_low, b_high), (1e-6, 1.0)]
+    # ---- Analytical initial parameter estimation ----
+    # qi: RF prediction anchored to peak of smoothed history
+    feats = np.array([[wd['NormOil'].mean(), wd['NormGas'].mean(), wd['NormWater'].mean()]],
+                     dtype=float)
     try:
-        res = minimize(robust_loss, x0=[qi0,b0,di0], args=(t_hist, y_s),
-                       bounds=bounds, method='L-BFGS-B')
-        qi,b,di = map(float, res.x)
-    except:
-        qi,b,di = qi0, b0, di0
+        qi0 = float(min(peak_qi, max(models['qi'].predict(feats)[0], 0.01)))
+    except Exception:
+        qi0 = peak_qi
 
-    fit_hist = arps(qi,b,di,t_hist)
-    f_m, f_v = [], []
-    m = len(t_hist)
-    while m < len(t_hist)+max_months:
-        q = float(arps(qi,b,di,np.array([m],float))[0])
-        if q < 1e-6: break
-        f_m.append(m); f_v.append(q); m += 1
+    # di: log-linear regression on the declining portion after the peak month
+    peak_idx = int(np.nanargmax(y_s)) if len(y_s) > 0 else 0
+    decline_portion = y_s[peak_idx:]
+    t_decline = np.arange(len(decline_portion), dtype=float)
+    if len(decline_portion) >= 3:
+        pos_mask = decline_portion > 0
+        if pos_mask.sum() >= 3:
+            slope, *_ = stats.linregress(t_decline[pos_mask],
+                                         np.log(decline_portion[pos_mask]))
+            di0 = float(min(max(-slope, d_lim), 1.0))
+        else:
+            di0 = 0.05
+    else:
+        di0 = 0.05
+
+    # b: start at midpoint of allowed bounds
+    b0 = 0.5 * (b_low + b_high)
+
+    # ---- Shut-in / zero-production filtering for optimization ----
+    # Months below 1% of peak (workovers, curtailments) distort the fit;
+    # exclude them from the objective but keep them in EUR history totals.
+    shutin_thresh = max(0.01 * peak_qi, 1.0)
+    active = y_s > shutin_thresh
+    t_fit = t_hist[active] if active.sum() >= 3 else t_hist
+    y_fit = y_s[active]   if active.sum() >= 3 else y_s
+
+    # ---- Bounded optimization (Modified Arps objective) ----
+    # Lower bound on di = d_lim ensures optimizer stays in the physical regime
+    # where the hyperbolic phase applies before the terminal switch.
+    bounds = [(0.01, peak_qi * 1.5), (b_low, b_high), (d_lim, 1.0)]
+    try:
+        res = minimize(robust_loss, x0=[qi0, b0, di0],
+                       args=(t_fit, y_fit, d_lim),
+                       bounds=bounds, method='L-BFGS-B')
+        qi, b, di = map(float, res.x)
+    except Exception:
+        qi, b, di = qi0, b0, di0
+
+    # ---- Fit history with Modified Arps ----
+    fit_hist = modified_arps(qi, b, di, d_lim, t_hist)
+
+    # ---- Vectorised forecast (replaces per-month Python loop) ----
+    t_fcst = np.arange(len(t_hist), len(t_hist) + max_months, dtype=float)
+    f_vals_all = modified_arps(qi, b, di, d_lim, t_fcst)
+    valid = f_vals_all >= 1e-6
+    f_m = t_fcst[valid].astype(int)
+    f_v = f_vals_all[valid]
 
     eur_hist = float(y_hist.sum())
     eur_fcst = float(np.sum(f_v))
-    return dict(qi=qi, b=b, di=di, t_hist=t_hist, hist=y_hist,
-                fit_hist=fit_hist, f_months=np.array(f_m,int), f_vals=np.array(f_v,float),
-                EUR_total=eur_hist+eur_fcst, EUR_fcst=eur_fcst)
+    return dict(qi=qi, b=b, di=di, d_lim=d_lim,
+                t_hist=t_hist, hist=y_hist,
+                fit_hist=fit_hist, f_months=f_m, f_vals=f_v,
+                EUR_total=eur_hist + eur_fcst, EUR_fcst=eur_fcst)
+
 
 @dataclass
 class ForecastConfig:
-    commodity: str      # 'oil'|'gas'|'water'
+    commodity: str          # 'oil' | 'gas' | 'water'
     b_low: float = 0.8
     b_high: float = 1.2
     max_months: int = 600
+    d_lim: float = D_LIM_DEFAULT      # terminal nominal decline rate (Modified Arps)
+    min_months_history: int = 3       # wells with fewer months are skipped
 
-def forecast_all(merged: pd.DataFrame, cfg: ForecastConfig) -> Tuple[pd.DataFrame, pd.DataFrame]:
+
+def _forecast_well_job(well_id, wd: pd.DataFrame, com: str,
+                       b_low: float, b_high: float, max_months: int,
+                       models: Dict, d_lim: float):
+    """Module-level worker for joblib parallel execution."""
+    try:
+        fc = forecast_one_well(wd, com, b_low, b_high, max_months, models, d_lim)
+        return well_id, wd, fc
+    except Exception:
+        return None
+
+
+def forecast_all(merged: pd.DataFrame,
+                 cfg: ForecastConfig) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+    """
+    Forecast all wells in parallel.
+
+    Returns
+    -------
+    oneline_df    : one row per well with DCA parameters and EUR
+    monthly_df    : monthly historical + forecast volumes per well
+    well_forecasts: dict mapping WellID -> raw fc dict (for per-well plots)
+    """
     com = cfg.commodity.lower()
-    col = {'oil':'NormOil','gas':'NormGas','water':'NormWater'}[com]
+    col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[com]
+
     models = _train_rf(merged, col)
 
-    oneline, monthly = [], []
-    
-    # Group by WellID
-    for well_id, wd in merged.groupby('WellID'):
-        if wd[col].max()<=0 or wd[col].sum()<=0:
-            continue
-        fc = forecast_one_well(wd, com, cfg.b_low, cfg.b_high, cfg.max_months, models)
-        hdr = wd.iloc[0]; 
-        well = hdr.get('WellName','N/A')
-        api10 = hdr.get('API10','N/A')
+    # Collect qualifying wells upfront (avoids repeated groupby inside threads)
+    well_data = [
+        (well_id, wd.copy())
+        for well_id, wd in merged.groupby('WellID')
+        if wd[col].max() > 0
+        and wd[col].sum() > 0
+        and len(wd) >= cfg.min_months_history
+    ]
 
-        qi_day = fc['qi']/30.4
-        q12 = float(arps(fc['qi'], fc['b'], fc['di'], np.array([12.0]))[0])
-        decline_yr = (1.0 - (q12/fc['qi']))*100.0 if fc['qi']>0 else 0.0
+    # Parallel execution — threading backend is safe with Streamlit and
+    # benefits from scipy's GIL release during L-BFGS-B optimisation.
+    raw_results = Parallel(n_jobs=-1, prefer='threads')(
+        delayed(_forecast_well_job)(
+            well_id, wd, com,
+            cfg.b_low, cfg.b_high, cfg.max_months,
+            models, cfg.d_lim
+        )
+        for well_id, wd in well_data
+    )
+
+    oneline: list = []
+    monthly: list = []
+    well_forecasts: Dict[str, dict] = {}
+
+    for result in raw_results:
+        if result is None:
+            continue
+        well_id, wd, fc = result
+        well_forecasts[str(well_id)] = fc
+
+        hdr   = wd.iloc[0]
+        well  = hdr.get('WellName', 'N/A')
+        api10 = hdr.get('API10', 'N/A')
+
+        qi_day     = fc['qi'] / 30.4
+        q12        = float(modified_arps(fc['qi'], fc['b'], fc['di'], fc['d_lim'],
+                                         np.array([12.0]))[0])
+        decline_yr = (1.0 - (q12 / fc['qi'])) * 100.0 if fc['qi'] > 0 else 0.0
 
         row = {
-            'WellID': str(well_id),
-            'API10': str(api10), 
-            'WellName': well,
-            'WellNumber': str(hdr.get('WellNumber','')),
-            'State': hdr.get('State'), 
-            'County': hdr.get('County'),
-            'PrimaryFormation': hdr.get('PrimaryFormation'),
-            'LateralLength': hdr.get('LateralLength'),
-            'CompletionDate': hdr.get('CompletionDate'),
-            'FirstProdDate': hdr.get('FirstProdDate'),
-            'qi (per day)': round(qi_day,0),
-            'b': round(fc['b'],3),
-            'di (per month)': round(fc['di'],4),
-            'First-Year Decline (%)': round(decline_yr,1),
+            'WellID':             str(well_id),
+            'API10':              str(api10),
+            'WellName':           well,
+            'WellNumber':         str(hdr.get('WellNumber', '')),
+            'State':              hdr.get('State'),
+            'County':             hdr.get('County'),
+            'PrimaryFormation':   hdr.get('PrimaryFormation'),
+            'LateralLength':      hdr.get('LateralLength'),
+            'CompletionDate':     hdr.get('CompletionDate'),
+            'FirstProdDate':      hdr.get('FirstProdDate'),
+            'qi (per day)':       round(qi_day, 0),
+            'b':                  round(fc['b'], 3),
+            'di (per month)':     round(fc['di'], 4),
+            'First-Year Decline (%)': round(decline_yr, 1),
         }
-        if com=='oil':
-            row.update({'EUR (Mbbl)': round(fc['EUR_total']/1_000.0,2),
-                        'Remaining (Mbbl)': round(fc['EUR_fcst']/1_000.0,2)})
-        elif com=='gas':
-            row.update({'EUR (MMcf)': round(fc['EUR_total']/1_000_000.0,2),
-                        'Remaining (MMcf)': round(fc['EUR_fcst']/1_000_000.0,2)})
+        if com == 'oil':
+            row.update({'EUR (Mbbl)':        round(fc['EUR_total'] / 1_000.0, 2),
+                        'Remaining (Mbbl)':  round(fc['EUR_fcst']  / 1_000.0, 2)})
+        elif com == 'gas':
+            row.update({'EUR (MMcf)':        round(fc['EUR_total'] / 1_000_000.0, 2),
+                        'Remaining (MMcf)':  round(fc['EUR_fcst']  / 1_000_000.0, 2)})
         else:
-            row.update({'EUR (Mbbl water)': round(fc['EUR_total']/1_000.0,2),
-                        'Remaining (Mbbl water)': round(fc['EUR_fcst']/1_000.0,2)})
+            row.update({'EUR (Mbbl water)':       round(fc['EUR_total'] / 1_000.0, 2),
+                        'Remaining (Mbbl water)': round(fc['EUR_fcst']  / 1_000.0, 2)})
         oneline.append(row)
 
         hist_dates = wd.sort_values('MonthYear')['MonthYear'].dt.to_timestamp(how='start')
-        hist_vals  = wd[col].values.astype(float)
-        start = hist_dates.iloc[-1] + pd.offsets.MonthBegin(1) if len(hist_dates)>0 \
-                else merged['MonthYear'].min().to_timestamp(how='start')
+        hist_vals  = wd.sort_values('MonthYear')[col].values.astype(float)
+        start = (hist_dates.iloc[-1] + pd.offsets.MonthBegin(1) if len(hist_dates) > 0
+                 else merged['MonthYear'].min().to_timestamp(how='start'))
         f_dates = pd.date_range(start=start, periods=len(fc['f_vals']), freq='MS')
 
-        for d,v in zip(hist_dates, hist_vals):
-            monthly.append({'WellID':str(well_id), 'API10':str(api10),
-                            'WellName':well, 'Date':d,
-                            f'Monthly_{com}_volume':float(v),'Segment':'Historical'})
-        for d,v in zip(f_dates, fc['f_vals']):
-            monthly.append({'WellID':str(well_id), 'API10':str(api10),
-                            'WellName':well, 'Date':d,
-                            f'Monthly_{com}_volume':float(v),'Segment':'Forecast'})
+        for d, v in zip(hist_dates, hist_vals):
+            monthly.append({'WellID': str(well_id), 'API10': str(api10),
+                            'WellName': well, 'Date': d,
+                            f'Monthly_{com}_volume': float(v), 'Segment': 'Historical'})
+        for d, v in zip(f_dates, fc['f_vals']):
+            monthly.append({'WellID': str(well_id), 'API10': str(api10),
+                            'WellName': well, 'Date': d,
+                            f'Monthly_{com}_volume': float(v), 'Segment': 'Forecast'})
 
     oneline_df = pd.DataFrame(oneline)
-    monthly_df = pd.DataFrame(monthly).sort_values(['WellID','Date','Segment'])
-    return oneline_df, monthly_df
+    monthly_df = pd.DataFrame(monthly).sort_values(['WellID', 'Date', 'Segment'])
+    return oneline_df, monthly_df, well_forecasts
+
 
 def compute_eur_stats(eur_array: List[float]) -> Dict[str, float]:
     eur = np.array(eur_array, dtype=float)
@@ -468,7 +607,7 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     ax.set_xlabel("Month")
     ax.set_ylabel(f"Monthly {commodity} {unit}")
     ax.set_yscale('log')
-    ax.set_ylim(bottom=1)  
+    ax.set_ylim(bottom=1)
     ax.grid(True, linestyle="--", alpha=0.4, which='both')
     ax.legend()
     fig.tight_layout()

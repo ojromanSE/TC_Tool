@@ -214,9 +214,10 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             commodity=fluid_name.lower(),
             b_low=float(b_low), b_high=float(b_high), max_months=600
         )
-        oneline, monthly = forecast_all(merged, cfg)
+        oneline, monthly, well_fcs = forecast_all(merged, cfg)
         st.session_state[f"{fluid_name}_oneline"] = oneline
         st.session_state[f"{fluid_name}_monthly"] = monthly
+        st.session_state[f"{fluid_name}_well_fcs"] = well_fcs   # cache per-well forecasts
         st.success(f"{fluid_name} forecast completed.")
 
     on_key = f"{fluid_name}_oneline"
@@ -257,8 +258,13 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         pick_id = st.selectbox(f"Pick Well ({fluid_name})", opts['WellID'], key=f"{fluid_name}_pick")
         
         wd = merged[merged['WellID'] == pick_id]
-        models = _train_rf(merged, norm_col_for_models)
-        fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
+        fcs_key = f"{fluid_name}_well_fcs"
+        if fcs_key in st.session_state and pick_id in st.session_state[fcs_key]:
+            # Reuse cached forecast — no RF re-training or re-optimisation
+            fc = st.session_state[fcs_key][pick_id]
+        else:
+            models = _train_rf(merged, norm_col_for_models)
+            fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
         fig = plot_one_well(wd, fc, fluid_name.lower())
         st.pyplot(fig)
 
