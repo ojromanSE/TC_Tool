@@ -197,6 +197,13 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
 
     if cfg.use_normalization:
         merged['LateralLength'] = pd.to_numeric(merged['LateralLength'], errors='coerce').replace(0, np.nan)
+
+        # Impute missing laterals with the dataset median so wells without a
+        # lateral length are not silently dropped from the merged dataset.
+        lat_median = merged['LateralLength'].median()
+        fallback = lat_median if pd.notna(lat_median) else float(cfg.normalization_length)
+        merged['LateralLength'] = merged['LateralLength'].fillna(fallback)
+
         s = cfg.normalization_length / merged['LateralLength']
 
         for c in ['TotalOil','TotalGas','TotalWater']:
@@ -386,7 +393,7 @@ class ForecastConfig:
     b_high: float = 1.2
     max_months: int = 600
     d_lim: float = D_LIM_DEFAULT      # terminal nominal decline rate (Modified Arps)
-    min_months_history: int = 3       # wells with fewer months are skipped
+    min_months_history: int = 1       # wells with fewer months are skipped
 
 
 def _forecast_well_job(well_id, wd: pd.DataFrame, com: str,

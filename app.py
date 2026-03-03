@@ -32,8 +32,18 @@ with cols[1]:
 # ================= Sidebar =================
 with st.sidebar:
     st.header("Global Parameters")
-    norm_len = st.number_input("Normalization Length (ft)", 1000, 30000, 10000, step=500)
-    use_norm = st.checkbox("Apply Normalization", value=True)
+    vertical_wells = st.checkbox(
+        "Vertical Well Dataset",
+        value=False,
+        help="Disables lateral length normalization. No lateral length required — all wells are retained."
+    )
+    if vertical_wells:
+        use_norm = False
+        norm_len = 10_000   # unused placeholder
+        st.info("Normalization disabled for vertical wells.")
+    else:
+        norm_len = st.number_input("Normalization Length (ft)", 1000, 30000, 10000, step=500)
+        use_norm = st.checkbox("Apply Normalization", value=True)
     st.markdown("---")
     b_low  = st.number_input("b-factor Low", value=0.8, step=0.1, format="%.3f")
     b_high = st.number_input("b-factor High", value=1.2, step=0.1, format="%.3f")
