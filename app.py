@@ -193,7 +193,8 @@ def _fit_arps_to_trace(t: np.ndarray, y: np.ndarray, d_lim: float = D_LIM_DEFAUL
     return tuple(res.x) if res.success else (qi0, b0, di0)
 
 
-def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: int = 5):
+def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: int = 5,
+                                oneline: pd.DataFrame = None):
     vol_col = f"Monthly_{com}_volume"
     if monthly_df.empty or vol_col not in monthly_df.columns:
         return pd.DataFrame(columns=['t','P10','P50','P90']), []
@@ -208,7 +209,37 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
         y = np.clip(g[vol_col].to_numpy(), 1e-6, None)
         lines.append((t, y))
 
-    # Empirical percentiles — only where enough wells contribute
+    # Build smooth type curves from per-well Arps parameters sorted by EUR.
+    # Grouping by EUR percentile and taking median qi/b/di per group produces
+    # pure Modified Arps curves with no drops or kinks.
+    eur_col = {'oil': 'EUR (Mbbl)', 'gas': 'EUR (MMcf)', 'water': 'EUR (Mbbl water)'}[com.lower()]
+    if (oneline is not None and not oneline.empty
+            and eur_col in oneline.columns
+            and all(c in oneline.columns for c in ['qi (per day)', 'b', 'di (per month)'])):
+        df = oneline.copy()
+        df['_eur'] = pd.to_numeric(df[eur_col], errors='coerce')
+        df['_qi']  = pd.to_numeric(df['qi (per day)'], errors='coerce') * 30.4  # monthly
+        df['_b']   = pd.to_numeric(df['b'], errors='coerce')
+        df['_di']  = pd.to_numeric(df['di (per month)'], errors='coerce')
+        df = df.dropna(subset=['_eur', '_qi', '_b', '_di'])
+        df = df.sort_values('_eur', ascending=False).reset_index(drop=True)
+        n = len(df)
+        if n >= min_wells:
+            t_out = np.arange(1, 481, dtype=float)
+            smooth = {'t': t_out}
+            groups = {
+                'P10': df.iloc[:max(1, int(n * 0.1))],
+                'P50': df.iloc[max(0, int(n * 0.45)):max(1, int(n * 0.55))],
+                'P90': df.iloc[max(0, int(n * 0.9)):],
+            }
+            for pct, grp in groups.items():
+                qi = float(grp['_qi'].median())
+                b  = float(grp['_b'].median())
+                di = float(grp['_di'].median())
+                smooth[pct] = modified_arps(qi, b, di, D_LIM_DEFAULT, t_out)
+            return pd.DataFrame(smooth), lines
+
+    # Fallback: empirical percentiles with Arps fitting (used when oneline unavailable)
     all_df = monthly_df[['WellID','Date',vol_col]].dropna().sort_values(['WellID','Date']).copy()
     all_df['t'] = all_df.groupby('WellID').cumcount() + 1
     counts = all_df.groupby('t')[vol_col].count()
@@ -221,7 +252,6 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
     emp = emp.reset_index()
     t_emp = emp['t'].to_numpy(dtype=float)
 
-    # Fit Modified Arps to each percentile trace for smooth, continuous curves
     t_out = np.arange(1, int(t_emp.max()) + 1, dtype=float)
     smooth = {'t': t_out}
     for pct in ['P10', 'P50', 'P90']:
@@ -329,7 +359,10 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
     st.dataframe(format_df_2dec(eur_summary_table(fluid, stats, "Mbbl" if fluid!="Gas" else "MMcf", int(norm_len))))
     
     if mo_key in st.session_state:
-        curves, lines = build_type_curves_and_lines(st.session_state[mo_key], fluid.lower())
+        curves, lines = build_type_curves_and_lines(
+            st.session_state[mo_key], fluid.lower(),
+            oneline=st.session_state.get(on_key)
+        )
         st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
 
 with tw_tabs[0]: _render_tw("Oil", "Oil_oneline", "Oil_monthly", "EUR (Mbbl)")
@@ -508,7 +541,10 @@ def generate_comprehensive_pdf():
         
         # Type curves
         if monthly_key in st.session_state:
-            curves, lines = build_type_curves_and_lines(st.session_state[monthly_key], fluid_name.lower())
+            curves, lines = build_type_curves_and_lines(
+                st.session_state[monthly_key], fluid_name.lower(),
+                oneline=st.session_state.get(oneline_key)
+            )
             if not curves.empty:
                 story.append(Paragraph("Type Curve", styles['Heading2']))
                 story.append(Spacer(1, 6))
