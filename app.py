@@ -225,7 +225,7 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
         df = df.sort_values('_eur', ascending=False).reset_index(drop=True)
         n = len(df)
         if n >= min_wells:
-            t_out = np.arange(1, 481, dtype=float)
+            t_out = np.arange(1, 601, dtype=float)
             smooth = {'t': t_out}
             groups = {
                 'P10': df.iloc[:max(1, int(n * 0.1))],

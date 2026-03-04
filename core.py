@@ -583,35 +583,29 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     eps = 1e-6
 
     wd = wd.sort_values('MonthYear').copy()
-    hist_dates = wd['MonthYear'].dt.to_timestamp(how='start')
-    hist_vals  = np.clip(wd[col].astype(float).values, eps, None)
+    n_hist = len(wd)
+    hist_t  = np.arange(1, n_hist + 1, dtype=float)
+    hist_vals = np.clip(wd[col].astype(float).values, eps, None)
 
     fit_hist = np.clip(fc['fit_hist'], eps, None)
-    fit_dates = hist_dates
-
-    if len(hist_dates) > 0:
-        start = hist_dates.iloc[-1] + pd.offsets.MonthBegin(1)
-    else:
-        start = pd.Timestamp.today().normalize().replace(day=1)
-    f_dates = pd.date_range(start=start, periods=len(fc['f_vals']), freq='MS')
-    f_vals  = np.clip(fc['f_vals'], eps, None)
+    f_t   = np.arange(n_hist + 1, n_hist + 1 + len(fc['f_vals']), dtype=float)
+    f_vals = np.clip(fc['f_vals'], eps, None)
 
     unit = {"oil":"(norm bbl/mo)","gas":"(norm Mcf/mo)","water":"(norm bbl/mo)"}[com]
     well = wd.iloc[0].get('WellName','N/A')
     api  = str(wd.iloc[0].get('API10',''))
-    # Use WellID for title if API is empty
     if not api or api == 'nan':
         api = wd.iloc[0].get('WellID','N/A')
 
     fig, ax = plt.subplots(figsize=(10,6))
-    if len(hist_dates) > 0:
-        ax.scatter(hist_dates, hist_vals, label="Historical", s=22, color=color)
-        ax.plot(fit_dates, fit_hist, label="Fit (history)", linewidth=2, color=color)
-    if len(f_dates) > 0:
-        ax.plot(f_dates, f_vals, label="Forecast", linestyle="--", linewidth=2, color=color)
+    if n_hist > 0:
+        ax.scatter(hist_t, hist_vals, label="Historical", s=22, color=color)
+        ax.plot(hist_t, fit_hist, label="Fit (history)", linewidth=2, color=color)
+    if len(f_t) > 0:
+        ax.plot(f_t, f_vals, label="Forecast", linestyle="--", linewidth=2, color=color)
 
     ax.set_title(f"{well} | ID: {api} | {commodity.capitalize()}")
-    ax.set_xlabel("Month")
+    ax.set_xlabel("Month of Production")
     ax.set_ylabel(f"Monthly {commodity} {unit}")
     ax.set_yscale('log')
     ax.set_ylim(bottom=1)
