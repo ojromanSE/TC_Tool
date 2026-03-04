@@ -14,7 +14,8 @@ from core import (
     load_header, load_production, fill_lateral_by_geo,
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
     plot_one_well, forecast_one_well, _train_rf,
-    compute_eur_stats, probit_plot, eur_summary_table
+    compute_eur_stats, probit_plot, eur_summary_table,
+    modified_arps, D_LIM_DEFAULT
 )
 
 st.set_page_config(page_title="SE Tool", layout="wide")
@@ -178,12 +179,26 @@ def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
             scatter_png = _save_fig(fig_s)
     return hist_png, box_png, scatter_png, stats_df
 
-def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
+def _fit_arps_to_trace(t: np.ndarray, y: np.ndarray, d_lim: float = D_LIM_DEFAULT):
+    """Fit a Modified Arps curve to an empirical trace; returns (qi, b, di)."""
+    from scipy.optimize import minimize
+    y = np.clip(y, 1e-6, None)
+    qi0, b0, di0 = float(y[0]), 1.0, 0.10
+    def loss(p):
+        qi, b, di = p
+        pred = modified_arps(qi, b, di, d_lim, t)
+        return np.mean((np.log(pred + 1e-6) - np.log(y + 1e-6)) ** 2)
+    bounds = [(y.max() * 0.1, y.max() * 3.0), (0.01, 2.0), (d_lim, 1.5)]
+    res = minimize(loss, [qi0, b0, di0], method='L-BFGS-B', bounds=bounds)
+    return tuple(res.x) if res.success else (qi0, b0, di0)
+
+
+def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: int = 5):
     vol_col = f"Monthly_{com}_volume"
     if monthly_df.empty or vol_col not in monthly_df.columns:
         return pd.DataFrame(columns=['t','P10','P50','P90']), []
-    
-    # Use WellID for grouping
+
+    # Historical lines for background well traces
     hist = monthly_df[monthly_df['Segment'] == 'Historical'][['WellID','Date',vol_col]].dropna().copy()
     hist = hist.sort_values(['WellID','Date'])
     hist['t'] = hist.groupby('WellID').cumcount() + 1
@@ -192,13 +207,28 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str):
         t = g['t'].to_numpy()
         y = np.clip(g[vol_col].to_numpy(), 1e-6, None)
         lines.append((t, y))
-        
+
+    # Empirical percentiles — only where enough wells contribute
     all_df = monthly_df[['WellID','Date',vol_col]].dropna().sort_values(['WellID','Date']).copy()
     all_df['t'] = all_df.groupby('WellID').cumcount() + 1
-    q = all_df.groupby('t')[vol_col].quantile([0.90,0.50,0.10]).unstack(level=1)
-    q.columns = ['P10','P50','P90']
-    q = q.reset_index()
-    return q, lines
+    counts = all_df.groupby('t')[vol_col].count()
+    valid_t = counts[counts >= min_wells].index
+    if valid_t.empty:
+        return pd.DataFrame(columns=['t','P10','P50','P90']), lines
+
+    emp = all_df[all_df['t'].isin(valid_t)].groupby('t')[vol_col].quantile([0.90, 0.50, 0.10]).unstack(level=1)
+    emp.columns = ['P10', 'P50', 'P90']
+    emp = emp.reset_index()
+    t_emp = emp['t'].to_numpy(dtype=float)
+
+    # Fit Modified Arps to each percentile trace for smooth, continuous curves
+    t_out = np.arange(1, int(t_emp.max()) + 1, dtype=float)
+    smooth = {'t': t_out}
+    for pct in ['P10', 'P50', 'P90']:
+        qi, b, di = _fit_arps_to_trace(t_emp, emp[pct].to_numpy())
+        smooth[pct] = modified_arps(qi, b, di, D_LIM_DEFAULT, t_out)
+
+    return pd.DataFrame(smooth), lines
 
 def plot_type_curves(curves, lines, fluid):
     color = _phase_color(fluid)
