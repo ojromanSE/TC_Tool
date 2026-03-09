@@ -480,15 +480,31 @@ def generate_comprehensive_pdf():
     def add_fluid_section(fluid_name, oneline_key, monthly_key, eur_col):
         if oneline_key not in st.session_state:
             return
-        
+
         story.append(Paragraph(f"{fluid_name} Analysis", heading_style))
         story.append(Spacer(1, 12))
-        
-        oneline = st.session_state[oneline_key]
-        
+
+        oneline_full = st.session_state[oneline_key]
+
+        # Apply same well selection as shown in the TC section
+        sel_key = f"{fluid_name}_tc_selection"
+        if sel_key in st.session_state and len(st.session_state[sel_key]) == len(oneline_full):
+            mask = pd.array(st.session_state[sel_key], dtype=bool)
+            oneline = oneline_full[mask].reset_index(drop=True)
+        else:
+            oneline = oneline_full
+
+        # Filter monthly to the same selected wells
+        monthly_full = st.session_state.get(monthly_key)
+        if monthly_full is not None and len(oneline) < len(oneline_full):
+            sel_ids = set(oneline['WellID'].astype(str))
+            monthly_sel = monthly_full[monthly_full['WellID'].astype(str).isin(sel_ids)]
+        else:
+            monthly_sel = monthly_full
+
         # Well count
         well_count = len(oneline)
-        story.append(Paragraph(f"Total Wells Analyzed: {well_count}", styles['Normal']))
+        story.append(Paragraph(f"Wells in Type Curve: {well_count} / {len(oneline_full)}", styles['Normal']))
         story.append(Spacer(1, 12))
         
         # EUR Statistics
@@ -597,11 +613,10 @@ def generate_comprehensive_pdf():
             story.append(Image(scatter_png, width=5.5*inch, height=2.6*inch))
             story.append(Spacer(1, 10))
         
-        # Type curves
-        if monthly_key in st.session_state:
+        # Type curves (use filtered monthly + filtered oneline to match the UI)
+        if monthly_sel is not None:
             curves, lines = build_type_curves_and_lines(
-                st.session_state[monthly_key], fluid_name.lower(),
-                oneline=st.session_state.get(oneline_key)
+                monthly_sel, fluid_name.lower(), oneline=oneline
             )
             if not curves.empty:
                 story.append(Paragraph("Type Curve", styles['Heading2']))
