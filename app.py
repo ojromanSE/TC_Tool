@@ -379,25 +379,39 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
     for c in show_cols:
         col_cfg[c] = st.column_config.TextColumn(c, disabled=True)
 
-    st.caption(f"**Analog Wells** — check/uncheck to include or exclude from the Type Curve ({len(oneline_full)} wells total)")
-    edited = st.data_editor(
-        editor_df,
-        column_config=col_cfg,
-        use_container_width=True,
-        hide_index=True,
-        key=f"{fluid}_analog_editor",
-    )
+    # ── Two-column layout: table left, plot right ──
+    left_col, right_col = st.columns([1, 1])
 
-    # Persist selection so the TC rebuilds instantly
+    with left_col:
+        st.caption(f"**Analog Wells** — check/uncheck to include or exclude from the Type Curve ({len(oneline_full)} wells total)")
+        edited = st.data_editor(
+            editor_df,
+            column_config=col_cfg,
+            use_container_width=True,
+            hide_index=True,
+            key=f"{fluid}_analog_editor",
+        )
+
+    # Persist selection
     st.session_state[sel_key] = edited["Select"].tolist()
     selected_mask = edited["Select"].values.astype(bool)
     oneline_filtered = oneline_full[selected_mask].reset_index(drop=True)
-
     n_sel = int(selected_mask.sum())
     n_tot = len(oneline_full)
-    st.caption(f"{n_sel} / {n_tot} wells selected")
 
-    # --- EUR summary from filtered set ---
+    with right_col:
+        if mo_key in st.session_state and n_sel > 0:
+            sel_ids = set(oneline_filtered['WellID'].astype(str))
+            monthly_filtered = st.session_state[mo_key][
+                st.session_state[mo_key]['WellID'].astype(str).isin(sel_ids)
+            ]
+            curves, lines = build_type_curves_and_lines(
+                monthly_filtered, fluid.lower(), oneline=oneline_filtered
+            )
+            st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
+
+    # ── EUR summary below ──
+    st.caption(f"**{n_sel} / {n_tot} wells selected**")
     if n_sel > 0:
         eurs = pd.to_numeric(oneline_filtered[eur_col], errors='coerce').dropna().tolist()
         if fluid == "Gas":
@@ -409,18 +423,6 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
         )
     else:
         st.warning("No wells selected — select at least one well to compute statistics.")
-
-    # --- Type curve plot from filtered set ---
-    if mo_key in st.session_state and n_sel > 0:
-        # Filter monthly to selected WellIDs only
-        sel_ids = set(oneline_filtered['WellID'].astype(str))
-        monthly_filtered = st.session_state[mo_key][
-            st.session_state[mo_key]['WellID'].astype(str).isin(sel_ids)
-        ]
-        curves, lines = build_type_curves_and_lines(
-            monthly_filtered, fluid.lower(), oneline=oneline_filtered
-        )
-        st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
 
 with tw_tabs[0]: _render_tw("Oil", "Oil_oneline", "Oil_monthly", "EUR (Mbbl)")
 with tw_tabs[1]: _render_tw("Gas", "Gas_oneline", "Gas_monthly", "EUR (MMcf)")
