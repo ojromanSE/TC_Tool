@@ -366,13 +366,15 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
         'WellName', 'PrimaryFormation', 'LateralLength', eur_col
     ] if c in oneline_full.columns]
 
-    # Initialise selection state (all selected) when forecast is fresh or missing
-    if sel_key not in st.session_state or len(st.session_state[sel_key]) != len(oneline_full):
-        st.session_state[sel_key] = [True] * len(oneline_full)
+    # Initialise selection state: set of all WellIDs (all selected)
+    all_ids = set(oneline_full['WellID'].astype(str).tolist())
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = all_ids
 
     # Build editable frame: "Select" checkbox + display columns
+    saved_ids = st.session_state[sel_key]
     editor_df = oneline_full[show_cols].copy().reset_index(drop=True)
-    editor_df.insert(0, "Select", st.session_state[sel_key])
+    editor_df.insert(0, "Select", oneline_full['WellID'].astype(str).isin(saved_ids).tolist())
 
     col_cfg = {"Select": st.column_config.CheckboxColumn("Select", default=True)}
     for c in show_cols:
@@ -391,10 +393,10 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
             key=f"{fluid}_analog_editor",
         )
 
-    # Persist selection
-    st.session_state[sel_key] = edited["Select"].tolist()
+    # Persist selection as a set of WellIDs (robust across reruns/index shifts)
     selected_mask = edited["Select"].values.astype(bool)
     oneline_filtered = oneline_full[selected_mask].reset_index(drop=True)
+    st.session_state[sel_key] = set(oneline_filtered['WellID'].astype(str).tolist())
     n_sel = int(selected_mask.sum())
     n_tot = len(oneline_full)
 
@@ -486,21 +488,21 @@ def generate_comprehensive_pdf():
 
         oneline_full = st.session_state[oneline_key]
 
-        # Apply same well selection as shown in the TC section
+        # Apply same well selection as shown in the TC section (stored as a set of WellIDs)
         sel_key = f"{fluid_name}_tc_selection"
-        if sel_key in st.session_state and len(st.session_state[sel_key]) == len(oneline_full):
-            mask = np.array(st.session_state[sel_key], dtype=bool)
-            oneline = oneline_full.loc[mask].reset_index(drop=True)
+        if sel_key in st.session_state and isinstance(st.session_state[sel_key], set):
+            sel_ids = st.session_state[sel_key]
+            oneline = oneline_full[oneline_full['WellID'].astype(str).isin(sel_ids)].reset_index(drop=True)
         else:
             oneline = oneline_full
+            sel_ids = set(oneline_full['WellID'].astype(str).tolist())
 
         # Filter monthly to the same selected wells
         monthly_full = st.session_state.get(monthly_key)
-        if monthly_full is not None and len(oneline) < len(oneline_full):
-            sel_ids = set(oneline['WellID'].astype(str))
+        if monthly_full is not None:
             monthly_sel = monthly_full[monthly_full['WellID'].astype(str).isin(sel_ids)]
         else:
-            monthly_sel = monthly_full
+            monthly_sel = None
 
         # Well count
         well_count = len(oneline)
