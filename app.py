@@ -363,8 +363,7 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
 
     # Build display columns available in the oneline
     show_cols = [c for c in [
-        'WellName', 'WellID', 'County', 'PrimaryFormation', 'LateralLength',
-        eur_col, 'qi (per day)', 'b', 'di (per month)', 'First-Year Decline (%)'
+        'WellName', 'PrimaryFormation', 'LateralLength', eur_col
     ] if c in oneline_full.columns]
 
     # Initialise selection state (all selected) when forecast is fresh or missing
