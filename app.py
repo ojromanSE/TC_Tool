@@ -489,8 +489,8 @@ def generate_comprehensive_pdf():
         # Apply same well selection as shown in the TC section
         sel_key = f"{fluid_name}_tc_selection"
         if sel_key in st.session_state and len(st.session_state[sel_key]) == len(oneline_full):
-            mask = pd.array(st.session_state[sel_key], dtype=bool)
-            oneline = oneline_full[mask].reset_index(drop=True)
+            mask = np.array(st.session_state[sel_key], dtype=bool)
+            oneline = oneline_full.loc[mask].reset_index(drop=True)
         else:
             oneline = oneline_full
 
