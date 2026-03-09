@@ -288,6 +288,8 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         st.session_state[f"{fluid_name}_oneline"] = oneline
         st.session_state[f"{fluid_name}_monthly"] = monthly
         st.session_state[f"{fluid_name}_well_fcs"] = well_fcs   # cache per-well forecasts
+        # Reset analog selection so new forecast starts with all wells selected
+        st.session_state.pop(f"{fluid_name}_tc_selection", None)
         st.success(f"{fluid_name} forecast completed.")
 
     on_key = f"{fluid_name}_oneline"
@@ -353,15 +355,70 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
     if on_key not in st.session_state:
         st.info(f"Run {fluid} first.")
         return
-    eurs = st.session_state[on_key][eur_col].astype(float).tolist()
-    if fluid=="Gas": eurs = [x*1000 for x in eurs if pd.notna(x)]
-    stats = compute_eur_stats(eurs)
-    st.dataframe(format_df_2dec(eur_summary_table(fluid, stats, "Mbbl" if fluid!="Gas" else "MMcf", int(norm_len))))
-    
-    if mo_key in st.session_state:
+
+    oneline_full = st.session_state[on_key]
+
+    # --- Analog selection table ---
+    sel_key = f"{fluid}_tc_selection"
+
+    # Build display columns available in the oneline
+    show_cols = [c for c in [
+        'WellName', 'WellID', 'County', 'PrimaryFormation', 'LateralLength',
+        eur_col, 'qi (per day)', 'b', 'di (per month)', 'First-Year Decline (%)'
+    ] if c in oneline_full.columns]
+
+    # Initialise selection state (all selected) when forecast is fresh or missing
+    if sel_key not in st.session_state or len(st.session_state[sel_key]) != len(oneline_full):
+        st.session_state[sel_key] = [True] * len(oneline_full)
+
+    # Build editable frame: "Select" checkbox + display columns
+    editor_df = oneline_full[show_cols].copy().reset_index(drop=True)
+    editor_df.insert(0, "Select", st.session_state[sel_key])
+
+    col_cfg = {"Select": st.column_config.CheckboxColumn("Select", default=True)}
+    for c in show_cols:
+        col_cfg[c] = st.column_config.TextColumn(c, disabled=True)
+
+    st.caption(f"**Analog Wells** — check/uncheck to include or exclude from the Type Curve ({len(oneline_full)} wells total)")
+    edited = st.data_editor(
+        editor_df,
+        column_config=col_cfg,
+        use_container_width=True,
+        hide_index=True,
+        key=f"{fluid}_analog_editor",
+    )
+
+    # Persist selection so the TC rebuilds instantly
+    st.session_state[sel_key] = edited["Select"].tolist()
+    selected_mask = edited["Select"].values.astype(bool)
+    oneline_filtered = oneline_full[selected_mask].reset_index(drop=True)
+
+    n_sel = int(selected_mask.sum())
+    n_tot = len(oneline_full)
+    st.caption(f"{n_sel} / {n_tot} wells selected")
+
+    # --- EUR summary from filtered set ---
+    if n_sel > 0:
+        eurs = pd.to_numeric(oneline_filtered[eur_col], errors='coerce').dropna().tolist()
+        if fluid == "Gas":
+            eurs = [x * 1000 for x in eurs]
+        stats = compute_eur_stats(eurs)
+        st.dataframe(
+            format_df_2dec(eur_summary_table(fluid, stats, "Mbbl" if fluid != "Gas" else "MMcf", int(norm_len))),
+            use_container_width=True,
+        )
+    else:
+        st.warning("No wells selected — select at least one well to compute statistics.")
+
+    # --- Type curve plot from filtered set ---
+    if mo_key in st.session_state and n_sel > 0:
+        # Filter monthly to selected WellIDs only
+        sel_ids = set(oneline_filtered['WellID'].astype(str))
+        monthly_filtered = st.session_state[mo_key][
+            st.session_state[mo_key]['WellID'].astype(str).isin(sel_ids)
+        ]
         curves, lines = build_type_curves_and_lines(
-            st.session_state[mo_key], fluid.lower(),
-            oneline=st.session_state.get(on_key)
+            monthly_filtered, fluid.lower(), oneline=oneline_filtered
         )
         st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
 
