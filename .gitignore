@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 python_embed/
+dist/
+build/
+*.spec
