@@ -17,6 +17,14 @@ IF EXIST "%EMBED_DIR%\python.exe" (
     exit /b 0
 )
 
+REM Check that project files are present
+IF NOT EXIST "%~dp0requirements.txt" (
+    echo ERROR: requirements.txt not found.
+    echo setup.bat must be inside the TC_Tool project folder, not run standalone.
+    pause
+    exit /b 1
+)
+
 REM Check for internet and curl
 curl --version >nul 2>&1
 IF ERRORLEVEL 1 (
