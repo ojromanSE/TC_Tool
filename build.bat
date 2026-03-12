@@ -36,6 +36,8 @@ echo Building SE_Tool.exe...
     --add-data "static;static" ^
     --collect-all streamlit ^
     --collect-all altair ^
+    --collect-all sklearn ^
+    --collect-all scipy ^
     --hidden-import streamlit.web.cli ^
     --hidden-import streamlit.runtime.scriptrunner ^
     "%~dp0launcher.py"
