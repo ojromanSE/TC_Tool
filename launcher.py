@@ -33,5 +33,6 @@ if __name__ == "__main__":
         "--server.headless=true",
         "--server.port=8501",
         "--browser.gatherUsageStats=false",
+        "--global.developmentMode=false",
     ]
     sys.exit(stcli.main())
