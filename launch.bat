@@ -11,6 +11,20 @@ IF ERRORLEVEL 1 (
     exit /b 1
 )
 
+REM Check that project files are present
+IF NOT EXIST "%~dp0requirements.txt" (
+    echo ERROR: requirements.txt not found.
+    echo launch.bat must be inside the TC_Tool project folder, not run standalone.
+    pause
+    exit /b 1
+)
+IF NOT EXIST "%~dp0app.py" (
+    echo ERROR: app.py not found.
+    echo launch.bat must be inside the TC_Tool project folder, not run standalone.
+    pause
+    exit /b 1
+)
+
 REM Install dependencies (skips packages already installed)
 echo Installing dependencies...
 pip install -r "%~dp0requirements.txt" --quiet
