@@ -77,6 +77,7 @@ def _phase_color(fluid: str) -> str:
 
 def _phase_color_rgb(fluid: str):
     """Return ReportLab color object for PDF generation"""
+    from reportlab.lib import colors
     color_map = {
         'oil': colors.HexColor('#2E7D32'),    # Green
         'gas': colors.HexColor('#D32F2F'),    # Red
