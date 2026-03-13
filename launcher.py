@@ -35,9 +35,14 @@ def _has_connections():
         result = subprocess.run(
             ["netstat", "-an"],
             capture_output=True, text=True,
-            startupinfo=_hidden_si()
+            startupinfo=_hidden_si(),
+            timeout=5
         )
-        return ":8501" in result.stdout and "ESTABLISHED" in result.stdout
+        # Check that :8501 and ESTABLISHED appear on the SAME line
+        return any(
+            ":8501" in line and "ESTABLISHED" in line
+            for line in result.stdout.splitlines()
+        )
     except Exception:
         return True  # assume connected if check fails
 
