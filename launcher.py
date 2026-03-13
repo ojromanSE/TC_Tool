@@ -12,7 +12,7 @@ import ctypes
 
 
 def _open_browser():
-    time.sleep(3)
+    time.sleep(8)
     webbrowser.open("http://localhost:8501")
 
 
