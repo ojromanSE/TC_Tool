@@ -54,7 +54,15 @@ def _watch_connections():
 
 
 def _open_browser():
-    time.sleep(8)
+    """Wait until Streamlit is ready, then open the browser."""
+    import urllib.request
+    for _ in range(120):  # try for up to 120 seconds
+        time.sleep(1)
+        try:
+            urllib.request.urlopen("http://localhost:8501/_stcore/health", timeout=1)
+            break  # server is ready
+        except Exception:
+            continue
     webbrowser.open("http://localhost:8501")
 
 
