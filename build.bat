@@ -38,8 +38,12 @@ echo Building SE_Tool.exe...
     --collect-all altair ^
     --collect-all sklearn ^
     --collect-all scipy ^
+    --collect-all reportlab ^
     --hidden-import streamlit.web.cli ^
     --hidden-import streamlit.runtime.scriptrunner ^
+    --hidden-import reportlab.lib.pagesizes ^
+    --hidden-import reportlab.platypus ^
+    --hidden-import reportlab.lib.styles ^
     "%~dp0launcher.py"
 
 echo.
