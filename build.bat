@@ -39,6 +39,7 @@ echo Building SE_Tool.exe...
     --collect-all sklearn ^
     --collect-all scipy ^
     --collect-all reportlab ^
+    --collect-all joblib ^
     --hidden-import streamlit.web.cli ^
     --hidden-import streamlit.runtime.scriptrunner ^
     --hidden-import reportlab.lib.pagesizes ^
