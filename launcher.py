@@ -1,18 +1,60 @@
 """
 Entry point for PyInstaller .exe build.
-Starts Streamlit in a background thread and opens the browser automatically.
-A native Windows dialog is shown; clicking OK shuts down everything cleanly.
+Starts Streamlit in a background thread, opens the browser, and automatically
+exits when the browser window/tab is closed.
 """
 import os
 import sys
 import threading
 import webbrowser
 import time
-import ctypes
+import subprocess
+
+
+def _hidden_si():
+    """STARTUPINFO to suppress console windows for subprocesses."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    return si
+
+
+def _has_browser_connections():
+    """Return True if any browser is connected to port 8501."""
+    try:
+        result = subprocess.run(
+            ["netstat", "-an"],
+            capture_output=True, text=True,
+            startupinfo=_hidden_si()
+        )
+        return ":8501" in result.stdout and "ESTABLISHED" in result.stdout
+    except Exception:
+        return True  # assume connected if check fails
+
+
+def _watch_connections():
+    """Exit automatically once all browser connections drop."""
+    # Wait up to 60 s for the first connection
+    connected = False
+    for _ in range(60):
+        time.sleep(1)
+        if _has_browser_connections():
+            connected = True
+            break
+
+    if not connected:
+        return  # no browser ever connected — don't auto-exit
+
+    # Monitor until all tabs are closed
+    while True:
+        time.sleep(2)
+        if not _has_browser_connections():
+            time.sleep(3)  # short grace period for page reloads
+            if not _has_browser_connections():
+                os._exit(0)
 
 
 def _open_browser():
-    time.sleep(3)
+    time.sleep(8)
     webbrowser.open("http://localhost:8501")
 
 
@@ -37,17 +79,10 @@ if __name__ == "__main__":
 
     app_path = os.path.join(base, "app.py")
 
-    # Run Streamlit in a daemon thread (dies automatically when main thread exits)
     threading.Thread(target=_run_streamlit, args=(app_path,), daemon=True).start()
     threading.Thread(target=_open_browser, daemon=True).start()
+    threading.Thread(target=_watch_connections, daemon=True).start()
 
-    # Show a native Windows dialog — blocks until user clicks OK
-    ctypes.windll.user32.MessageBoxW(
-        0,
-        "SE Tool is running in your browser.\n\nClick OK to close SE Tool.",
-        "SE Tool",
-        0x00000040  # MB_ICONINFORMATION
-    )
-
-    # Force-kill all threads (including Streamlit) immediately
-    os._exit(0)
+    # Keep main thread alive (daemon threads die when main exits)
+    while True:
+        time.sleep(1)
