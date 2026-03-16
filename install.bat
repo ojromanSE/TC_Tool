@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 
 echo =============================================
 echo  SE Tool - Desktop Installer
@@ -15,21 +15,42 @@ IF NOT EXIST "%EXE%" (
     exit /b 1
 )
 
-set SHORTCUT=%USERPROFILE%\Desktop\SE Tool.lnk
+REM Get the real Desktop path (handles OneDrive-redirected desktops)
+for /f "usebackq delims=" %%D in (`powershell -NoProfile -Command "[Environment]::GetFolderPath('Desktop')"`) do set DESKTOP=%%D
+
+echo Where would you like to save the shortcut?
+echo.
+echo  [1] Desktop          (%DESKTOP%)
+echo  [2] Custom location  (you will type the path)
+echo.
+set /p CHOICE="Enter 1 or 2: "
+
+if "%CHOICE%"=="1" (
+    set SHORTCUT_DIR=%DESKTOP%
+) else if "%CHOICE%"=="2" (
+    echo.
+    set /p SHORTCUT_DIR="Enter full folder path: "
+) else (
+    echo Invalid choice. Defaulting to Desktop.
+    set SHORTCUT_DIR=%DESKTOP%
+)
+
+set SHORTCUT=!SHORTCUT_DIR!\SE Tool.lnk
+
+IF NOT EXIST "!SHORTCUT_DIR!" (
+    echo.
+    echo ERROR: Folder does not exist: !SHORTCUT_DIR!
+    pause
+    exit /b 1
+)
 
 powershell -NoProfile -Command ^
-    "$ws = New-Object -ComObject WScript.Shell;" ^
-    "$sc = $ws.CreateShortcut('%SHORTCUT%');" ^
-    "$sc.TargetPath = '%EXE%';" ^
-    "$sc.WorkingDirectory = '%~dp0';" ^
-    "$sc.IconLocation = '%EXE%,0';" ^
-    "$sc.Description = 'SE Tool - Tube Curve Tool';" ^
-    "$sc.Save()"
+    "$ws = New-Object -ComObject WScript.Shell; $sc = $ws.CreateShortcut('!SHORTCUT!'); $sc.TargetPath = '%EXE%'; $sc.WorkingDirectory = '%~dp0'; $sc.IconLocation = '%EXE%,0'; $sc.Description = 'SE Tool - Tube Curve Tool'; $sc.Save()"
 
-IF EXIST "%SHORTCUT%" (
+IF EXIST "!SHORTCUT!" (
     echo.
-    echo  Shortcut created on your Desktop!
-    echo  You can now launch SE Tool from there.
+    echo  Shortcut created successfully!
+    echo  Location: !SHORTCUT!
     echo.
 ) ELSE (
     echo.
