@@ -54,10 +54,12 @@ echo Building SE_Tool.exe...
 
 echo.
 IF EXIST "%~dp0dist\SE_Tool\SE_Tool.exe" (
+    copy /y "%~dp0install.bat" "%~dp0dist\SE_Tool\install.bat" >nul
     echo =============================================
     echo  Build complete!
     echo  Executable: dist\SE_Tool\SE_Tool.exe
     echo  Share the entire dist\SE_Tool\ folder.
+    echo  Team members run install.bat to get a Desktop shortcut.
     echo =============================================
 ) ELSE (
     echo Build may have failed. Check output above for errors.
