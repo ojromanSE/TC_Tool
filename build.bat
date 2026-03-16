@@ -25,12 +25,17 @@ IF EXIST "%EMBED_DIR%\python.exe" (
 echo Installing PyInstaller...
 %PYTHON% -m pip install pyinstaller --quiet
 
+echo Generating icon...
+%PYTHON% -m pip install pillow --quiet
+%PYTHON% "%~dp0create_icon.py"
+
 echo Building SE_Tool.exe...
 %PYTHON% -m PyInstaller ^
     --noconfirm ^
     --onedir ^
     --windowed ^
     --name "SE_Tool" ^
+    --icon "%~dp0icon.ico" ^
     --add-data "app.py;." ^
     --add-data "core.py;." ^
     --add-data "static;static" ^
