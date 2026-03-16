@@ -26,14 +26,14 @@ base = getSampleStyleSheet()
 def S(name, parent="Normal", **kw):
     return ParagraphStyle(name, parent=base[parent], **kw)
 
-TITLE  = S("title",  "Title",   fontSize=24, textColor=NAVY, spaceAfter=2,  fontName="Helvetica-Bold")
-SUB    = S("sub",    "Normal",  fontSize=10, textColor=TEAL, spaceAfter=10, fontName="Helvetica")
-H2     = S("h2",     "Heading2",fontSize=12, textColor=NAVY, spaceBefore=8, spaceAfter=4, fontName="Helvetica-Bold")
-BODY   = S("body",   "Normal",  fontSize=10, textColor=colors.HexColor("#2C3E50"), leading=15, spaceAfter=4)
-NOTE   = S("note",   "Normal",  fontSize=9,  textColor=GREY, leading=13, leftIndent=10, spaceAfter=3, fontName="Helvetica-Oblique")
+TITLE  = S("title",  "Title",   fontSize=22, textColor=NAVY, spaceAfter=2,  fontName="Helvetica-Bold")
+SUB    = S("sub",    "Normal",  fontSize=10, textColor=TEAL, spaceAfter=7,  fontName="Helvetica")
+H2     = S("h2",     "Heading2",fontSize=11, textColor=NAVY, spaceBefore=6, spaceAfter=3, fontName="Helvetica-Bold")
+BODY   = S("body",   "Normal",  fontSize=10, textColor=colors.HexColor("#2C3E50"), leading=13, spaceAfter=3)
+NOTE   = S("note",   "Normal",  fontSize=9,  textColor=GREY, leading=12, leftIndent=10, spaceAfter=2, fontName="Helvetica-Oblique")
 FOOTER = S("footer", "Normal",  fontSize=8,  textColor=GREY, alignment=TA_CENTER)
-CODE   = S("code",   "Normal",  fontName="Courier", fontSize=10, textColor=colors.white, leading=15)
-PRE    = S("pre",    "Normal",  fontName="Courier", fontSize=9,  textColor=colors.white, leading=14)
+CODE   = S("code",   "Normal",  fontName="Courier", fontSize=10, textColor=colors.white, leading=14)
+PRE    = S("pre",    "Normal",  fontName="Courier", fontSize=9,  textColor=colors.white, leading=13)
 
 
 def code_block(text, multiline=False):
@@ -78,8 +78,8 @@ def step_box(number, title, body_flowables):
     card  = Table(inner, colWidths=[14.8*cm])
     card.setStyle(TableStyle([
         ("BACKGROUND",    (0,0), (-1,-1), LIGHT),
-        ("TOPPADDING",    (0,0), (-1,-1), 7),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+        ("TOPPADDING",    (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
         ("LEFTPADDING",   (0,0), (-1,-1), 9),
         ("RIGHTPADDING",  (0,0), (-1,-1), 9),
         ("LINEBELOW",     (0,0), (-1,-2), 0.3, DIVIDER),
@@ -91,7 +91,7 @@ def step_box(number, title, body_flowables):
 doc = SimpleDocTemplate(
     OUT, pagesize=A4,
     leftMargin=2.3*cm, rightMargin=2.3*cm,
-    topMargin=1.6*cm,  bottomMargin=1.6*cm,
+    topMargin=1.2*cm,  bottomMargin=1.2*cm,
     title="SE Tool — Installation Guide",
 )
 
@@ -106,19 +106,19 @@ header_tbl = Table([[
 ]], colWidths=[8*cm, 7.4*cm])
 header_tbl.setStyle(TableStyle([
     ("BACKGROUND",    (0,0), (-1,-1), NAVY),
-    ("TOPPADDING",    (0,0), (-1,-1), 12),
-    ("BOTTOMPADDING", (0,0), (-1,-1), 12),
+    ("TOPPADDING",    (0,0), (-1,-1), 10),
+    ("BOTTOMPADDING", (0,0), (-1,-1), 10),
     ("LEFTPADDING",   (0,0), (0,0),   14),
     ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
     ("ALIGN",         (1,0), (1,0),   "RIGHT"),
     ("RIGHTPADDING",  (1,0), (1,0),   14),
 ]))
-story += [header_tbl, Spacer(1, 0.2*cm)]
+story += [header_tbl, Spacer(1, 0.15*cm)]
 
 story += [
     Paragraph("Installation Guide", TITLE),
     Paragraph("Follow these steps to install the SE Tool on your Windows machine.", SUB),
-    HRFlowable(width="100%", thickness=1, color=TEAL, spaceAfter=6),
+    HRFlowable(width="100%", thickness=1, color=TEAL, spaceAfter=5),
 ]
 
 # Requirements
@@ -136,22 +136,31 @@ req.setStyle(TableStyle([
     ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
     ("LINEBEFORE",    (0,0), (0,-1),  3, TEAL),
 ]))
-story += [req, Spacer(1, 0.3*cm)]
+story += [req, Spacer(1, 0.15*cm)]
 
 # Steps
 story += [step_box("1", "Open the shared drive folder", [
     Paragraph("Navigate to the following network path in Windows Explorer:", BODY),
     code_block("Z:\\SIPC\\Software\\SE_TC_Tool"),
 ])]
-story.append(Spacer(1, 0.15*cm))
+story.append(Spacer(1, 0.1*cm))
 
-story += [step_box("2", "Run the installer", [
-    Paragraph("Double-click <b>install.bat</b>", BODY),
+story += [step_box("2", "Copy the SE_Tool folder to your Documents", [
+    Paragraph(
+        "Copy the <b>SE_Tool</b> folder from the shared drive into your "
+        "<b>Documents</b> folder. Your local copy will be at:", BODY),
+    code_block("Documents\\SE_Tool"),
+    Paragraph("Always run the app from this local copy, not directly from the shared drive.", NOTE),
+])]
+story.append(Spacer(1, 0.1*cm))
+
+story += [step_box("3", "Run the installer", [
+    Paragraph("Open your <b>Documents\\SE_Tool</b> folder and double-click <b>install.bat</b>", BODY),
     Paragraph("If Windows shows a security warning, click <b>Run anyway</b>.", NOTE),
 ])]
-story.append(Spacer(1, 0.15*cm))
+story.append(Spacer(1, 0.1*cm))
 
-story += [step_box("3", "Choose shortcut location", [
+story += [step_box("4", "Choose shortcut location", [
     Paragraph("The installer will ask where to save the shortcut:", BODY),
     code_block(
         "  Where would you like to save the shortcut?\n"
@@ -161,9 +170,9 @@ story += [step_box("3", "Choose shortcut location", [
         multiline=True),
     Paragraph("Type <b>1</b> and press <b>Enter</b> to add it to your Desktop.", NOTE),
 ])]
-story.append(Spacer(1, 0.15*cm))
+story.append(Spacer(1, 0.1*cm))
 
-story += [step_box("4", "Launch the app", [
+story += [step_box("5", "Launch the app", [
     Paragraph(
         "An <b>SE Tool</b> shortcut will appear on your Desktop. "
         "Double-click it to launch — the app opens automatically in your browser.",
