@@ -321,7 +321,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 unit = "Mbbl" if "Mbbl" in eur_col else "MMcf"
                 stats = compute_eur_stats(eurs)
                 st.dataframe(format_df_2dec(eur_summary_table(fluid_name, stats, unit, int(norm_len))))
-                fig = probit_plot(eurs, unit, f"{fluid_name} Probit", _phase_color(fluid_name))
+                fig = probit_plot(eurs, unit, f"{fluid_name} Probit", _phase_color(fluid_name), norm_len=int(norm_len))
                 st.pyplot(fig)
 
         st.subheader(f"{fluid_name} — Per-well Plot")
@@ -686,18 +686,49 @@ def generate_comprehensive_pdf():
                     story.append(tc_table)
                 story.append(Spacer(1, 10))
         
-        # Probit plot
+        # EUR summary table + probit plot
         if eur_col in oneline.columns:
             eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
             if fluid_name == "Gas":
                 eurs = [x * 1000 for x in eurs]
             if eurs:
                 unit = "Mbbl" if fluid_name != "Gas" else "MMcf"
+
+                # EUR summary table
+                eur_stats = compute_eur_stats(eurs)
+                tbl_df = eur_summary_table(fluid_name, eur_stats, unit, int(norm_len))
+                story.append(Paragraph("EUR Statistics", styles['Heading2']))
+                story.append(Spacer(1, 4))
+                col0, col1, col2 = tbl_df.columns
+                eur_tbl_data = [[col0, col1, col2]] + [
+                    [str(r[col0]),
+                     f"{r[col1]:.2f}" if isinstance(r[col1], float) and np.isfinite(r[col1]) else (str(r[col1]) if not isinstance(r[col1], float) else ""),
+                     f"{r[col2]:.2f}" if isinstance(r[col2], float) and np.isfinite(r[col2]) else (str(r[col2]) if not isinstance(r[col2], float) else "")]
+                    for _, r in tbl_df.iterrows()
+                ]
+                eur_tbl = Table(eur_tbl_data, colWidths=[2.2*inch, 1.4*inch, 1.4*inch])
+                eur_tbl.setStyle(TableStyle([
+                    ('BACKGROUND',    (0, 0), (-1, 0), _phase_color_rgb(fluid_name)),
+                    ('TEXTCOLOR',     (0, 0), (-1, 0), colors.whitesmoke),
+                    ('FONTNAME',      (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('ALIGN',         (0, 0), (0, -1), 'LEFT'),
+                    ('ALIGN',         (1, 0), (-1, -1), 'CENTER'),
+                    ('FONTSIZE',      (0, 0), (-1, -1), 9),
+                    ('TOPPADDING',    (0, 0), (-1, -1), 5),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                    ('GRID',          (0, 0), (-1, -1), 0.5, colors.black),
+                    ('ROWBACKGROUNDS',(0, 1), (-1, -1), [colors.white, colors.HexColor('#F5F5F5')]),
+                ]))
+                story.append(eur_tbl)
+                story.append(Spacer(1, 10))
+
+                # Probit plot (EUR + EUR/ft side by side)
                 story.append(Paragraph("Probit Plot", styles['Heading2']))
                 story.append(Spacer(1, 6))
-                fig = probit_plot(eurs, unit, f"{fluid_name} EUR Distribution", _phase_color(fluid_name))
+                fig = probit_plot(eurs, unit, f"{fluid_name} EUR Distribution",
+                                  _phase_color(fluid_name), norm_len=int(norm_len))
                 probit_png = _save_fig(fig)
-                story.append(Image(probit_png, width=5.5*inch, height=2.6*inch))
+                story.append(Image(probit_png, width=7.0*inch, height=3.0*inch))
                 story.append(Spacer(1, 12))
         
         story.append(PageBreak())
