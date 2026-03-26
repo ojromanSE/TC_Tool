@@ -401,6 +401,13 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
     n_sel = int(selected_mask.sum())
     n_tot = len(oneline_full)
 
+    # Compute EUR stats upfront so P50 curve can be scaled to match
+    eurs = []
+    eur_stats = {}
+    if n_sel > 0 and eur_col in oneline_filtered.columns:
+        eurs = pd.to_numeric(oneline_filtered[eur_col], errors='coerce').dropna().tolist()
+        eur_stats = compute_eur_stats(eurs)
+
     with right_col:
         if mo_key in st.session_state and n_sel > 0:
             sel_ids = set(oneline_filtered['WellID'].astype(str))
@@ -410,16 +417,23 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
             curves, lines = build_type_curves_and_lines(
                 monthly_filtered, fluid.lower(), oneline=oneline_filtered
             )
+            # Scale P50 curve so its cumulative volume matches the statistical P50 EUR.
+            # Curves are in Bbl or Mcf; EUR stats are in Mbbl or MMcf → *1000.
+            if (not curves.empty and 'P50' in curves.columns
+                    and eur_stats.get('P50') and np.isfinite(eur_stats['P50'])):
+                p50_curve_sum = curves['P50'].sum()
+                if p50_curve_sum > 0:
+                    scale = (eur_stats['P50'] * 1000) / p50_curve_sum
+                    curves = curves.copy()
+                    curves['P50'] = curves['P50'] * scale
             st.session_state[f"{fluid}_tc_curves"] = curves
             st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
 
     # ── EUR summary below ──
     st.caption(f"**{n_sel} / {n_tot} wells selected**")
     if n_sel > 0:
-        eurs = pd.to_numeric(oneline_filtered[eur_col], errors='coerce').dropna().tolist()
-        stats = compute_eur_stats(eurs)
         st.dataframe(
-            format_df_2dec(eur_summary_table(fluid, stats, "Mbbl" if fluid != "Gas" else "MMcf", int(norm_len))),
+            format_df_2dec(eur_summary_table(fluid, eur_stats, "Mbbl" if fluid != "Gas" else "MMcf", int(norm_len))),
             use_container_width=True,
         )
     else:
