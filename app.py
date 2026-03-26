@@ -316,8 +316,6 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             oneline = st.session_state[on_key]
             if eur_col in oneline.columns:
                 eurs = pd.to_numeric(oneline[eur_col], errors="coerce").astype(float).tolist()
-                if fluid_name == "Gas" or "MMcf" in eur_col:
-                    eurs = [x * 1000 if x is not None else None for x in eurs]
                 unit = "Mbbl" if "Mbbl" in eur_col else "MMcf"
                 stats = compute_eur_stats(eurs)
                 st.dataframe(format_df_2dec(eur_summary_table(fluid_name, stats, unit, int(norm_len))))
@@ -411,13 +409,24 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
                 monthly_filtered, fluid.lower(), oneline=oneline_filtered
             )
             st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
+            if not curves.empty and 'P50' in curves.columns:
+                vol_unit = {'Oil': 'Bbl', 'Gas': 'Mcf', 'Water': 'Bbl'}[fluid]
+                export_df = pd.DataFrame({
+                    'Month': curves['t'].astype(int),
+                    f'P50_{fluid}_{vol_unit}_per_month': curves['P50'].round(2),
+                })
+                st.download_button(
+                    label=f"\u2b07 Download P50 {fluid} TC Monthly Volumes",
+                    data=export_df.to_csv(index=False),
+                    file_name=f"P50_{fluid}_TC_monthly.csv",
+                    mime="text/csv",
+                    key=f"{fluid}_p50_download",
+                )
 
     # ── EUR summary below ──
     st.caption(f"**{n_sel} / {n_tot} wells selected**")
     if n_sel > 0:
         eurs = pd.to_numeric(oneline_filtered[eur_col], errors='coerce').dropna().tolist()
-        if fluid == "Gas":
-            eurs = [x * 1000 for x in eurs]
         stats = compute_eur_stats(eurs)
         st.dataframe(
             format_df_2dec(eur_summary_table(fluid, stats, "Mbbl" if fluid != "Gas" else "MMcf", int(norm_len))),
@@ -513,9 +522,7 @@ def generate_comprehensive_pdf():
         # EUR Statistics
         if eur_col in oneline.columns:
             eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
-            if fluid_name == "Gas":
-                eurs = [x * 1000 for x in eurs]
-            
+
             if eurs:
                 stats = compute_eur_stats(eurs)
                 unit = "Mbbl" if fluid_name != "Gas" else "MMcf"
@@ -689,8 +696,6 @@ def generate_comprehensive_pdf():
         # EUR summary table + probit plot
         if eur_col in oneline.columns:
             eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
-            if fluid_name == "Gas":
-                eurs = [x * 1000 for x in eurs]
             if eurs:
                 unit = "Mbbl" if fluid_name != "Gas" else "MMcf"
 
@@ -752,8 +757,6 @@ def generate_comprehensive_pdf():
             well_count = len(oneline)
             if eur_col in oneline.columns:
                 eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
-                if fluid == "Gas":
-                    eurs = [x * 1000 for x in eurs]
                 if eurs:
                     stats = compute_eur_stats(eurs)
                     unit = "MMcf" if fluid == "Gas" else "Mbbl"

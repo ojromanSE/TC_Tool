@@ -482,8 +482,8 @@ def forecast_all(merged: pd.DataFrame,
             row.update({'EUR (Mbbl)':        round(fc['EUR_total'] / 1_000.0, 2),
                         'Remaining (Mbbl)':  round(fc['EUR_fcst']  / 1_000.0, 2)})
         elif com == 'gas':
-            row.update({'EUR (MMcf)':        round(fc['EUR_total'] / 1_000_000.0, 2),
-                        'Remaining (MMcf)':  round(fc['EUR_fcst']  / 1_000_000.0, 2)})
+            row.update({'EUR (MMcf)':        round(fc['EUR_total'] / 1_000.0, 2),
+                        'Remaining (MMcf)':  round(fc['EUR_fcst']  / 1_000.0, 2)})
         else:
             row.update({'EUR (Mbbl water)':       round(fc['EUR_total'] / 1_000.0, 2),
                         'Remaining (Mbbl water)': round(fc['EUR_fcst']  / 1_000.0, 2)})
