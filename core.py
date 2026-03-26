@@ -578,9 +578,8 @@ def probit_plot(eurs: List[float], unit_label: str, title: str,
     return fig
 
 def eur_summary_table(fluid_name: str, stats_dict: Dict[str, float], unit: str, norm_len: int) -> pd.DataFrame:
-    factor = 1000.0 if unit != "MMcf" else 1.0
     def per_ft(x: float) -> float:
-        return (x / norm_len * factor) if (pd.notna(x) and np.isfinite(x) and norm_len) else np.nan
+        return (x / norm_len) if (pd.notna(x) and np.isfinite(x) and norm_len) else np.nan
     rows = [
         ["P90",                  stats_dict.get("P90"),       per_ft(stats_dict.get("P90"))],
         ["P50",                  stats_dict.get("P50"),       per_ft(stats_dict.get("P50"))],
