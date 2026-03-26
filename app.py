@@ -456,7 +456,7 @@ if any(k in st.session_state for k in _tc_keys):
 # ================= PDF EXPORT =================
 from datetime import datetime
 
-def generate_comprehensive_pdf():
+def generate_comprehensive_pdf(tc_name: str = ""):
     """Generate a comprehensive PDF report with all sections."""
     from reportlab.lib.pagesizes import letter
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
@@ -467,14 +467,28 @@ def generate_comprehensive_pdf():
     doc = SimpleDocTemplate(tmp.name, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
     story = []
     styles = getSampleStyleSheet()
-    
+
     # Custom styles
     title_style = ParagraphStyle('CustomTitle', parent=styles['Title'], fontSize=20, textColor=colors.HexColor('#2E7D32'))
     heading_style = ParagraphStyle('CustomHeading', parent=styles['Heading1'], fontSize=14, textColor=colors.HexColor('#1976D2'))
-    
+    tc_name_style = ParagraphStyle('TCName', parent=styles['Normal'], fontSize=16,
+                                   textColor=colors.HexColor('#1976D2'), fontName='Helvetica-Bold')
+
     # Title page
     story.append(Paragraph("SE Oil & Gas Autoforecasting Report", title_style))
     story.append(Spacer(1, 12))
+    if tc_name:
+        name_data = [[Paragraph(f"Type Curve Name:&nbsp;&nbsp;<font color='#1976D2'>{tc_name}</font>", tc_name_style)]]
+        name_box = Table(name_data, colWidths=[6.5*inch])
+        name_box.setStyle(TableStyle([
+            ('BACKGROUND',    (0, 0), (-1, -1), colors.HexColor('#EAF4FB')),
+            ('TOPPADDING',    (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+            ('LEFTPADDING',   (0, 0), (-1, -1), 14),
+            ('LINEBEFORE',    (0, 0), (0, -1),  4, colors.HexColor('#1976D2')),
+        ]))
+        story.append(name_box)
+        story.append(Spacer(1, 10))
     story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
     story.append(Spacer(1, 24))
     
@@ -816,17 +830,30 @@ if st.button("Generate PDF Report"):
     if "Oil_oneline" not in st.session_state and "Gas_oneline" not in st.session_state and "Water_oneline" not in st.session_state:
         st.error("Please run at least one forecast (Oil, Gas, or Water) before generating a PDF report.")
     else:
+        st.session_state["_pdf_name_prompt"] = True
+
+if st.session_state.get("_pdf_name_prompt"):
+    tc_name = st.text_input(
+        "Enter a name for this Type Curve report:",
+        key="_pdf_tc_name",
+        placeholder="e.g. Niobrara 2024 Q1",
+    )
+    if st.button("Confirm & Generate", key="_pdf_confirm"):
         try:
             with st.spinner("Generating comprehensive PDF report..."):
-                pdf_path = generate_comprehensive_pdf()
+                pdf_path = generate_comprehensive_pdf(tc_name=tc_name.strip())
+            safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in tc_name.strip())
+            file_name = f"{safe_name}.pdf" if safe_name else f"SE_Autoforecast_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
             with open(pdf_path, "rb") as f:
                 st.download_button(
                     label="📥 Download PDF Report",
                     data=f.read(),
-                    file_name=f"SE_Autoforecast_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                    mime="application/pdf"
+                    file_name=file_name,
+                    mime="application/pdf",
+                    key="_pdf_dl",
                 )
             st.success("PDF report generated successfully!")
+            st.session_state["_pdf_name_prompt"] = False
         except Exception as e:
             st.error(f"Error generating PDF: {str(e)}")
             st.exception(e)
