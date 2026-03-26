@@ -559,7 +559,8 @@ def probit_plot(eurs: List[float], unit_label: str, title: str,
         return fig
 
     factor = 1000.0 if unit_label != "MMcf" else 1.0
-    per_ft_label = f"{unit_label}/ft"
+    _per_ft_map = {"Mbbl": "Bo/ft", "MMcf": "Mcf/ft"}
+    per_ft_label = _per_ft_map.get(unit_label, f"{unit_label}/ft")
 
     if norm_len and norm_len > 0:
         eur_ft = eur / norm_len * factor
