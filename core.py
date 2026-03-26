@@ -547,10 +547,7 @@ def _probit_ax(ax, values: np.ndarray, unit_label: str, color):
     ax.set_ylabel("Probit")
     ax.set_xlabel(f"EUR ({unit_label})")
     ax.grid(True, linestyle='--', alpha=0.5)
-    ax.set_xscale('log')
-    ax.xaxis.set_major_locator(LogLocator(base=10, subs=(1,), numticks=10))
-    ax.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(2, 10), numticks=50))
-    ax.xaxis.set_minor_formatter(FuncFormatter(_mantissa_formatter))
+    ax.set_xlim(left=0)
 
 
 def probit_plot(eurs: List[float], unit_label: str, title: str,
