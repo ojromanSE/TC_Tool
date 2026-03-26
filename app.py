@@ -228,9 +228,11 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
         if n >= min_wells:
             t_out = np.arange(1, 601, dtype=float)
             smooth = {'t': t_out}
+            p50_lo = max(0, int(n * 0.45))
+            p50_hi = max(p50_lo + 1, int(n * 0.55))
             groups = {
                 'P10': df.iloc[:max(1, int(n * 0.1))],
-                'P50': df.iloc[max(0, int(n * 0.45)):max(1, int(n * 0.55))],
+                'P50': df.iloc[p50_lo:p50_hi],
                 'P90': df.iloc[max(0, int(n * 0.9)):],
             }
             for pct, grp in groups.items():
@@ -408,20 +410,8 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
             curves, lines = build_type_curves_and_lines(
                 monthly_filtered, fluid.lower(), oneline=oneline_filtered
             )
+            st.session_state[f"{fluid}_tc_curves"] = curves
             st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
-            if not curves.empty and 'P50' in curves.columns:
-                vol_unit = {'Oil': 'Bbl', 'Gas': 'Mcf', 'Water': 'Bbl'}[fluid]
-                export_df = pd.DataFrame({
-                    'Month': curves['t'].astype(int),
-                    f'P50_{fluid}_{vol_unit}_per_month': curves['P50'].round(2),
-                })
-                st.download_button(
-                    label=f"\u2b07 Download P50 {fluid} TC Monthly Volumes",
-                    data=export_df.to_csv(index=False),
-                    file_name=f"P50_{fluid}_TC_monthly.csv",
-                    mime="text/csv",
-                    key=f"{fluid}_p50_download",
-                )
 
     # ── EUR summary below ──
     st.caption(f"**{n_sel} / {n_tot} wells selected**")
@@ -435,9 +425,33 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
     else:
         st.warning("No wells selected — select at least one well to compute statistics.")
 
-with tw_tabs[0]: _render_tw("Oil", "Oil_oneline", "Oil_monthly", "EUR (Mbbl)")
-with tw_tabs[1]: _render_tw("Gas", "Gas_oneline", "Gas_monthly", "EUR (MMcf)")
+with tw_tabs[0]: _render_tw("Oil",   "Oil_oneline",   "Oil_monthly",   "EUR (Mbbl)")
+with tw_tabs[1]: _render_tw("Gas",   "Gas_oneline",   "Gas_monthly",   "EUR (MMcf)")
 with tw_tabs[2]: _render_tw("Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
+
+# ── Multi-phase TC download ──
+_phase_units = {"Oil": "Bbl", "Gas": "Mcf", "Water": "Bbl"}
+_tc_keys = ["Oil_tc_curves", "Gas_tc_curves", "Water_tc_curves"]
+if any(k in st.session_state for k in _tc_keys):
+    import io as _io
+    _xls_buf = _io.BytesIO()
+    with pd.ExcelWriter(_xls_buf, engine="openpyxl") as _writer:
+        for _fluid, _unit in _phase_units.items():
+            _curves = st.session_state.get(f"{_fluid}_tc_curves", pd.DataFrame())
+            if _curves.empty:
+                continue
+            _sheet_df = pd.DataFrame({"Month": _curves["t"].astype(int)})
+            for _pct in ["P10", "P50", "P90"]:
+                if _pct in _curves.columns:
+                    _sheet_df[f"{_pct}_{_fluid}_{_unit}_per_month"] = _curves[_pct].round(2)
+            _sheet_df.to_excel(_writer, sheet_name=f"{_fluid} TC", index=False)
+    st.download_button(
+        label="⬇ Download All Phases TC Monthly Volumes (Excel)",
+        data=_xls_buf.getvalue(),
+        file_name="TC_Monthly_Volumes.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="all_tc_download",
+    )
 
 # ================= PDF EXPORT =================
 from datetime import datetime
