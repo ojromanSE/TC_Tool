@@ -430,21 +430,34 @@ with tw_tabs[1]: _render_tw("Gas",   "Gas_oneline",   "Gas_monthly",   "EUR (MMc
 with tw_tabs[2]: _render_tw("Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
 
 # ── Multi-phase TC download ──
-_phase_units = {"Oil": "Bbl", "Gas": "Mcf", "Water": "Bbl"}
 _tc_keys = ["Oil_tc_curves", "Gas_tc_curves", "Water_tc_curves"]
 if any(k in st.session_state for k in _tc_keys):
     import io as _io
+    _oil_c   = st.session_state.get("Oil_tc_curves",   pd.DataFrame())
+    _gas_c   = st.session_state.get("Gas_tc_curves",   pd.DataFrame())
+    _water_c = st.session_state.get("Water_tc_curves", pd.DataFrame())
+
+    # Build combined Oil + Gas sheet (P50 columns adjacent, units converted)
+    _og_parts = [pd.Series(range(1, 601), name="Month")]
+    for _pct in ["P10", "P50", "P90"]:
+        if not _oil_c.empty and _pct in _oil_c.columns:
+            _og_parts.append((_oil_c[_pct] / 1000).round(4).rename(f"{_pct}_Oil_Mbbl_per_month"))
+        if not _gas_c.empty and _pct in _gas_c.columns:
+            _og_parts.append((_gas_c[_pct] / 1000).round(4).rename(f"{_pct}_Gas_MMcf_per_month"))
+    _og_df = pd.concat(_og_parts, axis=1)
+
+    # Water sheet
+    _water_parts = [pd.Series(range(1, 601), name="Month")]
+    for _pct in ["P10", "P50", "P90"]:
+        if not _water_c.empty and _pct in _water_c.columns:
+            _water_parts.append((_water_c[_pct] / 1000).round(4).rename(f"{_pct}_Water_Mbbl_per_month"))
+    _water_df = pd.concat(_water_parts, axis=1)
+
     _xls_buf = _io.BytesIO()
     with pd.ExcelWriter(_xls_buf, engine="openpyxl") as _writer:
-        for _fluid, _unit in _phase_units.items():
-            _curves = st.session_state.get(f"{_fluid}_tc_curves", pd.DataFrame())
-            if _curves.empty:
-                continue
-            _sheet_df = pd.DataFrame({"Month": _curves["t"].astype(int)})
-            for _pct in ["P10", "P50", "P90"]:
-                if _pct in _curves.columns:
-                    _sheet_df[f"{_pct}_{_fluid}_{_unit}_per_month"] = _curves[_pct].round(2)
-            _sheet_df.to_excel(_writer, sheet_name=f"{_fluid} TC", index=False)
+        _og_df.to_excel(_writer, sheet_name="Oil & Gas TC", index=False)
+        if len(_water_parts) > 1:
+            _water_df.to_excel(_writer, sheet_name="Water TC", index=False)
     st.download_button(
         label="⬇ Download All Phases TC Monthly Volumes (Excel)",
         data=_xls_buf.getvalue(),
