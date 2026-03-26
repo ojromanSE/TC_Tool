@@ -482,8 +482,8 @@ def forecast_all(merged: pd.DataFrame,
             row.update({'EUR (Mbbl)':        round(fc['EUR_total'] / 1_000.0, 2),
                         'Remaining (Mbbl)':  round(fc['EUR_fcst']  / 1_000.0, 2)})
         elif com == 'gas':
-            row.update({'EUR (MMcf)':        round(fc['EUR_total'] / 1_000_000.0, 2),
-                        'Remaining (MMcf)':  round(fc['EUR_fcst']  / 1_000_000.0, 2)})
+            row.update({'EUR (MMcf)':        round(fc['EUR_total'] / 1_000.0, 2),
+                        'Remaining (MMcf)':  round(fc['EUR_fcst']  / 1_000.0, 2)})
         else:
             row.update({'EUR (Mbbl water)':       round(fc['EUR_total'] / 1_000.0, 2),
                         'Remaining (Mbbl water)': round(fc['EUR_fcst']  / 1_000.0, 2)})
@@ -558,8 +558,9 @@ def probit_plot(eurs: List[float], unit_label: str, title: str,
         ax.text(0.5, 0.5, "No data", ha="center", va="center"); ax.axis('off')
         return fig
 
-    factor = 1000.0 if unit_label != "MMcf" else 1.0
-    per_ft_label = f"{unit_label}/ft"
+    factor = 1000.0  # Mbbl→Bbl/ft, MMcf→Mcf/ft
+    _per_ft_map = {"Mbbl": "Bbl/ft", "MMcf": "Mcf/ft"}
+    per_ft_label = _per_ft_map.get(unit_label, f"{unit_label}/ft")
 
     if norm_len and norm_len > 0:
         eur_ft = eur / norm_len * factor
