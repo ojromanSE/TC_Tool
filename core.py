@@ -529,35 +529,54 @@ def _mantissa_formatter(val, pos=None):
     s = f"{val:g}"
     return s if len(s) <= 4 else ""
 
-def probit_plot(eurs: List[float], unit_label: str, title: str, color: str | None = None):
-    eur = np.array([x for x in eurs if np.isfinite(x) and x>0.0], dtype=float)
-    if eur.size == 0:
-        fig, ax = plt.subplots(figsize=(8,6))
-        ax.text(0.5, 0.5, "No data", ha="center", va="center"); ax.axis('off')
-        return fig
-    eur_sorted = np.sort(eur)[::-1]
-    ranks = np.arange(1, eur_sorted.size+1)
-    probs = (ranks - 0.5) / eur_sorted.size
+def _probit_ax(ax, values: np.ndarray, unit_label: str, color):
+    """Draw a single probit panel onto *ax*."""
+    vals = np.sort(values)[::-1]
+    ranks = np.arange(1, vals.size + 1)
+    probs = (ranks - 0.5) / vals.size
     z = stats.norm.ppf(1 - probs)
-
-    p10  = np.percentile(eur_sorted, 90)
-    p50  = np.percentile(eur_sorted, 50)
-    p90  = np.percentile(eur_sorted, 10)
-
-    fig, ax = plt.subplots(figsize=(9,7))
-    ax.scatter(eur_sorted, z, edgecolors='black', alpha=0.85, s=48, color=color)
+    p10 = np.percentile(vals, 90)
+    p90 = np.percentile(vals, 10)
+    ax.scatter(vals, z, edgecolors='black', alpha=0.85, s=48, color=color)
     ax.plot([p90, p10],
-            [stats.norm.ppf(1-0.90), stats.norm.ppf(1-0.10)],
+            [stats.norm.ppf(1 - 0.90), stats.norm.ppf(1 - 0.10)],
             linewidth=2, color=color if color else 'black')
-    ticks = [stats.norm.ppf(1-x/100) for x in (10,50,90)]
-    ax.set_yticks(ticks); ax.set_yticklabels(['P10','P50','P90'])
-    ax.set_ylabel("Probit"); ax.set_xlabel(f"EUR ({unit_label})")
+    ticks = [stats.norm.ppf(1 - x / 100) for x in (10, 50, 90)]
+    ax.set_yticks(ticks)
+    ax.set_yticklabels(['P10', 'P50', 'P90'])
+    ax.set_ylabel("Probit")
+    ax.set_xlabel(f"EUR ({unit_label})")
     ax.grid(True, linestyle='--', alpha=0.5)
     ax.set_xscale('log')
     ax.xaxis.set_major_locator(LogLocator(base=10, subs=(1,), numticks=10))
-    ax.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(2,10), numticks=50))
+    ax.xaxis.set_minor_locator(LogLocator(base=10, subs=np.arange(2, 10), numticks=50))
     ax.xaxis.set_minor_formatter(FuncFormatter(_mantissa_formatter))
-    ax.set_title(title); plt.tight_layout()
+
+
+def probit_plot(eurs: List[float], unit_label: str, title: str,
+                color: str | None = None, norm_len: int | None = None):
+    eur = np.array([x for x in eurs if np.isfinite(x) and x > 0.0], dtype=float)
+    if eur.size == 0:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.text(0.5, 0.5, "No data", ha="center", va="center"); ax.axis('off')
+        return fig
+
+    factor = 1000.0 if unit_label != "MMcf" else 1.0
+    per_ft_label = f"{unit_label}/ft"
+
+    if norm_len and norm_len > 0:
+        eur_ft = eur / norm_len * factor
+        fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(14, 6))
+        _probit_ax(ax_left,  eur,    unit_label,    color)
+        _probit_ax(ax_right, eur_ft, per_ft_label,  color)
+        ax_left.set_title(f"{title} — EUR")
+        ax_right.set_title(f"{title} — EUR/ft")
+    else:
+        fig, ax_left = plt.subplots(figsize=(9, 7))
+        _probit_ax(ax_left, eur, unit_label, color)
+        ax_left.set_title(title)
+
+    plt.tight_layout()
     return fig
 
 def eur_summary_table(fluid_name: str, stats_dict: Dict[str, float], unit: str, norm_len: int) -> pd.DataFrame:
