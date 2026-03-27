@@ -194,7 +194,7 @@ def _fit_arps_to_trace(t: np.ndarray, y: np.ndarray, d_lim: float = D_LIM_DEFAUL
     return tuple(res.x) if res.success else (qi0, b0, di0)
 
 
-def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: int = 5,
+def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: int = 1,
                                 oneline: pd.DataFrame = None):
     vol_col = f"Monthly_{com}_volume"
     if monthly_df.empty or vol_col not in monthly_df.columns:
