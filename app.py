@@ -235,11 +235,17 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
                 'P50': df.iloc[p50_lo:p50_hi],
                 'P90': df.iloc[max(0, int(n * 0.9)):],
             }
+            # Use P50's b and di as the shape for all percentiles;
+            # scale qi by EUR ratio so curves are parallel and smooth.
+            p50_grp  = groups['P50']
+            b_shape  = float(p50_grp['_b'].median())
+            di_shape = float(p50_grp['_di'].median())
+            qi_p50   = float(p50_grp['_qi'].median())
+            eur_p50  = float(p50_grp['_eur'].median()) or 1.0
             for pct, grp in groups.items():
-                qi = float(grp['_qi'].median())
-                b  = float(grp['_b'].median())
-                di = float(grp['_di'].median())
-                smooth[pct] = modified_arps(qi, b, di, D_LIM_DEFAULT, t_out)
+                eur_ratio = float(grp['_eur'].median()) / eur_p50
+                smooth[pct] = modified_arps(qi_p50 * eur_ratio, b_shape, di_shape,
+                                            D_LIM_DEFAULT, t_out)
             return pd.DataFrame(smooth), lines
 
     # Fallback: empirical percentiles with Arps fitting (used when oneline unavailable)
