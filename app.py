@@ -235,11 +235,14 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
                 'P50': df.iloc[p50_lo:p50_hi],
                 'P90': df.iloc[max(0, int(n * 0.9)):],
             }
+            # All curves share P90's b and di (the representative decline shape).
+            # qi per group is a placeholder — _render_tw scales each curve to its
+            # EUR target, so only the shape (b, di) matters here.
+            b_shape  = float(groups['P90']['_b'].median())
+            di_shape = float(groups['P90']['_di'].median())
             for pct, grp in groups.items():
                 qi = float(grp['_qi'].median())
-                b  = float(grp['_b'].median())
-                di = float(grp['_di'].median())
-                smooth[pct] = modified_arps(qi, b, di, D_LIM_DEFAULT, t_out)
+                smooth[pct] = modified_arps(qi, b_shape, di_shape, D_LIM_DEFAULT, t_out)
             return pd.DataFrame(smooth), lines
 
     # Fallback: empirical percentiles with Arps fitting (used when oneline unavailable)
