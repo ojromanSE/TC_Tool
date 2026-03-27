@@ -368,6 +368,12 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     except Exception:
         qi, b, di = qi0, b0, di0
 
+    # If the optimizer hit the d_lim lower bound (degenerate: not enough history
+    # to constrain decline), fall back to the analytical di0 with a minimum floor.
+    # This prevents EUR ≈ qi/d_lim blow-up on wells with very few months of data.
+    if di < d_lim * 3:
+        di = max(di0, 0.03)
+
     # ---- Fit history with Modified Arps ----
     fit_hist = modified_arps(qi, b, di, d_lim, t_hist)
 
@@ -393,7 +399,7 @@ class ForecastConfig:
     b_high: float = 1.2
     max_months: int = 600
     d_lim: float = D_LIM_DEFAULT      # terminal nominal decline rate (Modified Arps)
-    min_months_history: int = 1       # wells with fewer months are skipped
+    min_months_history: int = 3       # wells with fewer months are skipped
 
 
 def _forecast_well_job(well_id, wd: pd.DataFrame, com: str,
