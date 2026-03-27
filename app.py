@@ -235,17 +235,11 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
                 'P50': df.iloc[p50_lo:p50_hi],
                 'P90': df.iloc[max(0, int(n * 0.9)):],
             }
-            # Use P50's b and di as the shape for all percentiles;
-            # scale qi by EUR ratio so curves are parallel and smooth.
-            p50_grp  = groups['P50']
-            b_shape  = float(p50_grp['_b'].median())
-            di_shape = float(p50_grp['_di'].median())
-            qi_p50   = float(p50_grp['_qi'].median())
-            eur_p50  = float(p50_grp['_eur'].median()) or 1.0
             for pct, grp in groups.items():
-                eur_ratio = float(grp['_eur'].median()) / eur_p50
-                smooth[pct] = modified_arps(qi_p50 * eur_ratio, b_shape, di_shape,
-                                            D_LIM_DEFAULT, t_out)
+                qi = float(grp['_qi'].median())
+                b  = float(grp['_b'].median())
+                di = float(grp['_di'].median())
+                smooth[pct] = modified_arps(qi, b, di, D_LIM_DEFAULT, t_out)
             return pd.DataFrame(smooth), lines
 
     # Fallback: empirical percentiles with Arps fitting (used when oneline unavailable)
@@ -423,15 +417,18 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
             curves, lines = build_type_curves_and_lines(
                 monthly_filtered, fluid.lower(), oneline=oneline_filtered
             )
-            # Scale P50 curve so its cumulative volume matches the statistical P50 EUR.
-            # Curves are in Bbl or Mcf; EUR stats are in Mbbl or MMcf → *1000.
-            if (not curves.empty and 'P50' in curves.columns
-                    and eur_stats.get('P50') and np.isfinite(eur_stats['P50'])):
-                p50_curve_sum = curves['P50'].sum()
-                if p50_curve_sum > 0:
-                    scale = (eur_stats['P50'] * 1000) / p50_curve_sum
-                    curves = curves.copy()
-                    curves['P50'] = curves['P50'] * scale
+            # Scale every TC curve so its cumulative volume exactly matches
+            # the corresponding EUR percentile from the stats table.
+            # Curves are in Bbl or Mcf; EUR stats are in Mbbl or MMcf → ×1000.
+            if not curves.empty:
+                curves = curves.copy()
+                for _pct, _stat in [('P10', 'P10'), ('P50', 'P50'), ('P90', 'P90')]:
+                    if (_pct in curves.columns
+                            and eur_stats.get(_stat)
+                            and np.isfinite(eur_stats[_stat])):
+                        _csum = curves[_pct].sum()
+                        if _csum > 0:
+                            curves[_pct] = curves[_pct] * (eur_stats[_stat] * 1000 / _csum)
             st.session_state[f"{fluid}_tc_curves"] = curves
             st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
 
