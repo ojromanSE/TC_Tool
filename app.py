@@ -89,6 +89,60 @@ def _save_fig(fig, dpi=220):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     fig.savefig(tmp.name, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
+
+
+def _make_outlier_fig(oneline_df, eur_col, fluid_name):
+    """EUR vs Lateral Length scatter with IQR-fence outlier detection.
+    Returns (fig, upper_fence, n_active, n_removed, median_eur) or None."""
+    df = oneline_df.copy()
+    df['_eur'] = pd.to_numeric(df[eur_col], errors='coerce')
+    if 'LateralLength' in df.columns:
+        df['_lat'] = pd.to_numeric(df['LateralLength'], errors='coerce')
+    else:
+        return None
+    df = df.dropna(subset=['_eur', '_lat'])
+    if len(df) < 3:
+        return None
+
+    q1, q3 = df['_eur'].quantile(0.25), df['_eur'].quantile(0.75)
+    iqr = q3 - q1
+    upper_fence = q3 + 1.5 * iqr
+    lower_fence = q1 - 1.5 * iqr
+
+    high_mask = df['_eur'] > upper_fence
+    low_mask  = df['_eur'] < lower_fence
+    ok_mask   = ~high_mask & ~low_mask
+    unit = "MMcf" if fluid_name.lower() == "gas" else "Mbbl"
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    if ok_mask.any():
+        ax.scatter(df.loc[ok_mask, '_lat'], df.loc[ok_mask, '_eur'],
+                   color='#2C2C2C', s=40, zorder=3, label='Within range')
+    if high_mask.any():
+        ax.scatter(df.loc[high_mask, '_lat'], df.loc[high_mask, '_eur'],
+                   color='#781F28', s=40, zorder=3, label='High EUR outlier (>1.5\u00d7 IQR)')
+    if low_mask.any():
+        ax.scatter(df.loc[low_mask, '_lat'], df.loc[low_mask, '_eur'],
+                   color='#BBBBBB', s=40, zorder=3, label='Low EUR outlier (<1.5\u00d7 IQR)')
+    ax.axhline(upper_fence, color='#781F28', linestyle='--', linewidth=0.8, alpha=0.6)
+    ax.text(0.98, 0.97, f"Upper fence  {upper_fence:,.0f}",
+            transform=ax.transAxes, ha='right', va='top', color='#781F28', fontsize=8)
+    for spine in ax.spines.values():
+        spine.set_edgecolor('#E8AABB')
+        spine.set_linewidth(1.5)
+    ax.set_facecolor('#FAFAFA')
+    fig.patch.set_facecolor('white')
+    ax.set_xlabel('Lateral Length (ft)', fontsize=9)
+    ax.set_ylabel(f'EUR ({unit})', fontsize=9)
+    ax.legend(fontsize=8, loc='upper right', bbox_to_anchor=(0.99, 0.88))
+    ax.tick_params(labelsize=8)
+    plt.tight_layout()
+
+    n_active  = int(ok_mask.sum())
+    n_removed = int((high_mask | low_mask).sum())
+    n_flagged = int(high_mask.sum())
+    median_eur = float(df['_eur'].median())
+    return fig, upper_fence, n_active, n_removed, n_flagged, median_eur, unit
     return tmp.name
 
 # ================= Upload =================
@@ -503,7 +557,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
     styles = getSampleStyleSheet()
 
     # Custom styles
-    title_style = ParagraphStyle('CustomTitle', parent=styles['Title'], fontSize=20, textColor=colors.HexColor('#2E7D32'))
+    title_style = ParagraphStyle('CustomTitle', parent=styles['Title'], fontSize=20, textColor=colors.HexColor('#781F28'))
     heading_style = ParagraphStyle('CustomHeading', parent=styles['Heading1'], fontSize=14, textColor=colors.HexColor('#1976D2'))
     tc_name_style = ParagraphStyle('TCName', parent=styles['Normal'], fontSize=16,
                                    textColor=colors.HexColor('#1976D2'), fontName='Helvetica-Bold')
@@ -548,8 +602,58 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         ('GRID', (0, 0), (-1, -1), 1, colors.black)
     ]))
     story.append(params_table)
+    story.append(Spacer(1, 20))
+
+    # ── Executive Summary (right after parameters) ──
+    story.append(Paragraph("Executive Summary", heading_style))
+    story.append(Spacer(1, 8))
+
+    exec_data = [["Fluid", "TC Wells", "P90 EUR", "P50 EUR", "P10 EUR", "Mean EUR"]]
+    for _fl, _key, _ecol in [("Oil", "Oil_oneline", "EUR (Mbbl)"),
+                               ("Gas", "Gas_oneline", "EUR (MMcf)"),
+                               ("Water", "Water_oneline", "EUR (Mbbl water)")]:
+        if _key not in st.session_state:
+            continue
+        _oneline_full = st.session_state[_key]
+        _sel_key = f"{_fl}_tc_selection"
+        if _sel_key in st.session_state and isinstance(st.session_state[_sel_key], set):
+            _sel_ids = st.session_state[_sel_key]
+            _oneline_tc = _oneline_full[_oneline_full['WellID'].astype(str).isin(_sel_ids)]
+        else:
+            _oneline_tc = _oneline_full
+        _tc_count = len(_oneline_tc)
+        if _ecol in _oneline_tc.columns:
+            _eurs = pd.to_numeric(_oneline_tc[_ecol], errors="coerce").dropna().astype(float).tolist()
+            if _eurs:
+                _st = compute_eur_stats(_eurs)
+                _unit = "MMcf" if _fl == "Gas" else "Mbbl"
+                _p90k = next((k for k in _st if 'p90' in k.lower()), None)
+                _p50k = next((k for k in _st if 'p50' in k.lower() or 'median' in k.lower()), None)
+                _p10k = next((k for k in _st if 'p10' in k.lower()), None)
+                _mnk  = next((k for k in _st if 'mean' in k.lower()), None)
+                exec_data.append([
+                    _fl, str(_tc_count),
+                    f"{_st[_p90k]:.1f} {_unit}" if _p90k else "N/A",
+                    f"{_st[_p50k]:.1f} {_unit}" if _p50k else "N/A",
+                    f"{_st[_p10k]:.1f} {_unit}" if _p10k else "N/A",
+                    f"{_st[_mnk]:.1f} {_unit}" if _mnk else "N/A",
+                ])
+    if len(exec_data) > 1:
+        exec_tbl = Table(exec_data, colWidths=[0.8*inch, 0.8*inch, 1.3*inch, 1.3*inch, 1.3*inch, 1.3*inch])
+        exec_tbl.setStyle(TableStyle([
+            ('BACKGROUND',    (0, 0), (-1, 0),  colors.HexColor('#781F28')),
+            ('TEXTCOLOR',     (0, 0), (-1, 0),  colors.whitesmoke),
+            ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME',      (0, 0), (-1, 0),  'Helvetica-Bold'),
+            ('FONTSIZE',      (0, 0), (-1, -1), 9),
+            ('BOTTOMPADDING', (0, 0), (-1, 0),  10),
+            ('TOPPADDING',    (0, 0), (-1, -1), 5),
+            ('GRID',          (0, 0), (-1, -1), 0.5, colors.black),
+            ('ROWBACKGROUNDS',(0, 1), (-1, -1), [colors.white, colors.HexColor('#F9ECEC')]),
+        ]))
+        story.append(exec_tbl)
     story.append(PageBreak())
-    
+
     # Function to add fluid section
     def add_fluid_section(fluid_name, oneline_key, monthly_key, eur_col):
         if oneline_key not in st.session_state:
@@ -803,61 +907,98 @@ def generate_comprehensive_pdf(tc_name: str = ""):
                 probit_png = _save_fig(fig)
                 story.append(Image(probit_png, width=7.0*inch, height=3.0*inch))
                 story.append(Spacer(1, 12))
-        
+
+        # ── Analog well oneline with Arps parameters ──
+        story.append(PageBreak())
+        story.append(Paragraph(f"{fluid_name} — Analog Wells & Arps Parameters", heading_style))
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(
+            f"The following {len(oneline)} wells were used to build the {fluid_name} type curve.",
+            styles['Normal']))
+        story.append(Spacer(1, 8))
+
+        _well_cols_wanted = ['WellName', 'WellID', 'PrimaryFormation', 'LateralLength',
+                              'qi (per day)', 'b', 'di (per month)', 'First-Year Decline (%)', eur_col]
+        _well_cols = [c for c in _well_cols_wanted if c in oneline.columns]
+        if _well_cols:
+            _qi_unit = "Mcf/d" if fluid_name == "Gas" else "bbl/d"
+            _hdr_map = {
+                'WellName': 'Well Name', 'WellID': 'Well ID',
+                'PrimaryFormation': 'Formation', 'LateralLength': 'Lat Len (ft)',
+                'qi (per day)': f'qi ({_qi_unit})', 'b': 'b',
+                'di (per month)': 'Di (/mo)', 'First-Year Decline (%)': '1yr Dec (%)',
+                eur_col: 'EUR'
+            }
+            _col_w = {
+                'WellName': 1.5*inch, 'WellID': 1.0*inch, 'PrimaryFormation': 1.0*inch,
+                'LateralLength': 0.7*inch, 'qi (per day)': 0.8*inch, 'b': 0.5*inch,
+                'di (per month)': 0.6*inch, 'First-Year Decline (%)': 0.7*inch, eur_col: 0.7*inch
+            }
+            _headers = [_hdr_map.get(c, c) for c in _well_cols]
+            _widths  = [_col_w.get(c, 0.9*inch) for c in _well_cols]
+
+            _well_data = [_headers]
+            for _, row in oneline[_well_cols].iterrows():
+                _row_vals = []
+                for c in _well_cols:
+                    v = row[c]
+                    if isinstance(v, float) and np.isfinite(v):
+                        _row_vals.append(f"{v:,.2f}" if c not in ('b', 'di (per month)') else f"{v:.4f}")
+                    else:
+                        _row_vals.append(str(v) if pd.notna(v) else "")
+                _well_data.append(_row_vals)
+
+            _well_tbl = Table(_well_data, colWidths=_widths, repeatRows=1)
+            _well_tbl.setStyle(TableStyle([
+                ('BACKGROUND',    (0, 0), (-1, 0),  _phase_color_rgb(fluid_name)),
+                ('TEXTCOLOR',     (0, 0), (-1, 0),  colors.whitesmoke),
+                ('FONTNAME',      (0, 0), (-1, 0),  'Helvetica-Bold'),
+                ('FONTSIZE',      (0, 0), (-1, -1), 7),
+                ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
+                ('ALIGN',         (0, 1), (1, -1),  'LEFT'),
+                ('TOPPADDING',    (0, 0), (-1, -1), 3),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+                ('GRID',          (0, 0), (-1, -1), 0.4, colors.black),
+                ('ROWBACKGROUNDS',(0, 1), (-1, -1), [colors.white, colors.HexColor('#F5F5F5')]),
+            ]))
+            story.append(_well_tbl)
+        story.append(Spacer(1, 10))
+
+        # ── Outlier detection: EUR vs Lateral Length ──
+        _out = _make_outlier_fig(oneline, eur_col, fluid_name)
+        if _out is not None:
+            _of, _uf, _na, _nr, _nflag, _med, _unit = _out
+            story.append(Spacer(1, 10))
+            story.append(Paragraph(f"{fluid_name} — EUR Outlier Detection", styles['Heading2']))
+            story.append(Spacer(1, 6))
+            story.append(Image(_save_fig(_of), width=6.5*inch, height=3.2*inch))
+            story.append(Spacer(1, 8))
+            # Summary stats bar
+            _stat_data = [[
+                Paragraph("<b>Active wells</b><br/>" + str(_na),           styles['Normal']),
+                Paragraph("<b>Removed wells</b><br/>" + str(_nr),          styles['Normal']),
+                Paragraph(f"<b>Median EUR</b><br/>{_med:,.0f} {_unit}",   styles['Normal']),
+                Paragraph(f"<b>Upper fence</b><br/>{_uf:,.0f} {_unit}",   styles['Normal']),
+                Paragraph(f"<b>Flagged</b><br/>{_nflag} wells",            styles['Normal']),
+            ]]
+            _stat_tbl = Table(_stat_data, colWidths=[1.2*inch]*5)
+            _stat_tbl.setStyle(TableStyle([
+                ('BACKGROUND',    (0, 0), (-1, -1), colors.HexColor('#EFEFEF')),
+                ('ALIGN',         (0, 0), (-1, -1), 'CENTER'),
+                ('FONTSIZE',      (0, 0), (-1, -1), 8),
+                ('TOPPADDING',    (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('GRID',          (0, 0), (-1, -1), 0.5, colors.HexColor('#CCCCCC')),
+            ]))
+            story.append(_stat_tbl)
+            story.append(Spacer(1, 10))
+
         story.append(PageBreak())
     
     # Add each fluid section
     add_fluid_section("Oil", "Oil_oneline", "Oil_monthly", "EUR (Mbbl)")
     add_fluid_section("Gas", "Gas_oneline", "Gas_monthly", "EUR (MMcf)")
     add_fluid_section("Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
-    
-    # Summary section
-    story.append(Paragraph("Executive Summary", heading_style))
-    story.append(Spacer(1, 12))
-    
-    summary_data = [["Fluid", "Wells", "Mean EUR", "P50 EUR", "P10 EUR"]]
-    
-    for fluid, key, eur_col in [("Oil", "Oil_oneline", "EUR (Mbbl)"), 
-                                  ("Gas", "Gas_oneline", "EUR (MMcf)"), 
-                                  ("Water", "Water_oneline", "EUR (Mbbl water)")]:
-        if key in st.session_state:
-            oneline = st.session_state[key]
-            well_count = len(oneline)
-            if eur_col in oneline.columns:
-                eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
-                if eurs:
-                    stats = compute_eur_stats(eurs)
-                    unit = "MMcf" if fluid == "Gas" else "Mbbl"
-                    
-                    # Get the actual key names from stats dict
-                    mean_key = next((k for k in stats.keys() if 'mean' in k.lower()), None)
-                    p50_key = next((k for k in stats.keys() if 'p50' in k.lower() or 'median' in k.lower()), None)
-                    p10_key = next((k for k in stats.keys() if 'p10' in k.lower()), None)
-                    
-                    mean_val = f"{stats[mean_key]:.2f} {unit}" if mean_key else "N/A"
-                    p50_val = f"{stats[p50_key]:.2f} {unit}" if p50_key else "N/A"
-                    p10_val = f"{stats[p10_key]:.2f} {unit}" if p10_key else "N/A"
-                    
-                    summary_data.append([
-                        fluid,
-                        str(well_count),
-                        mean_val,
-                        p50_val,
-                        p10_val
-                    ])
-    
-    if len(summary_data) > 1:
-        summary_table = Table(summary_data, colWidths=[1*inch, 1*inch, 1.5*inch, 1.5*inch, 1.5*inch])
-        summary_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1976D2')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        story.append(summary_table)
     
     # Build PDF
     doc.build(story)
