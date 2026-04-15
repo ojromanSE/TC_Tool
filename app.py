@@ -912,20 +912,20 @@ def generate_comprehensive_pdf(tc_name: str = ""):
             styles['Normal']))
         story.append(Spacer(1, 8))
 
-        _well_cols_wanted = ['WellName', 'WellID', 'PrimaryFormation', 'LateralLength',
+        _well_cols_wanted = ['API10', 'WellName', 'LateralLength',
                               'qi (per day)', 'b', 'di (per month)', 'First-Year Decline (%)', eur_col]
         _well_cols = [c for c in _well_cols_wanted if c in oneline.columns]
         if _well_cols:
             _qi_unit = "Mcf/d" if fluid_name == "Gas" else "bbl/d"
             _hdr_map = {
-                'WellName': 'Well Name', 'WellID': 'Well ID',
-                'PrimaryFormation': 'Formation', 'LateralLength': 'Lat Len (ft)',
+                'API10': 'API/UWI', 'WellName': 'Well Name',
+                'LateralLength': 'Lat Len (ft)',
                 'qi (per day)': f'qi ({_qi_unit})', 'b': 'b',
                 'di (per month)': 'Di (/mo)', 'First-Year Decline (%)': '1yr Dec (%)',
                 eur_col: 'EUR'
             }
             _col_w = {
-                'WellName': 1.5*inch, 'WellID': 1.0*inch, 'PrimaryFormation': 1.0*inch,
+                'API10': 1.2*inch, 'WellName': 1.5*inch,
                 'LateralLength': 0.7*inch, 'qi (per day)': 0.8*inch, 'b': 0.5*inch,
                 'di (per month)': 0.6*inch, 'First-Year Decline (%)': 0.7*inch, eur_col: 0.7*inch
             }
