@@ -427,6 +427,7 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
                     curves = curves.copy()
                     curves['P50'] = curves['P50'] * scale
             st.session_state[f"{fluid}_tc_curves"] = curves
+            st.session_state[f"{fluid}_tc_lines"] = lines
             st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
 
     # ── EUR summary below ──
@@ -678,89 +679,81 @@ def generate_comprehensive_pdf(tc_name: str = ""):
             story.append(Image(scatter_png, width=5.5*inch, height=2.6*inch))
             story.append(Spacer(1, 10))
         
-        # Type curves (use filtered monthly + filtered oneline to match the UI)
-        if monthly_sel is not None:
-            curves, lines = build_type_curves_and_lines(
+        # Type curves — use the same curves already computed and scaled by _render_tw
+        # so the PDF plot is guaranteed to match the UI plot exactly.
+        _cached_curves = st.session_state.get(f"{fluid_name}_tc_curves", pd.DataFrame())
+        _cached_lines  = st.session_state.get(f"{fluid_name}_tc_lines",  [])
+        if _cached_curves.empty and monthly_sel is not None:
+            # Fallback: recompute if session state was cleared (e.g. page reload before PDF)
+            _cached_curves, _cached_lines = build_type_curves_and_lines(
                 monthly_sel, fluid_name.lower(), oneline=oneline
             )
-            # Apply same P50 EUR scaling as the UI (_render_tw)
-            if (not curves.empty and 'P50' in curves.columns
-                    and eur_col in oneline.columns):
-                eurs_for_scale = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
-                if eurs_for_scale:
-                    eur_stats_scale = compute_eur_stats(eurs_for_scale)
-                    p50_key = next((k for k in eur_stats_scale if 'p50' in k.lower() or 'median' in k.lower()), None)
-                    p50_val = eur_stats_scale.get(p50_key) if p50_key else None
-                    if p50_val and np.isfinite(p50_val):
-                        p50_curve_sum = curves['P50'].sum()
-                        if p50_curve_sum > 0:
-                            scale = (p50_val * 1000) / p50_curve_sum
-                            curves = curves.copy()
-                            curves['P50'] = curves['P50'] * scale
-            if not curves.empty:
-                story.append(Paragraph("Type Curve", styles['Heading2']))
-                story.append(Spacer(1, 6))
-                fig = plot_type_curves(curves, lines, fluid_name.lower())
-                tc_png = _save_fig(fig)
-                story.append(Image(tc_png, width=5.5*inch, height=2.6*inch))
-                story.append(Spacer(1, 8))
+        if not _cached_curves.empty:
+            curves = _cached_curves
+            lines  = _cached_lines
+            story.append(Paragraph("Type Curve", styles['Heading2']))
+            story.append(Spacer(1, 6))
+            fig = plot_type_curves(curves, lines, fluid_name.lower())
+            tc_png = _save_fig(fig)
+            story.append(Image(tc_png, width=5.5*inch, height=2.6*inch))
+            story.append(Spacer(1, 8))
 
-                # Arps parameters table for each type curve tier
-                qi_col  = 'qi (per day)'
-                di_col  = 'di (per month)'
-                b_col   = 'b'
-                dec_col = 'First-Year Decline (%)'
-                if all(c in oneline.columns for c in [qi_col, b_col, di_col]):
-                    qi  = pd.to_numeric(oneline[qi_col],  errors='coerce').dropna()
-                    b_s = pd.to_numeric(oneline[b_col],   errors='coerce').dropna()
-                    di  = pd.to_numeric(oneline[di_col],  errors='coerce').dropna()
-                    dec = pd.to_numeric(oneline[dec_col], errors='coerce').dropna() if dec_col in oneline.columns else None
+            # Arps parameters table for each type curve tier
+            qi_col  = 'qi (per day)'
+            di_col  = 'di (per month)'
+            b_col   = 'b'
+            dec_col = 'First-Year Decline (%)'
+            if all(c in oneline.columns for c in [qi_col, b_col, di_col]):
+                qi  = pd.to_numeric(oneline[qi_col],  errors='coerce').dropna()
+                b_s = pd.to_numeric(oneline[b_col],   errors='coerce').dropna()
+                di  = pd.to_numeric(oneline[di_col],  errors='coerce').dropna()
+                dec = pd.to_numeric(oneline[dec_col], errors='coerce').dropna() if dec_col in oneline.columns else None
 
-                    qi_unit = "Mcf/day" if fluid_name == "Gas" else "bbl/day"
+                qi_unit = "Mcf/day" if fluid_name == "Gas" else "bbl/day"
 
-                    tc_data = [["Parameter", "P90 Curve\n(Low)", "P50 Curve\n(Mid)", "P10 Curve\n(High)"]]
+                tc_data = [["Parameter", "P90 Curve\n(Low)", "P50 Curve\n(Mid)", "P10 Curve\n(High)"]]
+                tc_data.append([
+                    f"qi ({qi_unit})",
+                    f"{np.percentile(qi, 10):,.0f}",
+                    f"{np.percentile(qi, 50):,.0f}",
+                    f"{np.percentile(qi, 90):,.0f}",
+                ])
+                tc_data.append([
+                    "b-factor",
+                    f"{np.percentile(b_s, 10):.3f}",
+                    f"{np.percentile(b_s, 50):.3f}",
+                    f"{np.percentile(b_s, 90):.3f}",
+                ])
+                tc_data.append([
+                    "Di (per month)",
+                    f"{np.percentile(di, 90):.4f}",
+                    f"{np.percentile(di, 50):.4f}",
+                    f"{np.percentile(di, 10):.4f}",
+                ])
+                if dec is not None and not dec.empty:
                     tc_data.append([
-                        f"qi ({qi_unit})",
-                        f"{np.percentile(qi, 10):,.0f}",
-                        f"{np.percentile(qi, 50):,.0f}",
-                        f"{np.percentile(qi, 90):,.0f}",
+                        "1st-Year Decline (%)",
+                        f"{np.percentile(dec, 90):.1f}%",
+                        f"{np.percentile(dec, 50):.1f}%",
+                        f"{np.percentile(dec, 10):.1f}%",
                     ])
-                    tc_data.append([
-                        "b-factor",
-                        f"{np.percentile(b_s, 10):.3f}",
-                        f"{np.percentile(b_s, 50):.3f}",
-                        f"{np.percentile(b_s, 90):.3f}",
-                    ])
-                    tc_data.append([
-                        "Di (per month)",
-                        f"{np.percentile(di, 90):.4f}",
-                        f"{np.percentile(di, 50):.4f}",
-                        f"{np.percentile(di, 10):.4f}",
-                    ])
-                    if dec is not None and not dec.empty:
-                        tc_data.append([
-                            "1st-Year Decline (%)",
-                            f"{np.percentile(dec, 90):.1f}%",
-                            f"{np.percentile(dec, 50):.1f}%",
-                            f"{np.percentile(dec, 10):.1f}%",
-                        ])
-                    tc_data.append(["Terminal Di (d_lim)", "0.00417/mo", "0.00417/mo", "0.00417/mo"])
+                tc_data.append(["Terminal Di (d_lim)", "0.00417/mo", "0.00417/mo", "0.00417/mo"])
 
-                    tc_table = Table(tc_data, colWidths=[2.0*inch, 1.4*inch, 1.4*inch, 1.4*inch])
-                    tc_table.setStyle(TableStyle([
-                        ('BACKGROUND', (0, 0), (-1, 0), _phase_color_rgb(fluid_name)),
-                        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                        ('ALIGN', (0, 0), (0, -1), 'LEFT'),
-                        ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
-                        ('FONTSIZE', (0, 0), (-1, -1), 9),
-                        ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-                        ('TOPPADDING', (0, 0), (-1, -1), 5),
-                        ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
-                        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F5F5F5')]),
-                    ]))
-                    story.append(tc_table)
-                story.append(Spacer(1, 10))
+                tc_table = Table(tc_data, colWidths=[2.0*inch, 1.4*inch, 1.4*inch, 1.4*inch])
+                tc_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), _phase_color_rgb(fluid_name)),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                    ('ALIGN', (1, 0), (-1, -1), 'CENTER'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 9),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                    ('TOPPADDING', (0, 0), (-1, -1), 5),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#F5F5F5')]),
+                ]))
+                story.append(tc_table)
+            story.append(Spacer(1, 10))
         
         # EUR summary table + probit plot
         if eur_col in oneline.columns:
