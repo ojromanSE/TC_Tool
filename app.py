@@ -271,7 +271,7 @@ def plot_type_curves(curves, lines, fluid):
     fig, ax = plt.subplots(figsize=(9,5))
     if lines:
         for t, y in lines:
-            ax.plot(t, y, color='gray', alpha=0.1, linewidth=0.5)
+            ax.plot(t, y, color='gray', alpha=0.3, linewidth=0.5)
     if not curves.empty:
         ax.plot(curves['t'], curves['P50'], color=color, linewidth=2, label='P50')
         ax.plot(curves['t'], curves['P10'], color=color, linestyle='--', label='P10')
@@ -689,6 +689,20 @@ def generate_comprehensive_pdf(tc_name: str = ""):
             curves, lines = build_type_curves_and_lines(
                 monthly_sel, fluid_name.lower(), oneline=oneline
             )
+            # Apply same P50 EUR scaling as the UI (_render_tw)
+            if (not curves.empty and 'P50' in curves.columns
+                    and eur_col in oneline.columns):
+                eurs_for_scale = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
+                if eurs_for_scale:
+                    eur_stats_scale = compute_eur_stats(eurs_for_scale)
+                    p50_key = next((k for k in eur_stats_scale if 'p50' in k.lower() or 'median' in k.lower()), None)
+                    p50_val = eur_stats_scale.get(p50_key) if p50_key else None
+                    if p50_val and np.isfinite(p50_val):
+                        p50_curve_sum = curves['P50'].sum()
+                        if p50_curve_sum > 0:
+                            scale = (p50_val * 1000) / p50_curve_sum
+                            curves = curves.copy()
+                            curves['P50'] = curves['P50'] * scale
             if not curves.empty:
                 story.append(Paragraph("Type Curve", styles['Heading2']))
                 story.append(Spacer(1, 6))
