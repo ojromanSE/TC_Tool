@@ -89,6 +89,7 @@ def _save_fig(fig, dpi=220):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     fig.savefig(tmp.name, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
+    return tmp.name
 
 
 def _make_outlier_fig(oneline_df, eur_col, fluid_name):
