@@ -1,0 +1,12 @@
+{
+  "name": "tc-tool-pptx",
+  "version": "1.0.0",
+  "description": "PPTX export for TC Tool",
+  "private": true,
+  "scripts": {
+    "generate": "node generate_tc_pptx.js"
+  },
+  "dependencies": {
+    "pptxgenjs": "^3.12.0"
+  }
+}

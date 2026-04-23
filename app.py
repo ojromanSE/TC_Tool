@@ -545,6 +545,220 @@ if any(k in st.session_state for k in _tc_keys):
 # ================= PDF EXPORT =================
 from datetime import datetime
 
+
+# ── PPTX data builder ──────────────────────────────────────────────────────────
+def _build_pptx_data(tc_name: str) -> dict:
+    """Extract live session-state data into the pptxgenjs data contract."""
+    import json as _json
+    from datetime import datetime as _dt
+
+    D_LIM = 0.00417
+
+    def _get_fluid(fluid_name, oneline_key, eur_col):
+        if oneline_key not in st.session_state:
+            return None
+        oneline_full = st.session_state[oneline_key]
+        sel_key = f"{fluid_name}_tc_selection"
+        if sel_key in st.session_state and isinstance(st.session_state[sel_key], set):
+            sel_ids = st.session_state[sel_key]
+            oneline = oneline_full[oneline_full['WellID'].astype(str).isin(sel_ids)].reset_index(drop=True)
+        else:
+            oneline = oneline_full.reset_index(drop=True)
+
+        n_tc    = len(oneline)
+        n_total = len(oneline_full)
+        is_gas  = fluid_name.lower() == 'gas'
+        eur_unit      = "MMcf" if is_gas else "Mbbl"
+        eur_per_ft_u  = "Mcf/ft" if is_gas else "Bbl/ft"
+        qi_unit       = "Mcf/day" if is_gas else "bbl/day"
+
+        eurs = pd.to_numeric(oneline[eur_col], errors='coerce').dropna().astype(float) if eur_col in oneline.columns else pd.Series([], dtype=float)
+        eur_stats = compute_eur_stats(eurs.tolist()) if len(eurs) > 0 else {}
+        _pk = lambda kw: next((k for k in eur_stats if kw in k.lower()), None)
+        p10e  = float(eur_stats.get(_pk('p10'), 0) or 0)
+        p50e  = float(eur_stats.get(_pk('p50') or _pk('median'), 0) or 0)
+        p90e  = float(eur_stats.get(_pk('p90'), 0) or 0)
+        mne   = float(eur_stats.get(_pk('mean'), 0) or 0)
+
+        lat_vals = pd.to_numeric(oneline['LateralLength'], errors='coerce').dropna() if 'LateralLength' in oneline.columns else pd.Series([], dtype=float)
+        avg_lat  = float(lat_vals.mean()) if len(lat_vals) > 0 else float(norm_len)
+        def _epft(e): return (e * 1000) / avg_lat if avg_lat > 0 else 0.0
+
+        b_vals = pd.to_numeric(oneline['b'], errors='coerce').dropna() if 'b' in oneline.columns else pd.Series([], dtype=float)
+        bc = len(b_vals)
+
+        # Group parameters (mirror build_type_curves_and_lines grouping)
+        df_tc = oneline.copy()
+        df_tc['_eur'] = pd.to_numeric(df_tc[eur_col], errors='coerce') if eur_col in df_tc.columns else 0
+        df_tc['_qi']  = pd.to_numeric(df_tc.get('qi (per day)', pd.Series(dtype=float)), errors='coerce')
+        df_tc['_b']   = pd.to_numeric(df_tc.get('b',            pd.Series(dtype=float)), errors='coerce')
+        df_tc['_di']  = pd.to_numeric(df_tc.get('di (per month)', pd.Series(dtype=float)), errors='coerce')
+        df_tc['_dec'] = pd.to_numeric(df_tc.get('First-Year Decline (%)', pd.Series(dtype=float)), errors='coerce')
+        df_tc = df_tc.dropna(subset=['_eur','_qi','_b','_di']).sort_values('_eur', ascending=False).reset_index(drop=True)
+        nn = len(df_tc)
+
+        def _gs(grp):
+            qi  = float(grp['_qi'].median()) if len(grp) > 0 else 0.0
+            b_  = float(grp['_b'].median())  if len(grp) > 0 else 1.0
+            di_ = float(grp['_di'].median()) if len(grp) > 0 else D_LIM
+            dec = float(grp['_dec'].dropna().median()) / 100 if (len(grp) > 0 and grp['_dec'].notna().any()) else 0.0
+            return qi, b_, di_, dec
+
+        if nn >= 1:
+            p50_lo = max(0, int(nn * 0.45))
+            p50_hi = max(p50_lo + 1, int(nn * 0.55))
+            grps = {
+                'P10': df_tc.iloc[:max(1, int(nn * 0.1))],
+                'P50': df_tc.iloc[p50_lo:p50_hi],
+                'P90': df_tc.iloc[max(0, int(nn * 0.9)):],
+            }
+            p10qi, p10b, p10di, p10dec = _gs(grps['P10'])
+            p50qi, p50b, p50di, p50dec = _gs(grps['P50'])
+            p90qi, p90b, p90di, p90dec = _gs(grps['P90'])
+        else:
+            p10qi = p50qi = p90qi = 0.0
+            p10b  = p50b  = p90b  = 1.0
+            p10di = p50di = p90di = D_LIM
+            p10dec = p50dec = p90dec = 0.0
+
+        analog_rows = []
+        for _, row in oneline.iterrows():
+            api_v  = str(row.get('API10', row.get('WellID', '')))
+            wn     = str(row.get('WellName', ''))
+            lat_ft = float(row['LateralLength']) if 'LateralLength' in row and pd.notna(row['LateralLength']) else avg_lat
+            qi_d   = float(row['qi (per day)'])        if 'qi (per day)'        in row and pd.notna(row['qi (per day)'])        else 0.0
+            bv     = float(row['b'])                   if 'b'                   in row and pd.notna(row['b'])                   else 1.0
+            di_mo  = float(row['di (per month)'])      if 'di (per month)'      in row and pd.notna(row['di (per month)'])      else D_LIM
+            dec1   = float(row['First-Year Decline (%)']) if 'First-Year Decline (%)' in row and pd.notna(row['First-Year Decline (%)']) else 0.0
+            eur_v  = float(row[eur_col])               if eur_col               in row and pd.notna(row[eur_col])               else 0.0
+            epft_v = (eur_v * 1000) / lat_ft if lat_ft > 0 else 0.0
+            analog_rows.append({
+                'api': api_v, 'wellName': wn, 'latLenFt': lat_ft,
+                'qi': qi_d, 'b': bv, 'diPerMo': di_mo,
+                'decline1yrPct': dec1, 'eur': eur_v, 'eurPerFt': epft_v,
+            })
+
+        return {
+            'fluid': fluid_name.lower(),
+            'nTcWells': n_tc, 'nTotal': n_total,
+            'meanEur': mne, 'p10Eur': p10e, 'p50Eur': p50e, 'p90Eur': p90e,
+            'eurUnit': eur_unit, 'eurPerFtUnit': eur_per_ft_u,
+            'meanEurPerFt': _epft(mne), 'p10EurPerFt': _epft(p10e),
+            'p50EurPerFt': _epft(p50e), 'p90EurPerFt': _epft(p90e),
+            'bMean':   float(b_vals.mean())             if bc > 0 else 0.0,
+            'bMedian': float(b_vals.median())           if bc > 0 else 0.0,
+            'bP10':    float(np.percentile(b_vals, 10)) if bc > 0 else 0.0,
+            'bP90':    float(np.percentile(b_vals, 90)) if bc > 0 else 0.0,
+            'bCount': int(bc),
+            'bValues': [float(v) for v in b_vals.tolist()],
+            'p90Qi': p90qi, 'p50Qi': p50qi, 'p10Qi': p10qi, 'qiUnit': qi_unit,
+            'p90B':  p90b,  'p50B':  p50b,  'p10B':  p10b,
+            'p90Di': p90di, 'p50Di': p50di, 'p10Di': p10di,
+            'p90Decline1yr': p90dec, 'p50Decline1yr': p50dec, 'p10Decline1yr': p10dec,
+            'terminalDi': D_LIM,
+            'analogRows': analog_rows,
+        }
+
+    # Well meta — derive from best available oneline
+    primary_key = next((k for k in ['Oil_oneline','Gas_oneline','Water_oneline'] if k in st.session_state), None)
+    prim_fl     = primary_key.split('_')[0] if primary_key else 'Oil'
+    prim_ol     = st.session_state.get(primary_key, pd.DataFrame())
+    sel_key     = f"{prim_fl}_tc_selection"
+    if sel_key in st.session_state and isinstance(st.session_state[sel_key], set):
+        prim_tc = prim_ol[prim_ol['WellID'].astype(str).isin(st.session_state[sel_key])]
+    else:
+        prim_tc = prim_ol
+
+    def _mode(col): return str(prim_tc[col].mode().iloc[0]) if (col in prim_tc.columns and not prim_tc[col].mode().empty) else ''
+    county    = _mode('County')
+    state_val = _mode('State')
+    reservoir = _mode('PrimaryFormation')
+    lat_vals  = pd.to_numeric(prim_tc['LateralLength'], errors='coerce').dropna() if 'LateralLength' in prim_tc.columns else pd.Series([], dtype=float)
+    avg_lat   = float(lat_vals.mean()) if len(lat_vals) > 0 else float(norm_len)
+
+    comp_dates  = pd.to_datetime(prim_tc['CompletionDate'], errors='coerce').dropna() if 'CompletionDate' in prim_tc.columns else pd.Series([], dtype='datetime64[ns]')
+    comp_vintage = (f"{comp_dates.min().year} – {comp_dates.max().year}" if len(comp_dates) > 0 else '')
+
+    unique_counties = list(prim_tc['County'].dropna().unique()) if 'County' in prim_tc.columns else [county]
+    ll_range = (f"{int(lat_vals.min()):,} – {int(lat_vals.max()):,} ft" if len(lat_vals) > 0 else '')
+
+    now = _dt.now()
+    data = {
+        'wellMeta': {
+            'wellName':       tc_name or 'TC Report',
+            'county':         county,
+            'state':          state_val,
+            'operator':       'SE',
+            'reservoir':      reservoir,
+            'afeLateralLenFt': float(norm_len),
+            'tvdFt':          0.0,
+            'reportDate':     now.isoformat(),
+            'generatedDate':  now.strftime('%Y-%m-%d'),
+            'normLengthFt':   float(norm_len),
+            'bFactorRange':   f"{b_low:.3f} - {b_high:.3f}",
+        },
+        'analogCriteria': {
+            'nAnalogs':        len(prim_tc),
+            'counties':        ', '.join(str(c) for c in unique_counties),
+            'reservoir':       reservoir,
+            'llRangeFt':       ll_range,
+            'llAvgFt':         avg_lat,
+            'compVintage':     comp_vintage,
+            'avgDistanceMi':   'N/A',
+        },
+    }
+    _blank = lambda fl, eu, epfu, qu: {
+        'fluid': fl, 'nTcWells': 0, 'nTotal': 0,
+        'meanEur': 0.0, 'p10Eur': 0.0, 'p50Eur': 0.0, 'p90Eur': 0.0,
+        'eurUnit': eu, 'eurPerFtUnit': epfu,
+        'meanEurPerFt': 0.0, 'p10EurPerFt': 0.0, 'p50EurPerFt': 0.0, 'p90EurPerFt': 0.0,
+        'bMean': 0.0, 'bMedian': 0.0, 'bP10': 0.0, 'bP90': 0.0, 'bCount': 0, 'bValues': [],
+        'p90Qi': 0.0, 'p50Qi': 0.0, 'p10Qi': 0.0, 'qiUnit': qu,
+        'p90B': 1.0, 'p50B': 1.0, 'p10B': 1.0,
+        'p90Di': 0.00417, 'p50Di': 0.00417, 'p10Di': 0.00417,
+        'p90Decline1yr': 0.0, 'p50Decline1yr': 0.0, 'p10Decline1yr': 0.0,
+        'terminalDi': 0.00417, 'analogRows': [],
+    }
+    data['oil']   = _get_fluid('Oil',   'Oil_oneline',   'EUR (Mbbl)')       or _blank('oil',   'Mbbl',  'Bbl/ft', 'bbl/day')
+    data['gas']   = _get_fluid('Gas',   'Gas_oneline',   'EUR (MMcf)')       or _blank('gas',   'MMcf',  'Mcf/ft', 'Mcf/day')
+    data['water'] = _get_fluid('Water', 'Water_oneline', 'EUR (Mbbl water)') or _blank('water', 'Mbbl',  'Bbl/ft', 'bbl/day')
+    return data
+
+
+def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
+    """Write pptx_data as JSON, call node generate_tc_pptx.js, return path or None."""
+    import json, subprocess, shutil
+    node = shutil.which('node')
+    if not node:
+        return None
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'generate_tc_pptx.js')
+    if not os.path.exists(script):
+        return None
+
+    safe = "".join(c if c.isalnum() or c in ' _-' else '_' for c in pptx_data['wellMeta']['wellName'])
+    date = pptx_data['wellMeta']['generatedDate']
+    out_path = os.path.join(output_dir, f"SE_{safe or 'TC'}_TC_Report_{date}.pptx")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.json', mode='w') as jf:
+        json.dump(pptx_data, jf)
+        json_path = jf.name
+    try:
+        result = subprocess.run(
+            [node, script, json_path, out_path],
+            capture_output=True, text=True, timeout=60,
+            cwd=os.path.dirname(script),
+        )
+        if result.returncode != 0:
+            st.warning(f"PPTX generation error: {result.stderr[:400]}")
+            return None
+        return out_path
+    except Exception as e:
+        st.warning(f"PPTX generation failed: {e}")
+        return None
+    finally:
+        try: os.unlink(json_path)
+        except: pass
+
 def generate_comprehensive_pdf(tc_name: str = ""):
     """Generate a comprehensive PDF report with all sections."""
     from reportlab.lib.pagesizes import letter
@@ -1022,19 +1236,37 @@ if st.session_state.get("_pdf_name_prompt"):
     )
     if st.button("Confirm & Generate", key="_pdf_confirm"):
         try:
-            with st.spinner("Generating comprehensive PDF report..."):
-                pdf_path = generate_comprehensive_pdf(tc_name=tc_name.strip())
-            safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in tc_name.strip())
-            file_name = f"{safe_name}.pdf" if safe_name else f"SE_Autoforecast_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            name_clean = tc_name.strip()
+            with st.spinner("Generating PDF report..."):
+                pdf_path = generate_comprehensive_pdf(tc_name=name_clean)
+            safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in name_clean)
+            pdf_file_name = f"{safe_name}.pdf" if safe_name else f"SE_Autoforecast_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
             with open(pdf_path, "rb") as f:
                 st.download_button(
-                    label="📥 Download PDF Report",
+                    label="Download PDF Report",
                     data=f.read(),
-                    file_name=file_name,
+                    file_name=pdf_file_name,
                     mime="application/pdf",
                     key="_pdf_dl",
                 )
-            st.success("PDF report generated successfully!")
+
+            with st.spinner("Generating PPTX report..."):
+                pptx_data = _build_pptx_data(name_clean)
+                pptx_path = generate_tc_pptx(pptx_data, tempfile.gettempdir())
+            if pptx_path and os.path.exists(pptx_path):
+                pptx_file_name = os.path.basename(pptx_path)
+                with open(pptx_path, "rb") as f:
+                    st.download_button(
+                        label="Download PPTX Report",
+                        data=f.read(),
+                        file_name=pptx_file_name,
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                        key="_pptx_dl",
+                    )
+                st.success("PDF and PPTX reports generated successfully!")
+            else:
+                st.success("PDF report generated successfully!")
+
             st.session_state["_pdf_name_prompt"] = False
         except Exception as e:
             st.error(f"Error generating PDF: {str(e)}")

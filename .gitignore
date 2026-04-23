@@ -4,3 +4,4 @@ python_embed/
 dist/
 build/
 *.spec
+node_modules/
