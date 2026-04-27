@@ -1220,13 +1220,18 @@ def generate_comprehensive_pdf(tc_name: str = ""):
     return tmp.name
 
 st.markdown("---")
-st.header("📄 Export Report")
+st.header("Export Report")
 
-if st.button("Generate PDF Report"):
-    if "Oil_oneline" not in st.session_state and "Gas_oneline" not in st.session_state and "Water_oneline" not in st.session_state:
-        st.error("Please run at least one forecast (Oil, Gas, or Water) before generating a PDF report.")
+_has_forecast = any(k in st.session_state for k in ["Oil_oneline", "Gas_oneline", "Water_oneline"])
+
+if st.button("Generate PDF + PPTX Report", disabled=not _has_forecast):
+    if not _has_forecast:
+        st.error("Please run at least one forecast before generating a report.")
     else:
         st.session_state["_pdf_name_prompt"] = True
+
+if not _has_forecast:
+    st.info("Run at least one forecast (Oil, Gas, or Water) to enable report export.")
 
 if st.session_state.get("_pdf_name_prompt"):
     tc_name = st.text_input(
@@ -1241,33 +1246,46 @@ if st.session_state.get("_pdf_name_prompt"):
                 pdf_path = generate_comprehensive_pdf(tc_name=name_clean)
             safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in name_clean)
             pdf_file_name = f"{safe_name}.pdf" if safe_name else f"SE_Autoforecast_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-            with open(pdf_path, "rb") as f:
-                st.download_button(
-                    label="Download PDF Report",
-                    data=f.read(),
-                    file_name=pdf_file_name,
-                    mime="application/pdf",
-                    key="_pdf_dl",
-                )
+            with open(pdf_path, "rb") as _f:
+                st.session_state["_pdf_bytes"]     = _f.read()
+                st.session_state["_pdf_file_name"] = pdf_file_name
 
             with st.spinner("Generating PPTX report..."):
                 pptx_data = _build_pptx_data(name_clean)
                 pptx_path = generate_tc_pptx(pptx_data, tempfile.gettempdir())
             if pptx_path and os.path.exists(pptx_path):
-                pptx_file_name = os.path.basename(pptx_path)
-                with open(pptx_path, "rb") as f:
-                    st.download_button(
-                        label="Download PPTX Report",
-                        data=f.read(),
-                        file_name=pptx_file_name,
-                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                        key="_pptx_dl",
-                    )
-                st.success("PDF and PPTX reports generated successfully!")
+                with open(pptx_path, "rb") as _f:
+                    st.session_state["_pptx_bytes"]     = _f.read()
+                    st.session_state["_pptx_file_name"] = os.path.basename(pptx_path)
+                st.success("PDF and PPTX reports ready for download.")
             else:
-                st.success("PDF report generated successfully!")
+                st.session_state.pop("_pptx_bytes", None)
+                st.success("PDF report ready for download. (PPTX unavailable — Node.js not found)")
 
             st.session_state["_pdf_name_prompt"] = False
         except Exception as e:
-            st.error(f"Error generating PDF: {str(e)}")
+            st.error(f"Error generating report: {str(e)}")
             st.exception(e)
+
+# Persistent download buttons — survive rerenders via session state
+_dl_col1, _dl_col2 = st.columns(2)
+with _dl_col1:
+    if st.session_state.get("_pdf_bytes"):
+        st.download_button(
+            label="Download PDF Report",
+            data=st.session_state["_pdf_bytes"],
+            file_name=st.session_state.get("_pdf_file_name", "SE_Report.pdf"),
+            mime="application/pdf",
+            key="_pdf_dl",
+            use_container_width=True,
+        )
+with _dl_col2:
+    if st.session_state.get("_pptx_bytes"):
+        st.download_button(
+            label="Download PPTX Report",
+            data=st.session_state["_pptx_bytes"],
+            file_name=st.session_state.get("_pptx_file_name", "SE_Report.pptx"),
+            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            key="_pptx_dl",
+            use_container_width=True,
+        )
