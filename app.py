@@ -727,21 +727,17 @@ def _build_pptx_data(tc_name: str) -> dict:
 
 def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     """Write pptx_data as JSON, call node generate_tc_pptx.js, return path or None."""
-    import json, subprocess, shutil
-    node = shutil.which('node')
-    if not node:
-        # Streamlit may run with a stripped PATH; probe common install locations
-        for candidate in [
-            '/opt/node22/bin/node', '/opt/node20/bin/node', '/opt/node18/bin/node',
-            '/usr/local/bin/node', '/usr/bin/node',
-            os.path.expanduser('~/.nvm/versions/node/*/bin/node'),
-        ]:
-            import glob
-            matches = glob.glob(candidate)
-            hit = matches[0] if matches else (candidate if os.path.isfile(candidate) else None)
-            if hit and os.access(hit, os.X_OK):
-                node = hit
-                break
+    import json, subprocess, shutil, glob as _glob
+    # Build an extended PATH that includes common Node.js install locations so
+    # shutil.which works even when Streamlit inherits a stripped PATH.
+    extra_dirs = [
+        '/opt/node22/bin', '/opt/node20/bin', '/opt/node18/bin',
+        '/usr/local/bin', '/usr/bin',
+    ]
+    # Also pick up any nvm-managed versions
+    extra_dirs += _glob.glob(os.path.expanduser('~/.nvm/versions/node/*/bin'))
+    extended_path = os.pathsep.join(extra_dirs + [os.environ.get('PATH', '')])
+    node = shutil.which('node', path=extended_path)
     if not node:
         st.warning("PPTX unavailable — Node.js not found. Install Node.js to enable PPTX export.")
         return None
@@ -755,12 +751,13 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     node_modules = os.path.join(script_dir, 'node_modules', 'pptxgenjs')
     pkg_json = os.path.join(script_dir, 'package.json')
     if not os.path.isdir(node_modules) and os.path.exists(pkg_json):
-        npm = shutil.which('npm')
+        npm = shutil.which('npm', path=extended_path)
         if npm:
             with st.spinner("Installing PPTX dependencies (first run only)..."):
                 install = subprocess.run(
                     [npm, 'install', '--prefix', script_dir],
                     capture_output=True, text=True, timeout=120,
+                    env={**os.environ, 'PATH': extended_path},
                 )
             if install.returncode != 0:
                 st.warning(f"npm install failed: {install.stderr[:300]}")
