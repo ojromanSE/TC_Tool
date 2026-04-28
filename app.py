@@ -730,6 +730,19 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     import json, subprocess, shutil
     node = shutil.which('node')
     if not node:
+        # Streamlit may run with a stripped PATH; probe common install locations
+        for candidate in [
+            '/opt/node22/bin/node', '/opt/node20/bin/node', '/opt/node18/bin/node',
+            '/usr/local/bin/node', '/usr/bin/node',
+            os.path.expanduser('~/.nvm/versions/node/*/bin/node'),
+        ]:
+            import glob
+            matches = glob.glob(candidate)
+            hit = matches[0] if matches else (candidate if os.path.isfile(candidate) else None)
+            if hit and os.access(hit, os.X_OK):
+                node = hit
+                break
+    if not node:
         st.warning("PPTX unavailable — Node.js not found. Install Node.js to enable PPTX export.")
         return None
     script_dir = os.path.dirname(os.path.abspath(__file__))
