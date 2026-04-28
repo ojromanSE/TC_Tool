@@ -730,10 +730,28 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     import json, subprocess, shutil
     node = shutil.which('node')
     if not node:
+        st.warning("PPTX unavailable — Node.js not found. Install Node.js to enable PPTX export.")
         return None
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'generate_tc_pptx.js')
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(script_dir, 'generate_tc_pptx.js')
     if not os.path.exists(script):
+        st.warning("PPTX unavailable — generate_tc_pptx.js not found.")
         return None
+
+    # Auto-install pptxgenjs if node_modules is missing
+    node_modules = os.path.join(script_dir, 'node_modules', 'pptxgenjs')
+    pkg_json = os.path.join(script_dir, 'package.json')
+    if not os.path.isdir(node_modules) and os.path.exists(pkg_json):
+        npm = shutil.which('npm')
+        if npm:
+            with st.spinner("Installing PPTX dependencies (first run only)..."):
+                install = subprocess.run(
+                    [npm, 'install', '--prefix', script_dir],
+                    capture_output=True, text=True, timeout=120,
+                )
+            if install.returncode != 0:
+                st.warning(f"npm install failed: {install.stderr[:300]}")
+                return None
 
     safe = "".join(c if c.isalnum() or c in ' _-' else '_' for c in pptx_data['wellMeta']['wellName'])
     date = pptx_data['wellMeta']['generatedDate']
@@ -746,7 +764,7 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
         result = subprocess.run(
             [node, script, json_path, out_path],
             capture_output=True, text=True, timeout=60,
-            cwd=os.path.dirname(script),
+            cwd=script_dir,
         )
         if result.returncode != 0:
             st.warning(f"PPTX generation error: {result.stderr[:400]}")
