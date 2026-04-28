@@ -57,10 +57,12 @@ mkdir -p "$INSTALL_DIR"
 
 # ── 4. Copy application files ───────────────────────────────
 info "Copying application files..."
-cp -r "$SCRIPT_DIR/app.py"          "$INSTALL_DIR/"
-cp -r "$SCRIPT_DIR/core.py"         "$INSTALL_DIR/"
-cp -r "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
-cp -r "$SCRIPT_DIR/__init__.py"     "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/app.py"               "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/core.py"              "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/requirements.txt"     "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/__init__.py"          "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/generate_tc_pptx.js" "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/package.json"         "$INSTALL_DIR/"
 mkdir -p "$INSTALL_DIR/static"
 [[ -f "$SCRIPT_DIR/static/logo.png" ]] && cp "$SCRIPT_DIR/static/logo.png" "$INSTALL_DIR/static/"
 ok "Files copied."
@@ -78,11 +80,20 @@ fi
 VENV_PYTHON="${VENV_DIR}/bin/python"
 VENV_PIP="${VENV_DIR}/bin/pip"
 
-# ── 6. Install dependencies ─────────────────────────────────
-info "Installing dependencies (this may take a minute)..."
+# ── 6. Install Python dependencies ──────────────────────────
+info "Installing Python dependencies (this may take a minute)..."
 "$VENV_PIP" install --quiet --upgrade pip
 "$VENV_PIP" install --quiet -r "${INSTALL_DIR}/requirements.txt"
-ok "Dependencies installed."
+ok "Python dependencies installed."
+
+# ── 6b. Install Node.js dependencies (PPTX export) ──────────
+if command -v npm &>/dev/null; then
+    info "Installing Node.js dependencies for PPTX export..."
+    npm install --prefix "$INSTALL_DIR" --silent
+    ok "Node.js dependencies installed."
+else
+    warn "npm not found — PPTX export will be unavailable. Install Node.js to enable it."
+fi
 
 # ── 7. Create launcher script ───────────────────────────────
 mkdir -p "$BIN_DIR"
