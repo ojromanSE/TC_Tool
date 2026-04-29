@@ -238,31 +238,42 @@ def modified_arps(qi: float, b: float, di: float, d_lim: float, t: np.ndarray) -
     """
     Modified Arps with terminal exponential decline (Robertson 1988 / SPE-78695).
 
-    When the instantaneous nominal decline rate falls to d_lim the model
-    switches from hyperbolic to exponential, preventing the long tail that
-    causes EUR over-estimation in unconventional wells.
-
-    Switch time:  t_sw = (di/d_lim - 1) / (b * di)
-    Switch rate:  q_sw = qi / (1 + b*di*t_sw)^(1/b)
-    After switch: q(t) = q_sw * exp(-d_lim * (t - t_sw))
+    Hyperbolic phase transitions to exponential at the switch time where the
+    instantaneous nominal decline D(t) = d_lim (~5 %/yr), preventing the long
+    tail that causes EUR over-estimation in unconventional wells.
     """
     t = np.asarray(t, dtype=float)
-
-    # Degenerate case — preserve legacy harmonic behaviour
     if b <= 0:
         return qi / (1.0 + di * t)
-
-    # Initial decline already at or below terminal: pure exponential
     if di <= d_lim:
         return qi * np.exp(-d_lim * t)
-
-    # Switch time where D_nom(t_sw) = d_lim
     t_sw = (di / d_lim - 1.0) / (b * di)
     q_sw = qi / ((1.0 + b * di * t_sw) ** (1.0 / b))
-
     q_hyp = qi / ((1.0 + b * di * t) ** (1.0 / b))
     q_exp = q_sw * np.exp(-d_lim * (t - t_sw))
     return np.where(t <= t_sw, q_hyp, q_exp)
+
+
+def sepd(qi: float, tau: float, n: float, t: np.ndarray) -> np.ndarray:
+    """Stretched Exponential Production Decline (Valkó 2009, SPE-116731).
+
+    q(t) = qi * exp(-(t/τ)^n)   where 0 < n ≤ 1, τ > 0.
+    Captures transient linear/bilinear flow regimes common in tight reservoirs.
+    """
+    t = np.asarray(t, dtype=float)
+    return qi * np.exp(-np.power(np.maximum(t, 0.0) / tau, n))
+
+
+def duong(qi: float, a: float, m: float, t: np.ndarray) -> np.ndarray:
+    """Duong (2011, SPE-137748) rate-time model for fracture-dominated flow.
+
+    q(t) = qi * t^{-m} * exp(a/(1-m) * (t^{1-m} - 1)),  t 1-based.
+    Derived from the power-law relationship between rate-cumulative and time;
+    well-suited to early transient fracture flow in unconventional wells.
+    """
+    t = np.asarray(t, dtype=float) + 1.0   # 1-based: q(t=0 production) = qi
+    return (qi * np.power(t, -m)
+            * np.exp((a / (1.0 - m)) * (np.power(t, 1.0 - m) - 1.0)))
 
 
 def robust_loss(params: np.ndarray, t: np.ndarray, y: np.ndarray,
@@ -271,21 +282,44 @@ def robust_loss(params: np.ndarray, t: np.ndarray, y: np.ndarray,
     return huber(delta, modified_arps(qi, b, di, d_lim, t) - y).mean()
 
 
+def _log_mse(y_pred: np.ndarray, y_obs: np.ndarray) -> float:
+    """Log-space MSE — appropriate for multiplicative DCA errors."""
+    return float(np.mean(
+        (np.log(np.clip(y_pred, 1e-6, None)) - np.log(np.clip(y_obs, 1e-6, None))) ** 2
+    ))
+
+
+def _bic(y_obs: np.ndarray, y_pred: np.ndarray, k: int) -> float:
+    """Bayesian Information Criterion in log-rate space.  Lower = better fit."""
+    n = len(y_obs)
+    rss = np.sum(
+        (np.log(np.clip(y_obs, 1e-6, None)) - np.log(np.clip(y_pred, 1e-6, None))) ** 2
+    )
+    sigma2 = max(rss / n, 1e-30)
+    return n * np.log(sigma2) + k * np.log(max(n, 2))
+
+
+def _fit_model(loss_fn, x0_list: list, bounds: list, args: tuple = ()) -> Tuple[np.ndarray, float]:
+    """Multi-start L-BFGS-B: tries each starting point, returns (best_params, best_loss)."""
+    best_x, best_f = None, np.inf
+    for x0 in x0_list:
+        try:
+            r = minimize(loss_fn, x0=x0, args=args, bounds=bounds, method='L-BFGS-B',
+                         options={'maxiter': 300, 'ftol': 1e-14, 'gtol': 1e-8})
+            if np.isfinite(r.fun) and r.fun < best_f:
+                best_f, best_x = r.fun, r.x.copy()
+        except Exception:
+            pass
+    return best_x, best_f
+
+
 def _smooth(x, w=3):
     s = pd.Series(x, dtype=float)
     return s.rolling(window=w, center=True, min_periods=1).mean().values
 
 
 def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegressor]:
-    """
-    Train RF model for qi warm-start prediction.
-
-    Uses per-well PEAK production as the target (a proper proxy for initial
-    rate qi) instead of the mean.  Estimator count reduced to 60 and n_jobs=-1
-    so training is faster and uses all available cores.
-    b and di initial estimates are derived analytically per-well inside
-    forecast_one_well, so stub models are returned for those keys.
-    """
+    """Train RF for qi warm-start using per-well peak production as target."""
     agg_peak = (df.groupby('WellID')[['NormOil', 'NormGas', 'NormWater']]
                   .max().reset_index())
     agg_peak = agg_peak.dropna(subset=[target_col])
@@ -296,12 +330,10 @@ def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegres
         dummy.fit([[0, 0, 0]], [0])
         return {'qi': dummy, 'b': dummy, 'di': dummy}
 
-    # qi: trained on peak production per well — best proxy for initial rate
     qi_model = RandomForestRegressor(
         n_estimators=60, random_state=42, n_jobs=-1
     ).fit(X, agg_peak[target_col].values)
 
-    # b and di: single-node stubs; actual estimates computed analytically below
     stub = RandomForestRegressor(n_estimators=1, random_state=42)
     stub.fit([[0], [1]], [1.0, 1.0])
     return {'qi': qi_model, 'b': stub, 'di': stub}
@@ -318,78 +350,179 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     y_hist = wd[col].values.astype(float)
     y_s = _smooth(y_hist, 3)
 
-    peak_qi = float(np.nanmax(y_s)) if len(y_s) > 0 else 1.0
-    peak_qi = min(peak_qi, 152000.0)
+    peak_qi = float(np.nanmax(y_s)) if y_s.size > 0 else 1.0
+    peak_qi = min(peak_qi, 152_000.0)
 
-    # ---- Analytical initial parameter estimation ----
-    # qi: RF prediction anchored to peak of smoothed history
+    # ---- Shut-in filtering ----
+    # Exclude months at <1 % of peak (workovers, curtailments) from curve fit.
+    # Contiguous low-rate runs (≥3 months) are treated as shut-ins regardless of
+    # the absolute level; isolated single-month dips are kept.
+    shutin_thresh = max(0.01 * peak_qi, 1.0)
+    low = y_s <= shutin_thresh
+    # Mark contiguous shut-in runs of ≥3 consecutive months
+    in_shutin = np.zeros(len(y_s), dtype=bool)
+    run = 0
+    for i, lo in enumerate(low):
+        run = (run + 1) if lo else 0
+        if run >= 3:
+            in_shutin[max(0, i - run + 1):i + 1] = True
+    active = ~in_shutin
+    t_fit = t_hist[active] if active.sum() >= 4 else t_hist
+    y_fit = y_s[active]   if active.sum() >= 4 else y_s
+
+    # ---- qi: RF warm-start ----
     feats = np.array([[wd['NormOil'].mean(), wd['NormGas'].mean(), wd['NormWater'].mean()]],
                      dtype=float)
     try:
-        qi0 = float(min(peak_qi, max(models['qi'].predict(feats)[0], 0.01)))
+        qi0 = float(np.clip(models['qi'].predict(feats)[0], 0.01, peak_qi))
     except Exception:
         qi0 = peak_qi
 
-    # di: log-linear regression on the declining portion after the peak month
-    peak_idx = int(np.nanargmax(y_s)) if len(y_s) > 0 else 0
-    decline_portion = y_s[peak_idx:]
-    t_decline = np.arange(len(decline_portion), dtype=float)
-    if len(decline_portion) >= 3:
-        pos_mask = decline_portion > 0
-        if pos_mask.sum() >= 3:
-            slope, *_ = stats.linregress(t_decline[pos_mask],
-                                         np.log(decline_portion[pos_mask]))
-            di0 = float(min(max(-slope, d_lim), 1.0))
+    # ---- b0: analytical estimate from curvature of 1/D vs t (whole decline, SPE approach) ----
+    # From Arps theory: d(1/D)/dt = b, so a linear regression of 1/D vs t gives b directly.
+    peak_idx = int(np.nanargmax(y_s)) if y_s.size > 0 else 0
+    decline_y = y_s[peak_idx:]
+    if len(decline_y) >= 5:
+        log_q = np.log(np.clip(decline_y, 1e-9, None))
+        d_nom = np.clip(-np.gradient(log_q), 1e-9, None)
+        inv_d = _smooth(1.0 / d_nom, 3)
+        t_d = np.arange(len(inv_d), dtype=float)
+        b_slope, *_ = stats.linregress(t_d, inv_d)
+        b0 = float(np.clip(b_slope, b_low, b_high))
+    else:
+        b0 = 0.5 * (b_low + b_high)
+
+    # ---- di0: estimated from the LATEST decline trend ----
+    # Using the most-recent portion of production anchors the forecast to current
+    # well behaviour rather than early-time transient flow (ref. SPE-78695).
+    if len(decline_y) >= 4:
+        tail_n = max(6, len(decline_y) // 3)
+        tail = decline_y[-tail_n:] if len(decline_y) > tail_n else decline_y
+        t_tail = np.arange(len(tail), dtype=float)
+        pos = tail > 0
+        if pos.sum() >= 3:
+            slope, *_ = stats.linregress(t_tail[pos], np.log(tail[pos]))
+            di0 = float(np.clip(-slope, d_lim, 1.0))
         else:
             di0 = 0.05
     else:
         di0 = 0.05
 
-    # b: start at midpoint of allowed bounds
-    b0 = 0.5 * (b_low + b_high)
+    # ================================================================
+    # Fit 1 — Modified Arps (Robertson 1988 / SPE-78695)
+    # 3 params: qi, b, di
+    # ================================================================
+    def _arps_obj(p):
+        return _log_mse(modified_arps(p[0], p[1], p[2], d_lim, t_fit), y_fit)
 
-    # ---- Shut-in / zero-production filtering for optimization ----
-    # Months below 1% of peak (workovers, curtailments) distort the fit;
-    # exclude them from the objective but keep them in EUR history totals.
-    shutin_thresh = max(0.01 * peak_qi, 1.0)
-    active = y_s > shutin_thresh
-    t_fit = t_hist[active] if active.sum() >= 3 else t_hist
-    y_fit = y_s[active]   if active.sum() >= 3 else y_s
+    arps_bounds = [(0.01, peak_qi * 1.5), (b_low, b_high), (d_lim, 1.0)]
+    arps_params, _ = _fit_model(
+        _arps_obj, [], arps_bounds,   # multi-start list built below
+    )
+    # Build proper multi-start list and re-run
+    arps_starts = [
+        [qi0, b0,        di0],
+        [qi0, b_low,     di0],
+        [qi0, b_high,    min(di0 * 2, 0.5)],
+        [peak_qi, b0,    max(di0 * 0.5, d_lim)],
+    ]
+    arps_params, _ = _fit_model(_arps_obj, arps_starts, arps_bounds)
+    if arps_params is None:
+        arps_params = np.array([qi0, b0, di0])
+    qi_a, b_a, di_a = float(arps_params[0]), float(arps_params[1]), float(arps_params[2])
+    # Guard against degenerate low-di (too few months to constrain decline)
+    if di_a < d_lim * 3:
+        di_a = max(di0, 0.03)
 
-    # ---- Bounded optimization (Modified Arps objective) ----
-    # Lower bound on di = d_lim ensures optimizer stays in the physical regime
-    # where the hyperbolic phase applies before the terminal switch.
-    bounds = [(0.01, peak_qi * 1.5), (b_low, b_high), (d_lim, 1.0)]
-    try:
-        res = minimize(robust_loss, x0=[qi0, b0, di0],
-                       args=(t_fit, y_fit, d_lim),
-                       bounds=bounds, method='L-BFGS-B')
-        qi, b, di = map(float, res.x)
-    except Exception:
-        qi, b, di = qi0, b0, di0
+    # ================================================================
+    # Fit 2 — SEPD (Valkó 2009, SPE-116731)
+    # 3 params: qi, τ, n
+    # ================================================================
+    tau0 = max(1.0, 1.0 / max(di0, 1e-6))
 
-    # If the optimizer hit the d_lim lower bound (degenerate: not enough history
-    # to constrain decline), fall back to the analytical di0 with a minimum floor.
-    # This prevents EUR ≈ qi/d_lim blow-up on wells with very few months of data.
-    if di < d_lim * 3:
-        di = max(di0, 0.03)
+    def _sepd_obj(p):
+        return _log_mse(sepd(p[0], p[1], p[2], t_fit), y_fit)
 
-    # ---- Fit history with Modified Arps ----
-    fit_hist = modified_arps(qi, b, di, d_lim, t_hist)
+    sepd_bounds = [(0.01, peak_qi * 1.5), (0.5, 500.0), (0.05, 1.0)]
+    sepd_starts = [
+        [qi0, tau0,       0.5],
+        [qi0, tau0 * 2,   0.3],
+        [qi0, tau0 * 0.5, 0.7],
+        [peak_qi, tau0,   0.4],
+    ]
+    sepd_params, _ = _fit_model(_sepd_obj, sepd_starts, sepd_bounds)
+    if sepd_params is None:
+        sepd_params = np.array([qi0, tau0, 0.5])
+    qi_s, tau_s, n_s = float(sepd_params[0]), float(sepd_params[1]), float(sepd_params[2])
 
-    # ---- Vectorised forecast (replaces per-month Python loop) ----
+    # ================================================================
+    # Fit 3 — Duong (2011, SPE-137748)
+    # 3 params: qi, a, m
+    # ================================================================
+    def _duong_obj(p):
+        return _log_mse(duong(p[0], p[1], p[2], t_fit), y_fit)
+
+    duong_bounds = [(0.01, peak_qi * 1.5), (0.001, 10.0), (1.01, 3.0)]
+    duong_starts = [
+        [qi0, 1.0, 1.5],
+        [qi0, 0.5, 1.2],
+        [qi0, 2.0, 1.8],
+        [peak_qi, 1.0, 1.5],
+    ]
+    duong_params, _ = _fit_model(_duong_obj, duong_starts, duong_bounds)
+    if duong_params is None:
+        duong_params = np.array([qi0, 1.0, 1.5])
+    qi_d, a_d, m_d = float(duong_params[0]), float(duong_params[1]), float(duong_params[2])
+
+    # ================================================================
+    # Model selection by BIC (lower = better)
+    # All three models have k=3 parameters so BIC reduces to log(RSS/n).
+    # ================================================================
+    pred_a = modified_arps(qi_a, b_a, di_a, d_lim, t_fit)
+    pred_s = sepd(qi_s, tau_s, n_s, t_fit)
+    pred_d = duong(qi_d, a_d, m_d, t_fit)
+
+    bics = {
+        'Modified Arps': _bic(y_fit, pred_a, 3),
+        'SEPD':          _bic(y_fit, pred_s, 3),
+        'Duong':         _bic(y_fit, pred_d, 3),
+    }
+    best_model = min(bics, key=bics.get)
+
+    # ================================================================
+    # Generate fit_hist and forecast using the winning model.
+    # Arps qi/b/di are always reported for b-factor analytics.
+    # ================================================================
     t_fcst = np.arange(len(t_hist), len(t_hist) + max_months, dtype=float)
-    f_vals_all = modified_arps(qi, b, di, d_lim, t_fcst)
+
+    if best_model == 'Modified Arps':
+        fit_hist   = modified_arps(qi_a, b_a, di_a, d_lim, t_hist)
+        f_vals_all = modified_arps(qi_a, b_a, di_a, d_lim, t_fcst)
+    elif best_model == 'SEPD':
+        fit_hist   = sepd(qi_s, tau_s, n_s, t_hist)
+        f_vals_all = sepd(qi_s, tau_s, n_s, t_fcst)
+    else:   # Duong
+        fit_hist   = duong(qi_d, a_d, m_d, t_hist)
+        f_vals_all = duong(qi_d, a_d, m_d, t_fcst)
+
     valid = f_vals_all >= 1e-6
     f_m = t_fcst[valid].astype(int)
     f_v = f_vals_all[valid]
 
     eur_hist = float(y_hist.sum())
     eur_fcst = float(np.sum(f_v))
-    return dict(qi=qi, b=b, di=di, d_lim=d_lim,
-                t_hist=t_hist, hist=y_hist,
-                fit_hist=fit_hist, f_months=f_m, f_vals=f_v,
-                EUR_total=eur_hist + eur_fcst, EUR_fcst=eur_fcst)
+
+    return dict(
+        # Arps parameters (always present for b-factor analytics / type curves)
+        qi=qi_a, b=b_a, di=di_a, d_lim=d_lim,
+        # Best-fit model metadata
+        model=best_model,
+        bics=bics,
+        # Histories and forecasts from the winning model
+        t_hist=t_hist, hist=y_hist,
+        fit_hist=fit_hist, f_months=f_m, f_vals=f_v,
+        EUR_total=eur_hist + eur_fcst, EUR_fcst=eur_fcst,
+    )
 
 
 @dataclass
@@ -479,6 +612,7 @@ def forecast_all(merged: pd.DataFrame,
             'LateralLength':      hdr.get('LateralLength'),
             'CompletionDate':     hdr.get('CompletionDate'),
             'FirstProdDate':      hdr.get('FirstProdDate'),
+            'Model':              fc.get('model', 'Modified Arps'),
             'qi (per day)':       round(qi_day, 0),
             'b':                  round(fc['b'], 3),
             'di (per month)':     round(fc['di'], 4),
@@ -626,7 +760,8 @@ def plot_one_well(wd: pd.DataFrame, fc: dict, commodity: str):
     if len(f_t) > 0:
         ax.plot(f_t, f_vals, label="Forecast", linestyle="--", linewidth=2, color=color)
 
-    ax.set_title(f"{well} | ID: {api} | {commodity.capitalize()}")
+    model_label = fc.get('model', 'Modified Arps')
+    ax.set_title(f"{well} | ID: {api} | {commodity.capitalize()} [{model_label}]")
     ax.set_xlabel("Month of Production")
     ax.set_ylabel(f"Monthly {commodity} {unit}")
     ax.set_yscale('log')
