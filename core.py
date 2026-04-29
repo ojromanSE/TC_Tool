@@ -170,7 +170,12 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
 
     pr['MonthYear'] = pr['ReportDate'].dt.to_period('M')
 
-    pr = pr.dropna(subset=['TotalOil','TotalGas','TotalWater'])
+    # Fill missing phase production with 0 — a well with no gas should report
+    # 0 bbl, not be dropped. Only remove rows where every phase is NaN
+    # (i.e. the row carries no production information at all).
+    for c in ['TotalOil', 'TotalGas', 'TotalWater']:
+        pr[c] = pd.to_numeric(pr[c], errors='coerce').fillna(0)
+    pr = pr[~((pr['TotalOil'] == 0) & (pr['TotalGas'] == 0) & (pr['TotalWater'] == 0))]
 
     # Sort and Deduplicate
     pr = pr.sort_values(['WellID','MonthYear','TotalOil','TotalGas','TotalWater'],
@@ -213,12 +218,11 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
         merged['NormGas']   = merged['TotalGas']*s
         merged['NormWater'] = merged['TotalWater']*s
     else:
-        merged['NormOil']   = merged['TotalOil']
-        merged['NormGas']   = merged['TotalGas']
-        merged['NormWater'] = merged['TotalWater']
+        merged['NormOil']   = pd.to_numeric(merged['TotalOil'],   errors='coerce').fillna(0)
+        merged['NormGas']   = pd.to_numeric(merged['TotalGas'],   errors='coerce').fillna(0)
+        merged['NormWater'] = pd.to_numeric(merged['TotalWater'],  errors='coerce').fillna(0)
 
-    merged = merged.replace([np.inf, -np.inf], np.finfo(np.float64).max)
-    merged = merged.dropna(subset=['NormOil','NormGas','NormWater'])
+    merged = merged.replace([np.inf, -np.inf], 0)
     return merged
 
 # ---------------- Models ----------------
