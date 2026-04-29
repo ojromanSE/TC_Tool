@@ -144,7 +144,6 @@ def _make_outlier_fig(oneline_df, eur_col, fluid_name):
     n_flagged = int(high_mask.sum())
     median_eur = float(df['_eur'].median())
     return fig, upper_fence, n_active, n_removed, n_flagged, median_eur, unit
-    return tmp.name
 
 # ================= Upload =================
 st.header("Upload & Prepare Data")
@@ -404,6 +403,110 @@ st.markdown("---")
 fluid_block("Gas", "EUR (MMcf)", "NormGas")
 st.markdown("---")
 fluid_block("Water", "EUR (Mbbl water)", "NormWater")
+st.markdown("---")
+
+# ================= Outlier Detection =================
+st.header("Outlier Detection — EUR vs Lateral Length")
+
+_out_fluid_cfg = [
+    ("Oil",   "Oil_oneline",   "EUR (Mbbl)"),
+    ("Gas",   "Gas_oneline",   "EUR (MMcf)"),
+    ("Water", "Water_oneline", "EUR (Mbbl water)"),
+]
+
+def _outlier_section(fluid: str, on_key: str, eur_col: str):
+    if on_key not in st.session_state:
+        st.info(f"Run {fluid} forecast first.")
+        return
+
+    oneline = st.session_state[on_key]
+    result  = _make_outlier_fig(oneline, eur_col, fluid)
+    if result is None:
+        st.info(f"Not enough data for {fluid} outlier detection (need ≥ 3 wells with lateral length).")
+        return
+
+    fig, upper_fence, n_active, n_removed, n_flagged, median_eur, unit = result
+    st.pyplot(fig)
+    plt.close(fig)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Active wells",  n_active)
+    m2.metric("Removed wells", n_removed)
+    m3.metric("Median EUR",    f"{median_eur:,.0f} {unit}")
+    m4.metric("Upper fence",   f"{upper_fence:,.0f} {unit}")
+    m5.metric("Flagged",       f"{n_flagged} wells")
+
+    # Recompute fences to identify individual outlier wells
+    df = oneline.copy()
+    df['_eur'] = pd.to_numeric(df[eur_col], errors='coerce')
+    if 'LateralLength' in df.columns:
+        df['_lat'] = pd.to_numeric(df['LateralLength'], errors='coerce')
+        df = df.dropna(subset=['_eur', '_lat'])
+    else:
+        df = df.dropna(subset=['_eur'])
+    q1, q3      = df['_eur'].quantile(0.25), df['_eur'].quantile(0.75)
+    iqr         = q3 - q1
+    upper_f     = q3 + 1.5 * iqr
+    lower_f     = q1 - 1.5 * iqr
+    flagged_df  = df[(df['_eur'] > upper_f) | (df['_eur'] < lower_f)].copy()
+    flagged_df['Outlier Type'] = flagged_df['_eur'].apply(
+        lambda v: '⬆ High EUR' if v > upper_f else '⬇ Low EUR'
+    )
+
+    sel_key = f"{fluid}_tc_selection"
+    all_ids = set(oneline['WellID'].astype(str).tolist())
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = all_ids.copy()
+
+    if flagged_df.empty:
+        st.success(f"No outliers detected for {fluid}.")
+        return
+
+    st.markdown(f"**{len(flagged_df)} outlier(s) detected.** Check wells to exclude from the Type Curve, then click **Update TC**.")
+
+    show_cols = [c for c in ['WellName', 'API10', 'LateralLength', eur_col] if c in flagged_df.columns]
+    display   = flagged_df[['WellID', 'Outlier Type'] + show_cols].reset_index(drop=True)
+    current_excluded = all_ids - st.session_state[sel_key]
+    display.insert(0, "Exclude", display['WellID'].astype(str).isin(current_excluded).tolist())
+
+    col_cfg = {"Exclude": st.column_config.CheckboxColumn("Exclude", default=False)}
+    for c in ['Outlier Type'] + show_cols:
+        col_cfg[c] = st.column_config.TextColumn(c, disabled=True)
+
+    edited = st.data_editor(
+        display.drop(columns=['WellID']),
+        column_config=col_cfg,
+        hide_index=True,
+        use_container_width=True,
+        key=f"{fluid}_outlier_editor",
+    )
+
+    excl_mask    = edited['Exclude'].values.astype(bool)
+    excl_well_ids = set(display.loc[excl_mask, 'WellID'].astype(str).tolist())
+    n_excl        = int(excl_mask.sum())
+
+    btn_col, reset_col = st.columns([2, 1])
+    with btn_col:
+        if st.button(
+            f"Update {fluid} Type Curve — remove {n_excl} outlier(s)" if n_excl else f"Select wells above to exclude",
+            disabled=(n_excl == 0),
+            type="primary",
+            key=f"{fluid}_apply_outlier",
+        ):
+            st.session_state[sel_key] = all_ids - excl_well_ids
+            st.success(f"{fluid}: {n_excl} well(s) removed from Type Curve. Scroll down to see the updated TC.")
+            st.rerun()
+    with reset_col:
+        if st.button(f"Reset {fluid} selection", key=f"{fluid}_reset_outlier"):
+            st.session_state[sel_key] = all_ids.copy()
+            st.success(f"{fluid} Type Curve restored to all {len(all_ids)} wells.")
+            st.rerun()
+
+_out_tabs = st.tabs(["Oil", "Gas", "Water"])
+with _out_tabs[0]: _outlier_section("Oil",   "Oil_oneline",   "EUR (Mbbl)")
+with _out_tabs[1]: _outlier_section("Gas",   "Gas_oneline",   "EUR (MMcf)")
+with _out_tabs[2]: _outlier_section("Water", "Water_oneline", "EUR (Mbbl water)")
+
 st.markdown("---")
 
 # ================= Type Wells =================
