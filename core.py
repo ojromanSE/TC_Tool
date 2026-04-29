@@ -348,56 +348,49 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     wd = wd.sort_values('MonthYear').copy()
     t_hist = np.arange(len(wd), dtype=float)
     y_hist = wd[col].values.astype(float)
-    y_s = _smooth(y_hist, 3)
+    y_s    = _smooth(y_hist, 3)
 
-    peak_qi = float(np.nanmax(y_s)) if y_s.size > 0 else 1.0
-    peak_qi = min(peak_qi, 152_000.0)
+    # ---- Find peak and anchor qi there ----
+    # The curve MUST pass through the actual peak production month.
+    # Fitting from t=0 (first month) lets the optimizer sacrifice the early
+    # high-rate data to better fit the longer tail — causing the visual gap.
+    peak_idx = int(np.nanargmax(y_s)) if y_s.size > 0 else 0
+    qi_peak  = float(max(y_hist[peak_idx], y_s[peak_idx]))   # raw peak, never lower than smoothed
+    qi_peak  = min(max(qi_peak, 1.0), 152_000.0)
 
-    # ---- Shut-in filtering ----
-    # Exclude months at <1 % of peak (workovers, curtailments) from curve fit.
-    # Contiguous low-rate runs (≥3 months) are treated as shut-ins regardless of
-    # the absolute level; isolated single-month dips are kept.
-    shutin_thresh = max(0.01 * peak_qi, 1.0)
-    low = y_s <= shutin_thresh
-    # Mark contiguous shut-in runs of ≥3 consecutive months
-    in_shutin = np.zeros(len(y_s), dtype=bool)
+    # ---- Post-peak decline data: t=0 is defined at the peak month ----
+    y_decline = y_s[peak_idx:]
+    t_decline = np.arange(len(y_decline), dtype=float)
+
+    # ---- Shut-in filtering on the decline portion ----
+    # Contiguous runs of ≥3 months at <2 % of peak are excluded from the fit.
+    shutin_thresh = max(0.02 * qi_peak, 1.0)
+    low = y_decline <= shutin_thresh
+    in_shutin = np.zeros(len(y_decline), dtype=bool)
     run = 0
     for i, lo in enumerate(low):
         run = (run + 1) if lo else 0
         if run >= 3:
             in_shutin[max(0, i - run + 1):i + 1] = True
     active = ~in_shutin
-    t_fit = t_hist[active] if active.sum() >= 4 else t_hist
-    y_fit = y_s[active]   if active.sum() >= 4 else y_s
+    t_fit = t_decline[active] if active.sum() >= 4 else t_decline
+    y_fit = y_decline[active] if active.sum() >= 4 else y_decline
 
-    # ---- qi: RF warm-start ----
-    feats = np.array([[wd['NormOil'].mean(), wd['NormGas'].mean(), wd['NormWater'].mean()]],
-                     dtype=float)
-    try:
-        qi0 = float(np.clip(models['qi'].predict(feats)[0], 0.01, peak_qi))
-    except Exception:
-        qi0 = peak_qi
-
-    # ---- b0: analytical estimate from curvature of 1/D vs t (whole decline, SPE approach) ----
-    # From Arps theory: d(1/D)/dt = b, so a linear regression of 1/D vs t gives b directly.
-    peak_idx = int(np.nanargmax(y_s)) if y_s.size > 0 else 0
-    decline_y = y_s[peak_idx:]
-    if len(decline_y) >= 5:
-        log_q = np.log(np.clip(decline_y, 1e-9, None))
+    # ---- b0: from curvature of 1/D vs t (Arps analytical: d(1/D)/dt = b) ----
+    if len(y_decline) >= 5:
+        log_q = np.log(np.clip(y_decline, 1e-9, None))
         d_nom = np.clip(-np.gradient(log_q), 1e-9, None)
         inv_d = _smooth(1.0 / d_nom, 3)
-        t_d = np.arange(len(inv_d), dtype=float)
-        b_slope, *_ = stats.linregress(t_d, inv_d)
+        b_slope, *_ = stats.linregress(np.arange(len(inv_d), dtype=float), inv_d)
         b0 = float(np.clip(b_slope, b_low, b_high))
     else:
         b0 = 0.5 * (b_low + b_high)
 
-    # ---- di0: estimated from the LATEST decline trend ----
-    # Using the most-recent portion of production anchors the forecast to current
-    # well behaviour rather than early-time transient flow (ref. SPE-78695).
-    if len(decline_y) >= 4:
-        tail_n = max(6, len(decline_y) // 3)
-        tail = decline_y[-tail_n:] if len(decline_y) > tail_n else decline_y
+    # ---- di0: from the LATEST decline trend ----
+    # Anchor the forecast to current behaviour, not early transient flow (SPE-78695).
+    if len(y_decline) >= 4:
+        tail_n = max(6, len(y_decline) // 3)
+        tail = y_decline[-tail_n:] if len(y_decline) > tail_n else y_decline
         t_tail = np.arange(len(tail), dtype=float)
         pos = tail > 0
         if pos.sum() >= 3:
@@ -408,117 +401,110 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     else:
         di0 = 0.05
 
-    # ================================================================
-    # Fit 1 — Modified Arps (Robertson 1988 / SPE-78695)
-    # 3 params: qi, b, di
-    # ================================================================
-    def _arps_obj(p):
-        return _log_mse(modified_arps(p[0], p[1], p[2], d_lim, t_fit), y_fit)
+    tau0 = max(1.0, 1.0 / max(di0, 1e-6))
 
-    arps_bounds = [(0.01, peak_qi * 1.5), (b_low, b_high), (d_lim, 1.0)]
-    arps_params, _ = _fit_model(
-        _arps_obj, [], arps_bounds,   # multi-start list built below
-    )
-    # Build proper multi-start list and re-run
+    # ================================================================
+    # Fit all three models on the post-peak decline data with qi FIXED
+    # to the actual peak rate.  Fixing qi (k→k-1 free params) guarantees
+    # the curve passes through the peak month and eliminates the largest
+    # source of visual misfit.  BIC uses k=2 since one param is pinned.
+    # ================================================================
+
+    # -- Modified Arps: free params = (b, di) --
+    def _arps_obj(p):
+        return _log_mse(modified_arps(qi_peak, p[0], p[1], d_lim, t_fit), y_fit)
+
     arps_starts = [
-        [qi0, b0,        di0],
-        [qi0, b_low,     di0],
-        [qi0, b_high,    min(di0 * 2, 0.5)],
-        [peak_qi, b0,    max(di0 * 0.5, d_lim)],
+        [b0,     di0],
+        [b_low,  di0],
+        [b_high, min(di0 * 2, 0.5)],
+        [b0,     max(di0 * 0.5, d_lim)],
     ]
-    arps_params, _ = _fit_model(_arps_obj, arps_starts, arps_bounds)
+    arps_params, _ = _fit_model(_arps_obj, arps_starts, [(b_low, b_high), (d_lim, 1.0)])
     if arps_params is None:
-        arps_params = np.array([qi0, b0, di0])
-    qi_a, b_a, di_a = float(arps_params[0]), float(arps_params[1]), float(arps_params[2])
-    # Guard against degenerate low-di (too few months to constrain decline)
+        arps_params = np.array([b0, di0])
+    b_a, di_a = float(arps_params[0]), float(arps_params[1])
     if di_a < d_lim * 3:
         di_a = max(di0, 0.03)
 
-    # ================================================================
-    # Fit 2 — SEPD (Valkó 2009, SPE-116731)
-    # 3 params: qi, τ, n
-    # ================================================================
-    tau0 = max(1.0, 1.0 / max(di0, 1e-6))
-
+    # -- SEPD: free params = (τ, n) --
     def _sepd_obj(p):
-        return _log_mse(sepd(p[0], p[1], p[2], t_fit), y_fit)
+        return _log_mse(sepd(qi_peak, p[0], p[1], t_fit), y_fit)
 
-    sepd_bounds = [(0.01, peak_qi * 1.5), (0.5, 500.0), (0.05, 1.0)]
     sepd_starts = [
-        [qi0, tau0,       0.5],
-        [qi0, tau0 * 2,   0.3],
-        [qi0, tau0 * 0.5, 0.7],
-        [peak_qi, tau0,   0.4],
+        [tau0,       0.5],
+        [tau0 * 2,   0.3],
+        [tau0 * 0.5, 0.7],
+        [tau0,       0.4],
     ]
-    sepd_params, _ = _fit_model(_sepd_obj, sepd_starts, sepd_bounds)
+    sepd_params, _ = _fit_model(_sepd_obj, sepd_starts, [(0.5, 500.0), (0.05, 1.0)])
     if sepd_params is None:
-        sepd_params = np.array([qi0, tau0, 0.5])
-    qi_s, tau_s, n_s = float(sepd_params[0]), float(sepd_params[1]), float(sepd_params[2])
+        sepd_params = np.array([tau0, 0.5])
+    tau_s, n_s = float(sepd_params[0]), float(sepd_params[1])
 
-    # ================================================================
-    # Fit 3 — Duong (2011, SPE-137748)
-    # 3 params: qi, a, m
-    # ================================================================
+    # -- Duong: free params = (a, m) --
     def _duong_obj(p):
-        return _log_mse(duong(p[0], p[1], p[2], t_fit), y_fit)
+        return _log_mse(duong(qi_peak, p[0], p[1], t_fit), y_fit)
 
-    duong_bounds = [(0.01, peak_qi * 1.5), (0.001, 10.0), (1.01, 3.0)]
     duong_starts = [
-        [qi0, 1.0, 1.5],
-        [qi0, 0.5, 1.2],
-        [qi0, 2.0, 1.8],
-        [peak_qi, 1.0, 1.5],
+        [1.0, 1.5],
+        [0.5, 1.2],
+        [2.0, 1.8],
+        [1.0, 2.0],
     ]
-    duong_params, _ = _fit_model(_duong_obj, duong_starts, duong_bounds)
+    duong_params, _ = _fit_model(_duong_obj, duong_starts, [(0.001, 10.0), (1.01, 3.0)])
     if duong_params is None:
-        duong_params = np.array([qi0, 1.0, 1.5])
-    qi_d, a_d, m_d = float(duong_params[0]), float(duong_params[1]), float(duong_params[2])
+        duong_params = np.array([1.0, 1.5])
+    a_d, m_d = float(duong_params[0]), float(duong_params[1])
 
     # ================================================================
-    # Model selection by BIC (lower = better)
-    # All three models have k=3 parameters so BIC reduces to log(RSS/n).
+    # Model selection by BIC (k=2 free params, lower = better)
     # ================================================================
-    pred_a = modified_arps(qi_a, b_a, di_a, d_lim, t_fit)
-    pred_s = sepd(qi_s, tau_s, n_s, t_fit)
-    pred_d = duong(qi_d, a_d, m_d, t_fit)
+    pred_a = modified_arps(qi_peak, b_a,   di_a,  d_lim, t_fit)
+    pred_s = sepd(          qi_peak, tau_s, n_s,          t_fit)
+    pred_d = duong(         qi_peak, a_d,   m_d,          t_fit)
 
     bics = {
-        'Modified Arps': _bic(y_fit, pred_a, 3),
-        'SEPD':          _bic(y_fit, pred_s, 3),
-        'Duong':         _bic(y_fit, pred_d, 3),
+        'Modified Arps': _bic(y_fit, pred_a, 2),
+        'SEPD':          _bic(y_fit, pred_s, 2),
+        'Duong':         _bic(y_fit, pred_d, 2),
     }
     best_model = min(bics, key=bics.get)
 
     # ================================================================
-    # Generate fit_hist and forecast using the winning model.
-    # Arps qi/b/di are always reported for b-factor analytics.
+    # Build fit_hist and forecast, both using peak-relative time axis.
+    #
+    # Pre-peak ramp-up: show smoothed observations (the model starts at peak).
+    # Post-peak:        use the winning model with t=0 = peak month.
+    # Forecast:         continue the same time axis past the end of history.
     # ================================================================
-    t_fcst = np.arange(len(t_hist), len(t_hist) + max_months, dtype=float)
+    n_post   = len(t_hist) - peak_idx      # months from peak to end of history (inclusive)
+    t_post   = np.arange(n_post, dtype=float)
+    t_fcst   = np.arange(n_post, n_post + max_months, dtype=float)
 
     if best_model == 'Modified Arps':
-        fit_hist   = modified_arps(qi_a, b_a, di_a, d_lim, t_hist)
-        f_vals_all = modified_arps(qi_a, b_a, di_a, d_lim, t_fcst)
+        post_fit   = modified_arps(qi_peak, b_a,   di_a,  d_lim, t_post)
+        f_vals_all = modified_arps(qi_peak, b_a,   di_a,  d_lim, t_fcst)
     elif best_model == 'SEPD':
-        fit_hist   = sepd(qi_s, tau_s, n_s, t_hist)
-        f_vals_all = sepd(qi_s, tau_s, n_s, t_fcst)
-    else:   # Duong
-        fit_hist   = duong(qi_d, a_d, m_d, t_hist)
-        f_vals_all = duong(qi_d, a_d, m_d, t_fcst)
+        post_fit   = sepd(qi_peak,  tau_s, n_s,           t_post)
+        f_vals_all = sepd(qi_peak,  tau_s, n_s,           t_fcst)
+    else:  # Duong
+        post_fit   = duong(qi_peak, a_d,   m_d,           t_post)
+        f_vals_all = duong(qi_peak, a_d,   m_d,           t_fcst)
+
+    # Concatenate: smoothed ramp-up + model-driven decline
+    fit_hist = np.concatenate([y_s[:peak_idx], post_fit])
 
     valid = f_vals_all >= 1e-6
-    f_m = t_fcst[valid].astype(int)
-    f_v = f_vals_all[valid]
+    f_m   = t_fcst[valid].astype(int)
+    f_v   = f_vals_all[valid]
 
     eur_hist = float(y_hist.sum())
     eur_fcst = float(np.sum(f_v))
 
     return dict(
-        # Arps parameters (always present for b-factor analytics / type curves)
-        qi=qi_a, b=b_a, di=di_a, d_lim=d_lim,
-        # Best-fit model metadata
-        model=best_model,
-        bics=bics,
-        # Histories and forecasts from the winning model
+        qi=qi_peak, b=b_a, di=di_a, d_lim=d_lim,
+        model=best_model, bics=bics,
         t_hist=t_hist, hist=y_hist,
         fit_hist=fit_hist, f_months=f_m, f_vals=f_v,
         EUR_total=eur_hist + eur_fcst, EUR_fcst=eur_fcst,
