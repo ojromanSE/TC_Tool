@@ -870,8 +870,31 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     date = pptx_data['wellMeta']['generatedDate']
     out_path = os.path.join(output_dir, f"SE_{safe or 'TC'}_TC_Report_{date}.pptx")
 
+    def _scrub(obj):
+        """Recursively replace nan/inf with 0 and numpy scalars with Python scalars.
+        Python's json.dump writes NaN literals for float('nan') which are not valid
+        JSON — Node.js's JSON.parse rejects them and the script crashes silently."""
+        import math
+        if isinstance(obj, float):
+            return 0.0 if not math.isfinite(obj) else obj
+        if isinstance(obj, dict):
+            return {k: _scrub(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_scrub(v) for v in obj]
+        # Coerce numpy scalar types to plain Python
+        try:
+            import numpy as _np
+            if isinstance(obj, _np.floating):
+                v = float(obj)
+                return 0.0 if not math.isfinite(v) else v
+            if isinstance(obj, _np.integer):
+                return int(obj)
+        except ImportError:
+            pass
+        return obj
+
     with tempfile.NamedTemporaryFile(delete=False, suffix='.json', mode='w') as jf:
-        json.dump(pptx_data, jf)
+        json.dump(_scrub(pptx_data), jf)
         json_path = jf.name
     try:
         result = subprocess.run(
