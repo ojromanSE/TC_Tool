@@ -831,19 +831,25 @@ def _build_pptx_data(tc_name: str) -> dict:
 def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     """Write pptx_data as JSON, call node generate_tc_pptx.js, return path or None."""
     import json, subprocess, shutil, glob as _glob
-    # Build an extended PATH that includes common Node.js install locations so
-    # shutil.which works even when Streamlit inherits a stripped PATH.
-    extra_dirs = [
-        '/opt/node22/bin', '/opt/node20/bin', '/opt/node18/bin',
-        '/usr/local/bin', '/usr/bin',
+    # Locate node: first try known absolute paths (bypasses Streamlit PATH stripping),
+    # then fall back to PATH-based discovery.
+    _node_candidates = [
+        '/opt/node22/bin/node', '/opt/node21/bin/node', '/opt/node20/bin/node',
+        '/opt/node18/bin/node', '/usr/local/bin/node', '/usr/bin/node',
     ]
-    # Also pick up any nvm-managed versions
-    extra_dirs += _glob.glob(os.path.expanduser('~/.nvm/versions/node/*/bin'))
-    extended_path = os.pathsep.join(extra_dirs + [os.environ.get('PATH', '')])
-    node = shutil.which('node', path=extended_path)
+    _node_candidates += _glob.glob(os.path.expanduser('~/.nvm/versions/node/*/bin/node'))
+    node = next((p for p in _node_candidates if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+    if not node:
+        extra_dirs = [os.path.dirname(p) for p in _node_candidates]
+        extra_dirs += [os.environ.get('PATH', '')]
+        extended_path = os.pathsep.join(extra_dirs)
+        node = shutil.which('node', path=extended_path)
     if not node:
         st.warning("PPTX unavailable — Node.js not found. Install Node.js to enable PPTX export.")
         return None
+    # Build extended PATH so npm/node can find their own dependencies
+    extra_dirs = [os.path.dirname(node), '/usr/local/bin', '/usr/bin']
+    extended_path = os.pathsep.join(extra_dirs + [os.environ.get('PATH', '')])
     script_dir = os.path.dirname(os.path.abspath(__file__))
     script = os.path.join(script_dir, 'generate_tc_pptx.js')
     if not os.path.exists(script):
@@ -854,7 +860,10 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     node_modules = os.path.join(script_dir, 'node_modules', 'pptxgenjs')
     pkg_json = os.path.join(script_dir, 'package.json')
     if not os.path.isdir(node_modules) and os.path.exists(pkg_json):
-        npm = shutil.which('npm', path=extended_path)
+        _npm_candidates = [p.replace('/node', '/npm') for p in _node_candidates]
+        npm = next((p for p in _npm_candidates if os.path.isfile(p) and os.access(p, os.X_OK)), None)
+        if not npm:
+            npm = shutil.which('npm', path=extended_path)
         if npm:
             with st.spinner("Installing PPTX dependencies (first run only)..."):
                 install = subprocess.run(
@@ -1414,7 +1423,7 @@ if st.session_state.get("_pdf_name_prompt"):
                 st.success("PDF and PPTX reports ready for download.")
             else:
                 st.session_state.pop("_pptx_bytes", None)
-                st.success("PDF report ready for download. (PPTX unavailable — Node.js not found)")
+                st.success("PDF report ready for download. (PPTX export failed — see warning above)")
 
             st.session_state["_pdf_name_prompt"] = False
         except Exception as e:
