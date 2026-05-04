@@ -19,3 +19,6 @@ reportlab==4.2.5
 
 # Excel export
 openpyxl>=3.1.0
+
+# PPTX report (pure Python, no Node.js required)
+python-pptx>=1.0.0
