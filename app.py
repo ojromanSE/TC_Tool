@@ -825,6 +825,55 @@ def _build_pptx_data(tc_name: str) -> dict:
     data['oil']   = _get_fluid('Oil',   'Oil_oneline',   'EUR (Mbbl)')       or _blank('oil',   'Mbbl',  'Bbl/ft', 'bbl/day')
     data['gas']   = _get_fluid('Gas',   'Gas_oneline',   'EUR (MMcf)')       or _blank('gas',   'MMcf',  'Mcf/ft', 'Mcf/day')
     data['water'] = _get_fluid('Water', 'Water_oneline', 'EUR (Mbbl water)') or _blank('water', 'Mbbl',  'Bbl/ft', 'bbl/day')
+
+    # Generate the exact plots shown in the Streamlit interface as PNG bytes
+    def _fig_bytes(fig):
+        buf = BytesIO()
+        fig.savefig(buf, format='png', dpi=180, bbox_inches='tight')
+        buf.seek(0); plt.close(fig)
+        return buf.read()
+
+    def _attach_figs(fluid_name, oneline_key, monthly_key, eur_col, fd):
+        if oneline_key not in st.session_state or fd['nTcWells'] == 0:
+            return
+        oneline_full = st.session_state[oneline_key]
+        sel_key = f"{fluid_name}_tc_selection"
+        if sel_key in st.session_state and isinstance(st.session_state[sel_key], set):
+            oneline = oneline_full[oneline_full['WellID'].astype(str).isin(st.session_state[sel_key])]
+        else:
+            oneline = oneline_full
+
+        # B-factor histogram (same as bfactor_analytics_figures but keep figure)
+        b_vals = pd.to_numeric(oneline.get('b'), errors='coerce').dropna()
+        if len(b_vals) > 0:
+            color = _phase_color(fluid_name)
+            P50 = float(np.median(b_vals))
+            fig, ax = plt.subplots(figsize=(6.6, 3.4))
+            ax.hist(b_vals.values, bins=30, color=color, alpha=0.85, edgecolor='none')
+            ax.axvline(P50, color='black', linestyle='--', label=f"Median={P50:.2f}")
+            ax.legend(); ax.set_xlabel('b-factor'); ax.set_ylabel('Count')
+            plt.tight_layout()
+            fd['bfactor_hist_bytes'] = _fig_bytes(fig)
+
+        # Type curve — use cached session-state curves so it matches the UI exactly
+        curves = st.session_state.get(f"{fluid_name}_tc_curves", pd.DataFrame())
+        lines  = st.session_state.get(f"{fluid_name}_tc_lines",  [])
+        if not curves.empty:
+            fig = plot_type_curves(curves, lines, fluid_name.lower())
+            fd['typecurve_bytes'] = _fig_bytes(fig)
+
+        # Probit plot
+        if eur_col in oneline.columns:
+            eurs = pd.to_numeric(oneline[eur_col], errors='coerce').dropna().astype(float).tolist()
+            if eurs:
+                unit = "Mbbl" if fluid_name != "Gas" else "MMcf"
+                fig = probit_plot(eurs, unit, f"{fluid_name} EUR Distribution",
+                                  _phase_color(fluid_name), norm_len=int(norm_len))
+                fd['probit_bytes'] = _fig_bytes(fig)
+
+    _attach_figs('Oil',   'Oil_oneline',   'Oil_monthly',   'EUR (Mbbl)',       data['oil'])
+    _attach_figs('Gas',   'Gas_oneline',   'Gas_monthly',   'EUR (MMcf)',        data['gas'])
+    _attach_figs('Water', 'Water_oneline', 'Water_monthly', 'EUR (Mbbl water)', data['water'])
     return data
 
 
@@ -881,7 +930,7 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
         return sp
 
     def _txt(sl, text, x, y, w, h, size=10, bold=False, italic=False,
-             color=None, face="Calibri", align='left', wrap=True):
+             color=None, face="Garamond", align='left', wrap=True):
         tb = sl.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
         tf = tb.text_frame; tf.word_wrap = wrap
         p = tf.paragraphs[0]; p.alignment = _ALIGN.get(align, PP_ALIGN.LEFT)
@@ -894,13 +943,13 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     def _chrome(sl, pg):
         _rect(sl, 0, 5.3, 10, 0.325, SE_RED)
         _oval(sl, 0.15, 5.05, 0.5, 0.5, NAVY, SE_RED)
-        _txt(sl, "SE",  0.15, 5.12, 0.5,  0.35, size=9,  bold=True, color=WHITE, face="Georgia", align='center')
+        _txt(sl, "SE",  0.15, 5.12, 0.5,  0.35, size=9,  bold=True, color=WHITE, face="Garamond", align='center')
         _txt(sl, str(pg), 9.5, 5.3,  0.4,  0.32, size=10, color=WHITE, align='right')
         _txt(sl, "CONFIDENTIAL", 0.0, 0.5, 0.5, 4.5, size=7, color=MARK_GRAY, align='center')
         _txt(sl, "CONFIDENTIAL", 9.5, 0.5, 0.5, 4.5, size=7, color=MARK_GRAY, align='center')
 
     def _slide_title(sl, title):
-        _txt(sl, title, 0.4, 0.18, 9.2, 0.52, size=24, bold=True, color=SE_RED, face="Georgia")
+        _txt(sl, title, 0.4, 0.18, 9.2, 0.52, size=24, bold=True, color=SE_RED, face="Garamond")
         _rect(sl, 0.4, 0.73, 9.2, 0.03, SE_RED)
 
     def _kv_box(sl, header, rows, x, y, w, rh=0.30):
@@ -966,10 +1015,10 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     sl = prs.slides.add_slide(_blank)
     sl.background.fill.solid(); sl.background.fill.fore_color.rgb = NAVY
     _oval(sl, 0.3, 0.2, 1.1, 1.1, NAVY, SE_RED, lw=3)
-    _txt(sl, "SE", 0.3, 0.42, 1.1, 0.5, size=22, bold=True, color=WHITE, face="Georgia", align='center')
-    _txt(sl, wm['wellName'], 0.4, 1.8, 7, 0.85, size=36, bold=True, color=WHITE, face="Georgia")
+    _txt(sl, "SE", 0.3, 0.42, 1.1, 0.5, size=22, bold=True, color=WHITE, face="Garamond", align='center')
+    _txt(sl, wm['wellName'], 0.4, 1.8, 7, 0.85, size=36, bold=True, color=WHITE, face="Garamond")
     _txt(sl, f"TC Report – {_fd(wm['reportDate'])}", 0.4, 2.7, 7, 0.6,
-         size=24, italic=True, color=RGBColor(0xCC, 0xCC, 0xCC), face="Georgia")
+         size=24, italic=True, color=RGBColor(0xCC, 0xCC, 0xCC), face="Garamond")
     _rect(sl, 0, 5.3, 10, 0.325, SE_RED)
 
     # ── Slide 2: Disclaimer ────────────────────────────────────────────────────
@@ -1082,67 +1131,36 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
             ["Mean", f"{fd['meanEur']:.2f}", f"{fd['meanEurPerFt']:.2f}"],
         ], 4.1, 3.72, [1.5, 2.05, 2.05])
 
-    # ── Slides 6/9/12: Charts (b-factor histogram + type curve + probit) ───────
+    # ── Slides 6/9/12: Charts — paste exact Streamlit interface plots as images ──
+    def _embed_bytes(sl, data_bytes, x, y, w, h):
+        sl.shapes.add_picture(_BytesIO(data_bytes), Inches(x), Inches(y), Inches(w), Inches(h))
+
     for fd, pg in [(oil, 6), (gas, 9), (wtr, 12)]:
         if not fd or fd['nTcWells'] == 0:
             continue
         sl = prs.slides.add_slide(_blank)
         _slide_title(sl, f"{_cap(fd['fluid'])} Analysis – Charts"); _chrome(sl, pg)
-        fc = FLUID_HEX.get(fd['fluid'].lower(), '#953735')
-        tdl = fd.get('terminalDi', D_LIM)
 
-        # B-factor histogram
-        _txt(sl, "B-Factor Distribution", 0.4, 0.85, 4.3, 0.28, size=10, bold=True, color=BODY_GRAY)
-        _txt(sl, f"Median = {fd['bMedian']:.2f}", 0.4, 1.08, 4.3, 0.2, size=8, color=BODY_GRAY, align='right')
-        fig, ax = _plt.subplots(figsize=(4, 2), facecolor='#F8F8F8')
-        b_vals = fd.get('bValues', [])
-        if b_vals:
-            bins = np.arange(0.75, 1.30, 0.05)
-            ax.hist(b_vals, bins=bins, color=fc, edgecolor='white', linewidth=0.5)
-        ax.set_facecolor('#F8F8F8'); ax.tick_params(labelsize=7)
-        ax.grid(axis='y', color='#E0E0E0', linewidth=0.5)
-        ax.spines[['top', 'right']].set_visible(False)
-        _embed(sl, fig, 0.4, 1.15, 4.3, 2.0)
+        has_hist = 'bfactor_hist_bytes' in fd
+        has_tc   = 'typecurve_bytes' in fd
+        has_prob = 'probit_bytes' in fd
 
-        # Type curve
-        _txt(sl, "Type Curve (log scale)", 5.0, 0.85, 4.6, 0.28, size=10, bold=True, color=BODY_GRAY)
-        mos = list(range(1, 601))
-        p50q = _arps(fd['p50Qi'], fd['p50B'], fd['p50Di'], tdl)
-        p10q = _arps(fd['p10Qi'], fd['p10B'], fd['p10Di'], tdl)
-        p90q = _arps(fd['p90Qi'], fd['p90B'], fd['p90Di'], tdl)
-        fig, ax = _plt.subplots(figsize=(4.4, 2), facecolor='#F8F8F8')
-        for q, lbl, ls in [(p50q, 'P50', '-'), (p10q, 'P10', '--'), (p90q, 'P90', ':')]:
-            safe_q = [max(v, 0.01) for v in q]
-            ax.semilogy(mos, safe_q, color=fc, lw=2 if lbl == 'P50' else 1.5, ls=ls, label=lbl)
-        ax.set_facecolor('#F8F8F8'); ax.legend(fontsize=7, loc='upper right')
-        ax.tick_params(labelsize=7); ax.grid(color='#E0E0E0', linewidth=0.5)
-        ax.spines[['top', 'right']].set_visible(False)
-        ax.set_xlabel("Month", fontsize=7); ax.set_ylabel(fd['qiUnit'], fontsize=7)
-        _embed(sl, fig, 5.0, 1.15, 4.6, 2.0)
+        if has_hist and has_tc:
+            # Top row: b-factor histogram (left) + type curve (right)
+            _txt(sl, "B-Factor Distribution", 0.4, 0.82, 4.5, 0.25, size=10, bold=True, color=BODY_GRAY)
+            _embed_bytes(sl, fd['bfactor_hist_bytes'], 0.4, 1.08, 4.5, 2.1)
+            _txt(sl, "Type Curve", 5.1, 0.82, 4.5, 0.25, size=10, bold=True, color=BODY_GRAY)
+            _embed_bytes(sl, fd['typecurve_bytes'], 5.1, 1.08, 4.5, 2.1)
+        elif has_hist:
+            _txt(sl, "B-Factor Distribution", 0.4, 0.82, 9.2, 0.25, size=10, bold=True, color=BODY_GRAY)
+            _embed_bytes(sl, fd['bfactor_hist_bytes'], 0.4, 1.08, 9.2, 2.1)
+        elif has_tc:
+            _txt(sl, "Type Curve", 0.4, 0.82, 9.2, 0.25, size=10, bold=True, color=BODY_GRAY)
+            _embed_bytes(sl, fd['typecurve_bytes'], 0.4, 1.08, 9.2, 2.1)
 
-        # Probit plots
-        _txt(sl, "Probit Plot", 0.4, 3.28, 9.2, 0.28, size=10, bold=True, color=BODY_GRAY)
-        ar = fd.get('analogRows', [])
-        if ar:
-            n = len(ar)
-            pos = [(i + 0.5) / n for i in range(n)]
-            s_eur = sorted(r['eur'] for r in ar)
-            fig, ax = _plt.subplots(figsize=(4, 1.7), facecolor='#F8F8F8')
-            ax.scatter(s_eur, pos, color=fc, s=15)
-            ax.set_xlabel(f"EUR ({fd['eurUnit']})", fontsize=7)
-            ax.set_ylabel("Cum. Prob.", fontsize=7)
-            ax.set_facecolor('#F8F8F8'); ax.tick_params(labelsize=7)
-            ax.grid(color='#E0E0E0', linewidth=0.5); ax.spines[['top', 'right']].set_visible(False)
-            _embed(sl, fig, 0.4, 3.6, 4.3, 1.6)
-
-            s_pft = sorted(r.get('eurPerFt', 0) for r in ar)
-            fig, ax = _plt.subplots(figsize=(4.4, 1.7), facecolor='#F8F8F8')
-            ax.scatter(s_pft, pos, color=fc, s=15)
-            ax.set_xlabel(f"EUR ({fd['eurPerFtUnit']})", fontsize=7)
-            ax.set_ylabel("Cum. Prob.", fontsize=7)
-            ax.set_facecolor('#F8F8F8'); ax.tick_params(labelsize=7)
-            ax.grid(color='#E0E0E0', linewidth=0.5); ax.spines[['top', 'right']].set_visible(False)
-            _embed(sl, fig, 5.0, 3.6, 4.6, 1.6)
+        if has_prob:
+            _txt(sl, "EUR Probit", 0.4, 3.25, 9.2, 0.25, size=10, bold=True, color=BODY_GRAY)
+            _embed_bytes(sl, fd['probit_bytes'], 0.4, 3.5, 9.2, 1.8)
 
     # ── Slides 7/10/13: Analog well tables ─────────────────────────────────────
     for fd, pg in [(oil, 7), (gas, 10), (wtr, 13)]:
