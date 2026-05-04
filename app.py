@@ -829,98 +829,347 @@ def _build_pptx_data(tc_name: str) -> dict:
 
 
 def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
-    """Write pptx_data as JSON, call node generate_tc_pptx.js, return path or None."""
-    import json, subprocess, shutil, glob as _glob
-    # Locate node: first try known absolute paths (bypasses Streamlit PATH stripping),
-    # then fall back to PATH-based discovery.
-    _node_candidates = [
-        '/opt/node22/bin/node', '/opt/node21/bin/node', '/opt/node20/bin/node',
-        '/opt/node18/bin/node', '/usr/local/bin/node', '/usr/bin/node',
-    ]
-    _node_candidates += _glob.glob(os.path.expanduser('~/.nvm/versions/node/*/bin/node'))
-    node = next((p for p in _node_candidates if os.path.isfile(p) and os.access(p, os.X_OK)), None)
-    if not node:
-        extra_dirs = [os.path.dirname(p) for p in _node_candidates]
-        extra_dirs += [os.environ.get('PATH', '')]
-        extended_path = os.pathsep.join(extra_dirs)
-        node = shutil.which('node', path=extended_path)
-    if not node:
-        st.warning("PPTX unavailable — Node.js not found. Install Node.js to enable PPTX export.")
-        return None
-    # Build extended PATH so npm/node can find their own dependencies
-    extra_dirs = [os.path.dirname(node), '/usr/local/bin', '/usr/bin']
-    extended_path = os.pathsep.join(extra_dirs + [os.environ.get('PATH', '')])
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    script = os.path.join(script_dir, 'generate_tc_pptx.js')
-    if not os.path.exists(script):
-        st.warning("PPTX unavailable — generate_tc_pptx.js not found.")
-        return None
-
-    # Auto-install pptxgenjs if node_modules is missing
-    node_modules = os.path.join(script_dir, 'node_modules', 'pptxgenjs')
-    pkg_json = os.path.join(script_dir, 'package.json')
-    if not os.path.isdir(node_modules) and os.path.exists(pkg_json):
-        _npm_candidates = [p.replace('/node', '/npm') for p in _node_candidates]
-        npm = next((p for p in _npm_candidates if os.path.isfile(p) and os.access(p, os.X_OK)), None)
-        if not npm:
-            npm = shutil.which('npm', path=extended_path)
-        if npm:
-            with st.spinner("Installing PPTX dependencies (first run only)..."):
-                install = subprocess.run(
-                    [npm, 'install', '--prefix', script_dir],
-                    capture_output=True, text=True, timeout=120,
-                    env={**os.environ, 'PATH': extended_path},
-                )
-            if install.returncode != 0:
-                st.warning(f"npm install failed: {install.stderr[:300]}")
-                return None
-
-    safe = "".join(c if c.isalnum() or c in ' _-' else '_' for c in pptx_data['wellMeta']['wellName'])
-    date = pptx_data['wellMeta']['generatedDate']
-    out_path = os.path.join(output_dir, f"SE_{safe or 'TC'}_TC_Report_{date}.pptx")
-
-    def _scrub(obj):
-        """Recursively replace nan/inf with 0 and numpy scalars with Python scalars.
-        Python's json.dump writes NaN literals for float('nan') which are not valid
-        JSON — Node.js's JSON.parse rejects them and the script crashes silently."""
-        import math
-        if isinstance(obj, float):
-            return 0.0 if not math.isfinite(obj) else obj
-        if isinstance(obj, dict):
-            return {k: _scrub(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_scrub(v) for v in obj]
-        # Coerce numpy scalar types to plain Python
-        try:
-            import numpy as _np
-            if isinstance(obj, _np.floating):
-                v = float(obj)
-                return 0.0 if not math.isfinite(v) else v
-            if isinstance(obj, _np.integer):
-                return int(obj)
-        except ImportError:
-            pass
-        return obj
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.json', mode='w') as jf:
-        json.dump(_scrub(pptx_data), jf)
-        json_path = jf.name
+    """Generate a TC PowerPoint report using python-pptx (no Node.js required)."""
     try:
-        result = subprocess.run(
-            [node, script, json_path, out_path],
-            capture_output=True, text=True, timeout=60,
-            cwd=script_dir,
-        )
-        if result.returncode != 0:
-            st.warning(f"PPTX generation error: {result.stderr[:400]}")
-            return None
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+        from pptx.dml.color import RGBColor
+        from pptx.enum.text import PP_ALIGN
+    except ImportError:
+        st.warning("python-pptx not installed. Run: pip install python-pptx")
+        return None
+
+    import math as _math
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as _plt
+    from io import BytesIO as _BytesIO
+    from datetime import datetime as _dt
+
+    # ── Brand constants ────────────────────────────────────────────────────────
+    SE_RED    = RGBColor(0x95, 0x37, 0x35)
+    NAVY      = RGBColor(0x1A, 0x27, 0x44)
+    WHITE     = RGBColor(0xFF, 0xFF, 0xFF)
+    ROW_ALT   = RGBColor(0xF5, 0xED, 0xED)
+    BODY_GRAY = RGBColor(0x40, 0x40, 0x40)
+    MARK_GRAY = RGBColor(0xAA, 0xAA, 0xAA)
+    FLUID_HEX = {'oil': '#2D6E2D', 'gas': '#CC3333', 'water': '#2244AA'}
+    D_LIM     = 0.00417
+    _RECT     = 1   # MSO_AUTO_SHAPE_TYPE.RECTANGLE
+    _OVAL     = 9   # MSO_AUTO_SHAPE_TYPE.OVAL
+    _ALIGN    = {'left': PP_ALIGN.LEFT, 'center': PP_ALIGN.CENTER, 'right': PP_ALIGN.RIGHT}
+
+    prs = Presentation()
+    prs.slide_width  = Inches(10)
+    prs.slide_height = Inches(5.625)
+    _blank = prs.slide_layouts[6]
+
+    # ── Drawing primitives ─────────────────────────────────────────────────────
+    def _rect(sl, x, y, w, h, fill, line=None, lw=0.5):
+        sp = sl.shapes.add_shape(_RECT, Inches(x), Inches(y), Inches(w), Inches(h))
+        sp.fill.solid(); sp.fill.fore_color.rgb = fill
+        if line:
+            sp.line.color.rgb = line; sp.line.width = Pt(lw)
+        else:
+            sp.line.fill.background()
+        return sp
+
+    def _oval(sl, x, y, w, h, fill, line, lw=1.5):
+        sp = sl.shapes.add_shape(_OVAL, Inches(x), Inches(y), Inches(w), Inches(h))
+        sp.fill.solid(); sp.fill.fore_color.rgb = fill
+        sp.line.color.rgb = line; sp.line.width = Pt(lw)
+        return sp
+
+    def _txt(sl, text, x, y, w, h, size=10, bold=False, italic=False,
+             color=None, face="Calibri", align='left', wrap=True):
+        tb = sl.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+        tf = tb.text_frame; tf.word_wrap = wrap
+        p = tf.paragraphs[0]; p.alignment = _ALIGN.get(align, PP_ALIGN.LEFT)
+        r = p.add_run(); r.text = str(text)
+        r.font.size = Pt(size); r.font.bold = bool(bold); r.font.italic = bool(italic)
+        r.font.name = face
+        if color: r.font.color.rgb = color
+        return tb
+
+    def _chrome(sl, pg):
+        _rect(sl, 0, 5.3, 10, 0.325, SE_RED)
+        _oval(sl, 0.15, 5.05, 0.5, 0.5, NAVY, SE_RED)
+        _txt(sl, "SE",  0.15, 5.12, 0.5,  0.35, size=9,  bold=True, color=WHITE, face="Georgia", align='center')
+        _txt(sl, str(pg), 9.5, 5.3,  0.4,  0.32, size=10, color=WHITE, align='right')
+        _txt(sl, "CONFIDENTIAL", 0.0, 0.5, 0.5, 4.5, size=7, color=MARK_GRAY, align='center')
+        _txt(sl, "CONFIDENTIAL", 9.5, 0.5, 0.5, 4.5, size=7, color=MARK_GRAY, align='center')
+
+    def _slide_title(sl, title):
+        _txt(sl, title, 0.4, 0.18, 9.2, 0.52, size=24, bold=True, color=SE_RED, face="Georgia")
+        _rect(sl, 0.4, 0.73, 9.2, 0.03, SE_RED)
+
+    def _kv_box(sl, header, rows, x, y, w, rh=0.30):
+        _rect(sl, x, y, w, rh, SE_RED)
+        _txt(sl, header, x, y, w, rh, size=10, bold=True, color=WHITE)
+        for i, (lbl, val) in enumerate(rows):
+            ry = y + rh * (i + 1)
+            bg = WHITE if i % 2 == 0 else ROW_ALT
+            _rect(sl, x, ry, w, rh, bg, RGBColor(0xDD, 0xDD, 0xDD))
+            _txt(sl, lbl,       x,          ry, w * 0.5, rh, size=9.5, color=BODY_GRAY)
+            _txt(sl, str(val),  x + w * 0.5, ry, w * 0.5, rh, size=9.5, color=BODY_GRAY, align='center')
+
+    def _table(sl, headers, rows, x, y, cws, rh=0.28):
+        cx = x
+        for i, hdr in enumerate(headers):
+            _rect(sl, cx, y, cws[i], rh, SE_RED)
+            _txt(sl, hdr, cx, y, cws[i], rh, size=9, bold=True, color=WHITE, align='center')
+            cx += cws[i]
+        for ri, row in enumerate(rows):
+            ry = y + rh * (ri + 1)
+            bg = WHITE if ri % 2 == 0 else ROW_ALT
+            cx2 = x
+            for ci, cell in enumerate(row):
+                _rect(sl, cx2, ry, cws[ci], rh, bg, RGBColor(0xDD, 0xDD, 0xDD))
+                _txt(sl, str(cell), cx2, ry, cws[ci], rh, size=9, color=BODY_GRAY, align='center')
+                cx2 += cws[ci]
+
+    def _embed(sl, fig, x, y, w, h):
+        buf = _BytesIO()
+        fig.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='#F8F8F8')
+        buf.seek(0); _plt.close(fig)
+        sl.shapes.add_picture(buf, Inches(x), Inches(y), Inches(w), Inches(h))
+
+    # ── Format helpers ─────────────────────────────────────────────────────────
+    def _ff(n):       return f"{int(round(n)):,} ft"
+    def _fe(n, u):    return f"{n:.1f} {u}"
+    def _fn(n):       return f"{int(round(n)):,}" if n >= 1000 else f"{n:.2f}"
+    def _fp(v):       return f"{v * 100:.1f}%"
+    def _cap(s):      return s[0].upper() + s[1:] if s else s
+    def _fd(iso):
+        try:    return _dt.fromisoformat(iso).strftime("%B %-d, %Y")
+        except: return str(iso)
+
+    def _arps(qi_d, b, di, term_di, months=600):
+        qi = qi_d * 30.4
+        t_sw = ((di - term_di) / (b * di * term_di)) if (b > 0 and di > term_di) else float('inf')
+        q_sw = qi / (1 + b * di * t_sw) ** (1 / b) if t_sw < float('inf') else qi
+        q = []
+        for t in range(1, months + 1):
+            if t >= t_sw and t_sw < float('inf'):
+                q.append(q_sw * _math.exp(-term_di * (t - t_sw)))
+            else:
+                q.append(qi / (1 + b * di * t) ** (1 / b))
+        return q
+
+    wm  = pptx_data['wellMeta']
+    ac  = pptx_data['analogCriteria']
+    oil = pptx_data['oil']
+    gas = pptx_data['gas']
+    wtr = pptx_data['water']
+
+    # ── Slide 1: Title ─────────────────────────────────────────────────────────
+    sl = prs.slides.add_slide(_blank)
+    sl.background.fill.solid(); sl.background.fill.fore_color.rgb = NAVY
+    _oval(sl, 0.3, 0.2, 1.1, 1.1, NAVY, SE_RED, lw=3)
+    _txt(sl, "SE", 0.3, 0.42, 1.1, 0.5, size=22, bold=True, color=WHITE, face="Georgia", align='center')
+    _txt(sl, wm['wellName'], 0.4, 1.8, 7, 0.85, size=36, bold=True, color=WHITE, face="Georgia")
+    _txt(sl, f"TC Report – {_fd(wm['reportDate'])}", 0.4, 2.7, 7, 0.6,
+         size=24, italic=True, color=RGBColor(0xCC, 0xCC, 0xCC), face="Georgia")
+    _rect(sl, 0, 5.3, 10, 0.325, SE_RED)
+
+    # ── Slide 2: Disclaimer ────────────────────────────────────────────────────
+    sl = prs.slides.add_slide(_blank)
+    _slide_title(sl, "Disclaimer"); _chrome(sl, 2)
+    _txt(sl, (
+        'The information contained in this confidential presentation (this “Presentation”) is provided for '
+        'informational and discussion purposes only and is not, and may not be relied on in any manner as, '
+        'legal, tax or investment advice or as an offer to sell or a solicitation of an offer to buy an interest '
+        'in any security. The information contained in this Presentation must be kept strictly confidential and '
+        'may not be reproduced or redistributed in any format without the approval of Schaper International '
+        'Petroleum Consulting, LLC (“SIPC”). In considering any performance data contained in this Presentation, '
+        'you should bear in mind that past or targeted performance is not indicative of future results, and there '
+        'can be no assurance that any investment will achieve comparable results or that target returns will be met. '
+        'In addition, there can be no assurance that any investment will achieve or be realized at the valuations '
+        'shown, as actual realized returns will depend on, among other factors, future operating results, the value '
+        'of assets and market conditions at the time of disposition, any related transaction costs and the timing '
+        'and manner of sale, all of which may differ from the assumptions on which the valuations contained in this '
+        'Presentation are based. Nothing contained in this Presentation should be deemed to be a prediction or '
+        'projection of future performance of any investment. Investors should make their own investigations and '
+        'evaluations of a potential investment and the information contained in this Presentation. Except where '
+        'otherwise indicated in this Presentation, the information provided in this Presentation is based on matters '
+        'as they exist as of the date of preparation and not as of any future date, and will not be updated or '
+        'otherwise revised to reflect information that subsequently becomes available, or circumstances existing or '
+        'changes occurring after the date hereof.'
+    ), 0.4, 0.9, 9.2, 4.3, size=10.5, color=RGBColor(0x33, 0x33, 0x33), wrap=True)
+
+    # ── Slide 3: Analog Selection ──────────────────────────────────────────────
+    sl = prs.slides.add_slide(_blank)
+    _slide_title(sl, "Analog Selection Methodology"); _chrome(sl, 3)
+    _kv_box(sl, "Subject Location", [
+        ["Well",      wm['wellName']],
+        ["County",    wm.get('county', '')],
+        ["Reservoir", wm.get('reservoir', '')],
+        ["AFE LL",    _ff(wm['afeLateralLenFt'])],
+    ], 0.4, 0.85, 3.5)
+    _kv_box(sl, "Analog Pool Criteria", [
+        ["# of Analogs",            str(ac.get('nAnalogs', ''))],
+        ["County",                  str(ac.get('counties', ''))],
+        ["Reservoir",               str(ac.get('reservoir', ''))],
+        ["LL Range",                str(ac.get('llRangeFt', ''))],
+        ["LL Avg",                  _ff(ac['llAvgFt']) if ac.get('llAvgFt') else ''],
+        ["Completion Vintage",      str(ac.get('compVintage', ''))],
+        ["Avg Distance to Subject", str(ac.get('avgDistanceMi', 'N/A'))],
+    ], 0.4, 2.25, 3.5)
+    _rect(sl, 4.2, 0.85, 5.4, 4.2, RGBColor(0xCC, 0xCC, 0xCC), RGBColor(0x99, 0x99, 0x99))
+    _txt(sl, "[ Insert analog location map here ]", 4.2, 2.5, 5.4, 0.6,
+         size=11, color=RGBColor(0x66, 0x66, 0x66), italic=True, align='center')
+
+    # ── Slide 4: Summary ───────────────────────────────────────────────────────
+    sl = prs.slides.add_slide(_blank)
+    _slide_title(sl, f"Summary – {wm['wellName']} TC"); _chrome(sl, 4)
+    _txt(sl, "Analysis Parameters", 0.4, 0.85, 9, 0.3, size=12, bold=True, color=BODY_GRAY)
+    _kv_box(sl, "Parameter", [
+        ["Type Curve Name",      f"{wm['wellName']} TC"],
+        ["Generated",            wm['generatedDate']],
+        ["Normalization Length", _ff(wm['normLengthFt'])],
+        ["B-factor Range",       wm.get('bFactorRange', '')],
+    ], 0.4, 1.18, 4.5)
+    _txt(sl, "EUR Summary", 0.4, 2.7, 9, 0.3, size=12, bold=True, color=BODY_GRAY)
+
+    def _eur_row(fd):
+        return [_cap(fd['fluid']),
+                f"{fd['nTcWells']} / {fd['nTotal']}",
+                _fe(fd['p90Eur'], fd['eurUnit']),
+                _fe(fd['p50Eur'], fd['eurUnit']),
+                _fe(fd['p10Eur'], fd['eurUnit']),
+                _fe(fd['meanEur'], fd['eurUnit'])]
+
+    _table(sl, ["Fluid", "TC Wells", "P90 EUR", "P50 EUR", "P10 EUR", "Mean EUR"],
+           [_eur_row(oil), _eur_row(gas), _eur_row(wtr)],
+           0.4, 3.02, [1.1, 0.9, 1.65, 1.65, 1.65, 1.65])
+
+    # ── Slides 5/8/11: Fluid stats + parameters ────────────────────────────────
+    for fd, pg in [(oil, 5), (gas, 8), (wtr, 11)]:
+        if not fd or fd['nTcWells'] == 0:
+            continue
+        sl = prs.slides.add_slide(_blank)
+        _slide_title(sl, f"{_cap(fd['fluid'])} Analysis"); _chrome(sl, pg)
+        _txt(sl, f"{_cap(fd['fluid'])} EUR Statistics ({fd['eurUnit']})",
+             0.4, 0.85, 3.5, 0.3, size=11, bold=True, color=BODY_GRAY)
+        _kv_box(sl, "Metric", [
+            ["Wells in TC",  f"{fd['nTcWells']} / {fd['nTotal']}"],
+            ["Mean",         f"{fd['meanEur']:.2f}"],
+            ["Median (P50)", f"{fd['p50Eur']:.2f}"],
+            ["P10",          f"{fd['p10Eur']:.2f}"],
+            ["P90",          f"{fd['p90Eur']:.2f}"],
+        ], 0.4, 1.17, 3.5)
+        _txt(sl, "B-Factor Statistics", 0.4, 3.0, 3.5, 0.3, size=11, bold=True, color=BODY_GRAY)
+        _kv_box(sl, "Metric", [
+            ["Count",    str(fd['bCount'])],
+            ["Mean",     f"{fd['bMean']:.3f}"],
+            ["Median",   f"{fd['bMedian']:.3f}"],
+            ["P10/P90",  f"{fd['bP10']:.3f} / {fd['bP90']:.3f}"],
+        ], 0.4, 3.3, 3.5)
+        _txt(sl, "Type Curve Parameters", 4.1, 0.85, 5.6, 0.3, size=11, bold=True, color=BODY_GRAY)
+        _table(sl, ["Parameter", "P90 (Low)", "P50 (Mid)", "P10 (High)"], [
+            [f"qi ({fd['qiUnit']})", _fn(fd['p90Qi']),  _fn(fd['p50Qi']),  _fn(fd['p10Qi'])],
+            ["b-factor",             f"{fd['p90B']:.3f}", f"{fd['p50B']:.3f}", f"{fd['p10B']:.3f}"],
+            ["Di (per month)",       f"{fd['p90Di']:.4f}", f"{fd['p50Di']:.4f}", f"{fd['p10Di']:.4f}"],
+            ["1st-Year Decline",     _fp(fd['p90Decline1yr']), _fp(fd['p50Decline1yr']), _fp(fd['p10Decline1yr'])],
+            ["Terminal Di",          f"{fd['terminalDi']:.5f}/mo", f"{fd['terminalDi']:.5f}/mo", f"{fd['terminalDi']:.5f}/mo"],
+            [f"EUR ({fd['eurUnit']})", f"{fd['p90Eur']:.2f}", f"{fd['p50Eur']:.2f}", f"{fd['p10Eur']:.2f}"],
+        ], 4.1, 1.17, [2.2, 1.1, 1.1, 1.2])
+        _txt(sl, f"{_cap(fd['fluid'])} EURs", 4.1, 3.4, 5.6, 0.3, size=11, bold=True, color=BODY_GRAY)
+        _table(sl, ["Percentile", f"EUR ({fd['eurUnit']})", f"EUR ({fd['eurPerFtUnit']})"], [
+            ["P90",  f"{fd['p90Eur']:.2f}",  f"{fd['p90EurPerFt']:.2f}"],
+            ["P50",  f"{fd['p50Eur']:.2f}",  f"{fd['p50EurPerFt']:.2f}"],
+            ["P10",  f"{fd['p10Eur']:.2f}",  f"{fd['p10EurPerFt']:.2f}"],
+            ["Mean", f"{fd['meanEur']:.2f}", f"{fd['meanEurPerFt']:.2f}"],
+        ], 4.1, 3.72, [1.5, 2.05, 2.05])
+
+    # ── Slides 6/9/12: Charts (b-factor histogram + type curve + probit) ───────
+    for fd, pg in [(oil, 6), (gas, 9), (wtr, 12)]:
+        if not fd or fd['nTcWells'] == 0:
+            continue
+        sl = prs.slides.add_slide(_blank)
+        _slide_title(sl, f"{_cap(fd['fluid'])} Analysis – Charts"); _chrome(sl, pg)
+        fc = FLUID_HEX.get(fd['fluid'].lower(), '#953735')
+        tdl = fd.get('terminalDi', D_LIM)
+
+        # B-factor histogram
+        _txt(sl, "B-Factor Distribution", 0.4, 0.85, 4.3, 0.28, size=10, bold=True, color=BODY_GRAY)
+        _txt(sl, f"Median = {fd['bMedian']:.2f}", 0.4, 1.08, 4.3, 0.2, size=8, color=BODY_GRAY, align='right')
+        fig, ax = _plt.subplots(figsize=(4, 2), facecolor='#F8F8F8')
+        b_vals = fd.get('bValues', [])
+        if b_vals:
+            bins = np.arange(0.75, 1.30, 0.05)
+            ax.hist(b_vals, bins=bins, color=fc, edgecolor='white', linewidth=0.5)
+        ax.set_facecolor('#F8F8F8'); ax.tick_params(labelsize=7)
+        ax.grid(axis='y', color='#E0E0E0', linewidth=0.5)
+        ax.spines[['top', 'right']].set_visible(False)
+        _embed(sl, fig, 0.4, 1.15, 4.3, 2.0)
+
+        # Type curve
+        _txt(sl, "Type Curve (log scale)", 5.0, 0.85, 4.6, 0.28, size=10, bold=True, color=BODY_GRAY)
+        mos = list(range(1, 601))
+        p50q = _arps(fd['p50Qi'], fd['p50B'], fd['p50Di'], tdl)
+        p10q = _arps(fd['p10Qi'], fd['p10B'], fd['p10Di'], tdl)
+        p90q = _arps(fd['p90Qi'], fd['p90B'], fd['p90Di'], tdl)
+        fig, ax = _plt.subplots(figsize=(4.4, 2), facecolor='#F8F8F8')
+        for q, lbl, ls in [(p50q, 'P50', '-'), (p10q, 'P10', '--'), (p90q, 'P90', ':')]:
+            safe_q = [max(v, 0.01) for v in q]
+            ax.semilogy(mos, safe_q, color=fc, lw=2 if lbl == 'P50' else 1.5, ls=ls, label=lbl)
+        ax.set_facecolor('#F8F8F8'); ax.legend(fontsize=7, loc='upper right')
+        ax.tick_params(labelsize=7); ax.grid(color='#E0E0E0', linewidth=0.5)
+        ax.spines[['top', 'right']].set_visible(False)
+        ax.set_xlabel("Month", fontsize=7); ax.set_ylabel(fd['qiUnit'], fontsize=7)
+        _embed(sl, fig, 5.0, 1.15, 4.6, 2.0)
+
+        # Probit plots
+        _txt(sl, "Probit Plot", 0.4, 3.28, 9.2, 0.28, size=10, bold=True, color=BODY_GRAY)
+        ar = fd.get('analogRows', [])
+        if ar:
+            n = len(ar)
+            pos = [(i + 0.5) / n for i in range(n)]
+            s_eur = sorted(r['eur'] for r in ar)
+            fig, ax = _plt.subplots(figsize=(4, 1.7), facecolor='#F8F8F8')
+            ax.scatter(s_eur, pos, color=fc, s=15)
+            ax.set_xlabel(f"EUR ({fd['eurUnit']})", fontsize=7)
+            ax.set_ylabel("Cum. Prob.", fontsize=7)
+            ax.set_facecolor('#F8F8F8'); ax.tick_params(labelsize=7)
+            ax.grid(color='#E0E0E0', linewidth=0.5); ax.spines[['top', 'right']].set_visible(False)
+            _embed(sl, fig, 0.4, 3.6, 4.3, 1.6)
+
+            s_pft = sorted(r.get('eurPerFt', 0) for r in ar)
+            fig, ax = _plt.subplots(figsize=(4.4, 1.7), facecolor='#F8F8F8')
+            ax.scatter(s_pft, pos, color=fc, s=15)
+            ax.set_xlabel(f"EUR ({fd['eurPerFtUnit']})", fontsize=7)
+            ax.set_ylabel("Cum. Prob.", fontsize=7)
+            ax.set_facecolor('#F8F8F8'); ax.tick_params(labelsize=7)
+            ax.grid(color='#E0E0E0', linewidth=0.5); ax.spines[['top', 'right']].set_visible(False)
+            _embed(sl, fig, 5.0, 3.6, 4.6, 1.6)
+
+    # ── Slides 7/10/13: Analog well tables ─────────────────────────────────────
+    for fd, pg in [(oil, 7), (gas, 10), (wtr, 13)]:
+        if not fd or fd['nTcWells'] == 0:
+            continue
+        sl = prs.slides.add_slide(_blank)
+        _slide_title(sl, f"{_cap(fd['fluid'])} Analysis – Analogs"); _chrome(sl, pg)
+        rows_data = fd.get('analogRows', [])
+        n = len(rows_data)
+        rh = 0.225 if n > 15 else (0.255 if n > 10 else 0.31)
+        _table(sl,
+               ["API/UWI", "Well Name", "Lat Len (ft)",
+                f"qi ({fd['qiUnit']})", "b", "Di (/mo)", "1yr Dec (%)", f"EUR ({fd['eurUnit']})"],
+               [[str(r['api']), str(r['wellName']), f"{int(round(r['latLenFt'])):,}",
+                 _fn(r['qi']), f"{r['b']:.4f}", f"{r['diPerMo']:.4f}",
+                 f"{r['decline1yrPct']:.2f}", f"{r['eur']:.2f}"] for r in rows_data],
+               0.4, 0.88, [1.35, 1.85, 1.0, 0.85, 0.8, 0.75, 0.9, 0.7], rh)
+
+    # ── Save ───────────────────────────────────────────────────────────────────
+    try:
+        safe = "".join(c if c.isalnum() or c in ' _-' else '_' for c in wm['wellName'])
+        out_path = os.path.join(output_dir, f"SE_{safe or 'TC'}_TC_Report_{wm['generatedDate']}.pptx")
+        prs.save(out_path)
         return out_path
     except Exception as e:
-        st.warning(f"PPTX generation failed: {e}")
+        st.warning(f"PPTX save failed: {e}")
         return None
-    finally:
-        try: os.unlink(json_path)
-        except: pass
 
 def generate_comprehensive_pdf(tc_name: str = ""):
     """Generate a comprehensive PDF report with all sections."""
