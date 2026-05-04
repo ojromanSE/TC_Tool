@@ -3,9 +3,9 @@ numpy==2.1.2
 pandas==2.2.3
 scipy==1.13.1
 
-# ML — XGBoost for DCA parameter prediction, scikit-learn for utilities
+# ML — scikit-learn for RandomForest; joblib for parallel forecasting
 scikit-learn==1.5.2
-xgboost>=2.0.0
+joblib>=1.3.0
 
 # Plotting
 matplotlib==3.9.2
