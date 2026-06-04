@@ -15,7 +15,8 @@ from core import (
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
     plot_one_well, forecast_one_well, _train_rf,
     compute_eur_stats, probit_plot, eur_summary_table,
-    modified_arps, D_LIM_DEFAULT
+    modified_arps, D_LIM_DEFAULT,
+    estimate_lateral_exponent, hindcast_one_well
 )
 
 st.set_page_config(page_title="SE Tool", layout="wide")
@@ -41,13 +42,48 @@ with st.sidebar:
     if vertical_wells:
         use_norm = False
         norm_len = 10_000   # unused placeholder
+        norm_method = "Linear  EUR ∝ L"
+        auto_fit_exp = False
+        norm_exponent = 1.0
         st.info("Normalization disabled for vertical wells.")
     else:
         norm_len = st.number_input("Normalization Length (ft)", 1000, 30000, 10000, step=500)
         use_norm = st.checkbox("Apply Normalization", value=True)
+        norm_method = st.radio(
+            "Scaling method (SPEE M5)",
+            ["Power-law  EUR ∝ Lᵃ  (recommended)", "Linear  EUR ∝ L"],
+            index=0,
+            help=("SPEE Monograph 5 ('Scaling'): EUR per foot DECREASES with lateral "
+                  "length, so production scales sub-linearly (exponent a < 1). Linear "
+                  "scaling (a = 1) is the legacy behaviour and over-corrects long laterals."),
+        )
+        if norm_method.startswith("Power"):
+            auto_fit_exp = st.checkbox("Auto-fit exponent from data", value=True)
+            _est = st.session_state.get("lat_exponent_est")
+            if auto_fit_exp:
+                if _est is not None:
+                    st.caption(f"Auto-fit exponent a ≈ {float(_est):.2f} (from log-cum vs log-lateral).")
+                else:
+                    st.caption("Exponent will be auto-fit from your data on Load / QC / Merge.")
+                norm_exponent = float(_est) if _est is not None else 0.85
+            else:
+                norm_exponent = st.number_input(
+                    "Lateral scaling exponent a", 0.30, 1.00,
+                    value=float(_est) if _est is not None else 0.85, step=0.05,
+                )
+        else:
+            auto_fit_exp = False
+            norm_exponent = 1.0
+        st.caption("Note: M5 also recommends scaling for kH and proppant intensity — not "
+                   "applied here; bin on those instead (see Analogous Binning below).")
     st.markdown("---")
     b_low  = st.number_input("b-factor Low", value=0.8, step=0.1, format="%.3f")
     b_high = st.number_input("b-factor High", value=1.2, step=0.1, format="%.3f")
+    min_hist = st.number_input(
+        "Min months history per well", 1, 60, 6, step=1,
+        help=("SPEE M5 stresses sufficient history for individual forecasts. Wells with "
+              "fewer producing months are excluded from the forecast."),
+    )
     st.markdown("---")
     lat_col = st.text_input("Latitude column (optional QC)", value="Latitude")
     lon_col = st.text_input("Longitude column (optional QC)", value="Longitude")
@@ -171,28 +207,119 @@ if st.button("Load / QC / Merge"):
             prod_df = load_production(prod_file)
             st.session_state.header_qc = header_qc
             st.session_state.prod_df   = prod_df
+
+            # Estimate the SPEE M5 sub-linear lateral-scaling exponent from data.
+            est_exp = None
+            if use_norm and not vertical_wells:
+                est_exp = estimate_lateral_exponent(header_qc, prod_df)
+                st.session_state["lat_exponent_est"] = est_exp
+
+            # Resolve the exponent actually applied to this merge.
+            if not use_norm or vertical_wells or not norm_method.startswith("Power"):
+                applied_exp = 1.0
+            elif auto_fit_exp:
+                applied_exp = float(est_exp) if est_exp is not None else 0.85
+            else:
+                applied_exp = float(norm_exponent)
+            st.session_state["applied_norm_exponent"] = applied_exp
+
             pp_cfg = PreprocessConfig(
                 normalization_length=int(norm_len),
-                use_normalization=bool(use_norm)
+                use_normalization=bool(use_norm),
+                normalization_exponent=float(applied_exp),
             )
             merged = preprocess(header_qc, prod_df, pp_cfg)
             if merged.empty:
                 st.warning("No rows after preprocessing. Check your inputs.")
             else:
+                # Keep the full merged set; binning derives the working subset.
+                st.session_state.merged_full = merged
                 st.session_state.merged = merged
-                st.success(f"Merged {len(merged['WellID'].unique())} wells and {len(merged)} monthly rows.")
+                _exp_msg = (f" Scaling exponent a = {applied_exp:.2f}."
+                            if use_norm and not vertical_wells else "")
+                st.success(
+                    f"Merged {len(merged['WellID'].unique())} wells and "
+                    f"{len(merged)} monthly rows.{_exp_msg}"
+                )
         except Exception as e:
             st.exception(e)
 
-if "merged" in st.session_state:
+if "merged_full" in st.session_state:
     with st.expander("Preview: Header (QC'd)"):
         st.dataframe(format_df_2dec(st.session_state.header_qc.head(20)), use_container_width=True)
     with st.expander("Preview: Production"):
         st.dataframe(format_df_2dec(st.session_state.prod_df.head(20)), use_container_width=True)
     with st.expander("Preview: Merged"):
-        st.dataframe(format_df_2dec(st.session_state.merged.head(20)), use_container_width=True)
+        st.dataframe(format_df_2dec(st.session_state.merged_full.head(20)), use_container_width=True)
 
 st.markdown("---")
+
+# ================= Analogous Binning (SPEE Monograph 5) =================
+def _well_significance_note(n: int) -> None:
+    """Render an M5 sample-size adequacy note for a well population."""
+    if n >= 30:
+        st.caption(f"✅ {n} wells — statistically meaningful sample (M5).")
+    elif n >= 10:
+        st.caption(f"⚠️ {n} wells — moderate sample; treat P10/P90 spread with caution (M5).")
+    else:
+        st.caption(f"🚩 {n} wells — small sample; type-well percentiles are not statistically robust (M5).")
+
+if "merged_full" in st.session_state:
+    st.header("Analogous Binning (SPEE Monograph 5)")
+    st.caption(
+        "M5 stresses grouping wells into an analogous population — same play/formation, "
+        "vintage, and completion scale — while keeping the sample statistically meaningful. "
+        "Filters below define the working set used for all forecasts."
+    )
+    _base = st.session_state.merged_full
+    _bcols = st.columns(2)
+    with _bcols[0]:
+        _forms = sorted([f for f in _base['PrimaryFormation'].dropna().unique()]) \
+            if 'PrimaryFormation' in _base.columns else []
+        _sel_forms = st.multiselect("Formation", _forms, default=_forms) if _forms else []
+        _counties = sorted([c for c in _base['County'].dropna().unique()]) \
+            if 'County' in _base.columns else []
+        _sel_counties = st.multiselect("County", _counties, default=_counties) if _counties else []
+    with _bcols[1]:
+        _lat = pd.to_numeric(_base.get('LateralLength'), errors='coerce')
+        if _lat.notna().any():
+            _lmin, _lmax = int(np.floor(_lat.min())), int(np.ceil(_lat.max()))
+            if _lmin >= _lmax:
+                _lat_range = (_lmin, _lmax)
+                st.caption(f"Lateral length: {_lmin:,} ft (single value)")
+            else:
+                _lat_range = st.slider("Lateral length (ft)", _lmin, _lmax, (_lmin, _lmax), step=100)
+        else:
+            _lat_range = None
+        _years = pd.to_datetime(_base.get('CompletionDate'), errors='coerce').dt.year
+        if _years.notna().any():
+            _ymin, _ymax = int(_years.min()), int(_years.max())
+            if _ymin >= _ymax:
+                _yr_range = (_ymin, _ymax)
+                st.caption(f"Completion vintage: {_ymin} (single year)")
+            else:
+                _yr_range = st.slider("Completion vintage (year)", _ymin, _ymax, (_ymin, _ymax), step=1)
+        else:
+            _yr_range = None
+
+    _mask = pd.Series(True, index=_base.index)
+    if _forms and _sel_forms:
+        _mask &= _base['PrimaryFormation'].isin(_sel_forms)
+    if _counties and _sel_counties:
+        _mask &= _base['County'].isin(_sel_counties)
+    if _lat_range is not None:
+        # Keep unknown lateral (NaN) wells rather than silently dropping them.
+        _mask &= (_lat.between(_lat_range[0], _lat_range[1]) | _lat.isna())
+    if _yr_range is not None:
+        _mask &= (_years.between(_yr_range[0], _yr_range[1]) | _years.isna())
+
+    _binned = _base[_mask].copy()
+    st.session_state.merged = _binned
+    _n_wells = _binned['WellID'].nunique()
+    _n_total = _base['WellID'].nunique()
+    st.markdown(f"**Working set: {_n_wells} / {_n_total} wells** ({len(_binned)} monthly rows).")
+    _well_significance_note(_n_wells)
+    st.markdown("---")
 
 # ---------- Analytics ----------
 def bfactor_analytics_figures(oneline: pd.DataFrame, fluid: str, eur_col: str):
@@ -289,14 +416,19 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
                 'P50': df.iloc[p50_lo:p50_hi],
                 'P90': df.iloc[max(0, int(n * 0.9)):],
             }
-            # All curves share P90's b and di (the representative decline shape).
-            # qi per group is a placeholder — _render_tw scales each curve to its
-            # EUR target, so only the shape (b, di) matters here.
-            b_shape  = float(groups['P90']['_b'].median())
-            di_shape = float(groups['P90']['_di'].median())
+            # Build each percentile curve from ITS OWN group's median (b, di)
+            # shape (per SPEE M5 — percentiles should carry their own decline
+            # character, not a single shared shape). qi is a placeholder;
+            # _render_tw rescales each curve to its EUR target downstream.
             for pct, grp in groups.items():
-                qi = float(grp['_qi'].median())
-                smooth[pct] = modified_arps(qi, b_shape, di_shape, D_LIM_DEFAULT, t_out)
+                qi   = float(grp['_qi'].median())
+                b_g  = float(grp['_b'].median())
+                di_g = float(grp['_di'].median())
+                smooth[pct] = modified_arps(qi, b_g, di_g, D_LIM_DEFAULT, t_out)
+            # Mean ("average well", M5) curve from the full-population median shape.
+            smooth['Mean'] = modified_arps(
+                float(df['_qi'].median()), float(df['_b'].median()),
+                float(df['_di'].median()), D_LIM_DEFAULT, t_out)
             return pd.DataFrame(smooth), lines
 
     # Fallback: empirical percentiles with Arps fitting (used when oneline unavailable)
@@ -317,6 +449,8 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
     for pct in ['P10', 'P50', 'P90']:
         qi, b, di = _fit_arps_to_trace(t_emp, emp[pct].to_numpy())
         smooth[pct] = modified_arps(qi, b, di, D_LIM_DEFAULT, t_out)
+    # No per-well params available here — use the P50 shape as the Mean proxy.
+    smooth['Mean'] = smooth['P50'].copy()
 
     return pd.DataFrame(smooth), lines
 
@@ -330,6 +464,9 @@ def plot_type_curves(curves, lines, fluid):
         ax.plot(curves['t'], curves['P50'], color=color, linewidth=2, label='P50')
         ax.plot(curves['t'], curves['P10'], color=color, linestyle='--', label='P10')
         ax.plot(curves['t'], curves['P90'], color=color, linestyle='--', label='P90')
+        if 'Mean' in curves.columns:
+            ax.plot(curves['t'], curves['Mean'], color='black', linewidth=1.5,
+                    linestyle=':', label='Mean (avg well)')
     ax.set_yscale('log'); ax.set_ylim(bottom=1)
     ax.legend()
     return fig
@@ -340,9 +477,14 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
     disabled = "merged" not in st.session_state
     if st.button(f"Run {fluid_name} Forecast", disabled=disabled):
         merged = st.session_state.merged
+        if merged is None or merged.empty:
+            st.warning("No wells in the current binning selection — widen the Analogous "
+                       "Binning filters above before running a forecast.")
+            st.stop()
         cfg = ForecastConfig(
             commodity=fluid_name.lower(),
-            b_low=float(b_low), b_high=float(b_high), max_months=600
+            b_low=float(b_low), b_high=float(b_high), max_months=600,
+            min_months_history=int(min_hist),
         )
         oneline, monthly, well_fcs = forecast_all(merged, cfg)
         st.session_state[f"{fluid_name}_oneline"] = oneline
@@ -356,6 +498,25 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
     mo_key = f"{fluid_name}_monthly"
 
     if on_key in st.session_state:
+        # --- M5 sample-size & maturity diagnostics ---
+        _ol = st.session_state[on_key]
+        _nw = len(_ol)
+        _c1, _c2, _c3 = st.columns(3)
+        _c1.metric("Wells forecast", _nw)
+        if 'Months History' in _ol.columns:
+            _mh = pd.to_numeric(_ol['Months History'], errors='coerce')
+            _immature = int((_mh < 12).sum())
+            _c2.metric("Median months history", f"{_mh.median():.0f}")
+            _c3.metric("Immature (<12 mo)", f"{_immature} ({_immature/_nw*100:.0f}%)" if _nw else "0")
+        if _nw < 10:
+            st.warning(f"🚩 Only {_nw} wells — below SPEE M5's threshold for a statistically "
+                       "meaningful type well. Percentiles are indicative only.")
+        elif _nw < 30:
+            st.info(f"⚠️ {_nw} wells — moderate sample size; interpret P10/P90 spread with caution (M5).")
+        if 'Months History' in _ol.columns and _nw and _immature / _nw > 0.5:
+            st.warning(f"⚠️ {_immature/_nw*100:.0f}% of wells have <12 months of history — the EUR "
+                       "distribution is forecast-dominated and may carry forecast bias (M5).")
+
         tab1, tab2, tab3, tab4 = st.tabs([
             "Oneline", "Monthly", "B-Factor", "Probit"
         ])
@@ -397,6 +558,34 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
         fig = plot_one_well(wd, fc, fluid_name.lower())
         st.pyplot(fig)
+
+        # --- Hindcast validation (SPEE M5 — Validation) ---
+        if st.checkbox(f"Show hindcast validation ({fluid_name})", key=f"{fluid_name}_hc_chk",
+                       help="Fit on the first 60% of this well's history and forecast the "
+                            "held-out remainder to gauge forecast reliability (M5)."):
+            hc = hindcast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high))
+            if hc is None:
+                st.info("Not enough history to hindcast this well (need ≥ ~9 months).")
+            else:
+                color = _phase_color(fluid_name)
+                figh, axh = plt.subplots(figsize=(10, 5))
+                axh.scatter(hc['t_train'], np.clip(hc['y_train'], 1e-6, None),
+                            s=22, color=color, label="Train (actual)")
+                axh.scatter(hc['t_test'], np.clip(hc['y_test'], 1e-6, None),
+                            s=40, facecolors='none', edgecolors=color, label="Held-out (actual)")
+                axh.plot(hc['t_test'], np.clip(hc['y_pred'], 1e-6, None),
+                         linestyle='--', linewidth=2, color=color, label="Forecast")
+                axh.set_yscale('log'); axh.set_ylim(bottom=1)
+                axh.set_xlabel("Month of Production"); axh.set_ylabel("Monthly volume (norm)")
+                axh.set_title(f"Hindcast — train on {hc['n_train']} mo, test on {hc['n_test']} mo "
+                              f"[{hc['model']}]")
+                axh.grid(True, linestyle="--", alpha=0.4, which='both'); axh.legend()
+                figh.tight_layout()
+                st.pyplot(figh)
+                mcol1, mcol2 = st.columns(2)
+                mcol1.metric("Cumulative error", f"{hc['cum_err_pct']:+.1f}%",
+                             help="Forecast cum vs actual cum over the held-out window. + = over-forecast.")
+                mcol2.metric("Mean abs. % error", f"{hc['mape_pct']:.1f}%")
 
 fluid_block("Oil", "EUR (Mbbl)", "NormOil")
 st.markdown("---")
@@ -583,7 +772,8 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
             # Curves are in Bbl or Mcf; EUR stats are in Mbbl or MMcf → ×1000.
             if not curves.empty:
                 curves = curves.copy()
-                for _pct, _stat in [('P10', 'P10'), ('P50', 'P50'), ('P90', 'P90')]:
+                for _pct, _stat in [('P10', 'P10'), ('P50', 'P50'), ('P90', 'P90'),
+                                    ('Mean', 'Mean')]:
                     if (_pct in curves.columns
                             and eur_stats.get(_stat)
                             and np.isfinite(eur_stats[_stat])):
@@ -597,10 +787,20 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
     # ── EUR summary below ──
     st.caption(f"**{n_sel} / {n_tot} wells selected**")
     if n_sel > 0:
+        _well_significance_note(n_sel)
         st.dataframe(
             format_df_2dec(eur_summary_table(fluid, eur_stats, "Mbbl" if fluid != "Gas" else "MMcf", int(norm_len))),
             use_container_width=True,
         )
+        _mean_v = eur_stats.get("Mean")
+        _p50_v  = eur_stats.get("P50")
+        if _mean_v and _p50_v and np.isfinite(_mean_v) and np.isfinite(_p50_v):
+            _unit = "Mbbl" if fluid != "Gas" else "MMcf"
+            st.caption(
+                f"SPEE M5 'average well' = **Mean {_mean_v:,.1f} {_unit}** "
+                f"({(_mean_v/_p50_v - 1)*100:+.0f}% vs P50 {_p50_v:,.1f}). "
+                "Use the Mean (expected value) when aggregating reserves across wells."
+            )
     else:
         st.warning("No wells selected — select at least one well to compute statistics.")
 
@@ -618,7 +818,7 @@ if any(k in st.session_state for k in _tc_keys):
 
     # Build combined Oil + Gas sheet (P50 columns adjacent, units converted)
     _og_parts = [pd.Series(range(1, 601), name="Month")]
-    for _pct in ["P10", "P50", "P90"]:
+    for _pct in ["P10", "P50", "P90", "Mean"]:
         if not _oil_c.empty and _pct in _oil_c.columns:
             _og_parts.append((_oil_c[_pct] / 1000).round(4).rename(f"{_pct}_Oil_Mbbl_per_month"))
         if not _gas_c.empty and _pct in _gas_c.columns:
@@ -627,7 +827,7 @@ if any(k in st.session_state for k in _tc_keys):
 
     # Water sheet
     _water_parts = [pd.Series(range(1, 601), name="Month")]
-    for _pct in ["P10", "P50", "P90"]:
+    for _pct in ["P10", "P50", "P90", "Mean"]:
         if not _water_c.empty and _pct in _water_c.columns:
             _water_parts.append((_water_c[_pct] / 1000).round(4).rename(f"{_pct}_Water_Mbbl_per_month"))
     _water_df = pd.concat(_water_parts, axis=1)
@@ -799,6 +999,7 @@ def _build_pptx_data(tc_name: str) -> dict:
             'generatedDate':  now.strftime('%Y-%m-%d'),
             'normLengthFt':   float(norm_len),
             'bFactorRange':   f"{b_low:.3f} - {b_high:.3f}",
+            'scalingExponent': float(st.session_state.get('applied_norm_exponent', 1.0)),
         },
         'analogCriteria': {
             'nAnalogs':        len(prim_tc),
@@ -1076,6 +1277,7 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
         ["Type Curve Name",      f"{wm['wellName']} TC"],
         ["Generated",            wm['generatedDate']],
         ["Normalization Length", _ff(wm['normLengthFt'])],
+        ["Scaling Exponent (a)", f"{wm.get('scalingExponent', 1.0):.2f}"],
         ["B-factor Range",       wm.get('bFactorRange', '')],
     ], 0.4, 1.18, 4.5)
     _txt(sl, "EUR Summary", 0.4, 2.7, 9, 0.3, size=12, bold=True, color=BODY_GRAY)
@@ -1232,6 +1434,8 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         ["Parameter", "Value"],
         ["Normalization Length", f"{norm_len} ft"],
         ["Apply Normalization", "Yes" if use_norm else "No"],
+        ["Lateral Scaling Exponent (a)", f"{st.session_state.get('applied_norm_exponent', 1.0):.2f}"],
+        ["Min Months History", str(int(min_hist))],
         ["B-factor Range", f"{b_low:.3f} - {b_high:.3f}"],
         ["Geographic Bin Decimals", str(bin_decimals)]
     ]
