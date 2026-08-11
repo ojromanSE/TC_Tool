@@ -128,9 +128,28 @@ def _save_fig(fig, dpi=220):
     return tmp.name
 
 
+def _log_lower_fence(eur: pd.Series) -> float:
+    """Lower outlier fence computed in log space.
+
+    EUR populations are approximately log-normal (see probit plots), so the
+    linear Q1 − 1.5×IQR fence is usually negative and never flags the
+    under-performers.  Computing the fence in log space yields a meaningful
+    positive lower bound (SPEE M5 — 'Look for Outliers and why')."""
+    eur = pd.to_numeric(eur, errors='coerce')
+    pos = eur[(eur > 0) & np.isfinite(eur)]
+    if len(pos) < 3:
+        return 0.0
+    le = np.log(pos.astype(float))
+    lq1, lq3 = le.quantile(0.25), le.quantile(0.75)
+    return float(np.exp(lq1 - 1.5 * (lq3 - lq1)))
+
+
 def _make_outlier_fig(oneline_df, eur_col, fluid_name):
-    """EUR vs Lateral Length scatter with IQR-fence outlier detection.
-    Returns (fig, upper_fence, n_active, n_removed, median_eur) or None."""
+    """EUR vs Lateral Length scatter with outlier detection.
+    High fence: Q3 + 1.5×IQR (linear).  Low fence: Q1 − 1.5×IQR in LOG space
+    (a linear lower fence is usually negative for log-normal EURs and never
+    triggers).  Returns (fig, upper_fence, lower_fence, n_active, n_removed,
+    n_high, n_low, median_eur, unit) or None."""
     df = oneline_df.copy()
     df['_eur'] = pd.to_numeric(df[eur_col], errors='coerce')
     if 'LateralLength' in df.columns:
@@ -144,7 +163,7 @@ def _make_outlier_fig(oneline_df, eur_col, fluid_name):
     q1, q3 = df['_eur'].quantile(0.25), df['_eur'].quantile(0.75)
     iqr = q3 - q1
     upper_fence = q3 + 1.5 * iqr
-    lower_fence = q1 - 1.5 * iqr
+    lower_fence = _log_lower_fence(df['_eur'])
 
     high_mask = df['_eur'] > upper_fence
     low_mask  = df['_eur'] < lower_fence
@@ -157,13 +176,17 @@ def _make_outlier_fig(oneline_df, eur_col, fluid_name):
                    color='#2C2C2C', s=40, zorder=3, label='Within range')
     if high_mask.any():
         ax.scatter(df.loc[high_mask, '_lat'], df.loc[high_mask, '_eur'],
-                   color='#781F28', s=40, zorder=3, label='High EUR outlier (>1.5\u00d7 IQR)')
+                   color='#781F28', s=40, zorder=3, label='High EUR outlier (>1.5× IQR)')
     if low_mask.any():
         ax.scatter(df.loc[low_mask, '_lat'], df.loc[low_mask, '_eur'],
-                   color='#BBBBBB', s=40, zorder=3, label='Low EUR outlier (<1.5\u00d7 IQR)')
+                   color='#4A6FA5', s=40, zorder=3, label='Low EUR outlier (log-IQR fence)')
     ax.axhline(upper_fence, color='#781F28', linestyle='--', linewidth=0.8, alpha=0.6)
     ax.text(0.98, 0.97, f"Upper fence  {upper_fence:,.0f}",
             transform=ax.transAxes, ha='right', va='top', color='#781F28', fontsize=8)
+    if lower_fence > 0:
+        ax.axhline(lower_fence, color='#4A6FA5', linestyle='--', linewidth=0.8, alpha=0.6)
+        ax.text(0.98, 0.03, f"Lower fence  {lower_fence:,.0f}",
+                transform=ax.transAxes, ha='right', va='bottom', color='#4A6FA5', fontsize=8)
     for spine in ax.spines.values():
         spine.set_edgecolor('#E8AABB')
         spine.set_linewidth(1.5)
@@ -177,9 +200,10 @@ def _make_outlier_fig(oneline_df, eur_col, fluid_name):
 
     n_active  = int(ok_mask.sum())
     n_removed = int((high_mask | low_mask).sum())
-    n_flagged = int(high_mask.sum())
+    n_high    = int(high_mask.sum())
+    n_low     = int(low_mask.sum())
     median_eur = float(df['_eur'].median())
-    return fig, upper_fence, n_active, n_removed, n_flagged, median_eur, unit
+    return fig, upper_fence, lower_fence, n_active, n_removed, n_high, n_low, median_eur, unit
 
 # ================= Upload =================
 st.header("Upload & Prepare Data")
@@ -319,6 +343,118 @@ if "merged_full" in st.session_state:
     _n_total = _base['WellID'].nunique()
     st.markdown(f"**Working set: {_n_wells} / {_n_total} wells** ({len(_binned)} monthly rows).")
     _well_significance_note(_n_wells)
+    st.markdown("---")
+
+# ================= Global Re-run (update all TCs) =================
+def _rerun_all_phases(keep_selections: bool = True) -> list:
+    """Re-merge with the CURRENT sidebar settings (normalization length,
+    lateral scaling exponent, b-factor bounds, min history) and re-run every
+    phase that has already been forecast, so all onelines and type curves are
+    consistent with the current parameters.
+
+    Analog/outlier selections are preserved (intersected with the new well
+    set) so exclusion decisions survive a re-run. Returns the list of phases
+    that were re-run."""
+    if "header_qc" not in st.session_state or "prod_df" not in st.session_state:
+        return []
+
+    # Resolve the scaling exponent from current sidebar state (mirrors Load/QC/Merge)
+    if not use_norm or vertical_wells or not norm_method.startswith("Power"):
+        applied_exp = 1.0
+    elif auto_fit_exp:
+        _est = st.session_state.get("lat_exponent_est")
+        applied_exp = float(_est) if _est is not None else 0.85
+    else:
+        applied_exp = float(norm_exponent)
+    st.session_state["applied_norm_exponent"] = applied_exp
+
+    pp_cfg = PreprocessConfig(
+        normalization_length=int(norm_len),
+        use_normalization=bool(use_norm),
+        normalization_exponent=float(applied_exp),
+    )
+    merged_full = preprocess(st.session_state.header_qc, st.session_state.prod_df, pp_cfg)
+    st.session_state.merged_full = merged_full
+
+    # Preserve the current binning: the well set is invariant to normalization
+    # settings, so filtering to the currently-binned WellIDs reproduces it.
+    prev = st.session_state.get("merged")
+    if prev is not None and not prev.empty:
+        _keep = set(prev['WellID'].astype(str))
+        merged = merged_full[merged_full['WellID'].astype(str).isin(_keep)].copy()
+    else:
+        merged = merged_full
+    st.session_state.merged = merged
+    if merged.empty:
+        return []
+
+    ran = []
+    for fl in ["Oil", "Gas", "Water"]:
+        if f"{fl}_oneline" not in st.session_state:
+            continue
+        cfg = ForecastConfig(
+            commodity=fl.lower(),
+            b_low=float(b_low), b_high=float(b_high), max_months=600,
+            min_months_history=int(min_hist),
+        )
+        oneline, monthly, well_fcs = forecast_all(merged, cfg)
+        st.session_state[f"{fl}_oneline"]  = oneline
+        st.session_state[f"{fl}_monthly"]  = monthly
+        st.session_state[f"{fl}_well_fcs"] = well_fcs
+        sel_key = f"{fl}_tc_selection"
+        new_ids = set(oneline['WellID'].astype(str))
+        if keep_selections and isinstance(st.session_state.get(sel_key), set):
+            kept = st.session_state[sel_key] & new_ids
+            st.session_state[sel_key] = kept if kept else new_ids
+        else:
+            st.session_state.pop(sel_key, None)
+        # Reset checkbox-editor widget state so stale positional edits don't
+        # misapply if the well list changed (e.g. min-history raised).
+        for _wk in (f"{fl}_analog_editor",
+                    f"{fl}_outlier_editor_high", f"{fl}_outlier_editor_low"):
+            st.session_state.pop(_wk, None)
+        ran.append(fl)
+    return ran
+
+
+def _global_rerun_button(key: str):
+    """Render the 'update all TCs' button; on click, re-run and refresh."""
+    if st.button("🔄 Re-run All Phases & Update TCs", key=key, type="primary",
+                 help="Re-applies the current b-factor bounds, normalization length and "
+                      "lateral scaling, re-runs every phase already forecast, and refreshes "
+                      "all type curves. Analog/outlier exclusions are kept."):
+        if not any(f"{fl}_oneline" in st.session_state for fl in ("Oil", "Gas", "Water")):
+            st.warning("No phase has been forecast yet — run at least one phase forecast first.")
+            return
+        try:
+            with st.spinner("Re-running all phases with current settings..."):
+                ran = _rerun_all_phases()
+        except Exception as e:
+            st.exception(e)
+            return
+        if not ran:
+            st.warning("Nothing to re-run — check that the binning selection is not empty.")
+            return
+        st.session_state["_global_rerun_msg"] = (
+            f"Re-ran {', '.join(ran)} with current settings — all type curves updated "
+            f"(a = {st.session_state.get('applied_norm_exponent', 1.0):.2f}, "
+            f"b ∈ [{float(b_low):.3f}, {float(b_high):.3f}], "
+            f"min history = {int(min_hist)} mo)."
+        )
+        st.rerun()
+
+
+if "merged_full" in st.session_state:
+    _grm = st.session_state.pop("_global_rerun_msg", None)
+    if _grm:
+        st.success(_grm)
+        try:
+            st.toast(_grm)
+        except Exception:
+            pass
+    _global_rerun_button("rerun_all_top")
+    st.caption("Changed b-factors, normalization length, or lateral scaling? One click "
+               "re-runs every forecast phase and brings all type curves up to date.")
     st.markdown("---")
 
 # ---------- Analytics ----------
@@ -547,7 +683,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         # Use WellID for selection
         opts = merged[['WellID']].drop_duplicates().sort_values('WellID')
         pick_id = st.selectbox(f"Pick Well ({fluid_name})", opts['WellID'], key=f"{fluid_name}_pick")
-        
+
         wd = merged[merged['WellID'] == pick_id]
         fcs_key = f"{fluid_name}_well_fcs"
         if fcs_key in st.session_state and pick_id in st.session_state[fcs_key]:
@@ -614,16 +750,17 @@ def _outlier_section(fluid: str, on_key: str, eur_col: str):
         st.info(f"Not enough data for {fluid} outlier detection (need ≥ 3 wells with lateral length).")
         return
 
-    fig, upper_fence, n_active, n_removed, n_flagged, median_eur, unit = result
+    fig, upper_fence, lower_fence, n_active, n_removed, n_high, n_low, median_eur, unit = result
     st.pyplot(fig)
     plt.close(fig)
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Active wells",  n_active)
-    m2.metric("Removed wells", n_removed)
+    m2.metric("Flagged wells", n_removed)
     m3.metric("Median EUR",    f"{median_eur:,.0f} {unit}")
     m4.metric("Upper fence",   f"{upper_fence:,.0f} {unit}")
-    m5.metric("Flagged",       f"{n_flagged} wells")
+    m5.metric("Lower fence",   f"{lower_fence:,.0f} {unit}")
+    m6.metric("High / Low",    f"{n_high} ⬆ / {n_low} ⬇")
 
     # Recompute fences to identify individual outlier wells
     df = oneline.copy()
@@ -636,43 +773,56 @@ def _outlier_section(fluid: str, on_key: str, eur_col: str):
     q1, q3      = df['_eur'].quantile(0.25), df['_eur'].quantile(0.75)
     iqr         = q3 - q1
     upper_f     = q3 + 1.5 * iqr
-    lower_f     = q1 - 1.5 * iqr
-    flagged_df  = df[(df['_eur'] > upper_f) | (df['_eur'] < lower_f)].copy()
-    flagged_df['Outlier Type'] = flagged_df['_eur'].apply(
-        lambda v: '⬆ High EUR' if v > upper_f else '⬇ Low EUR'
-    )
+    lower_f     = _log_lower_fence(df['_eur'])
+    high_df     = df[df['_eur'] > upper_f].sort_values('_eur', ascending=False).copy()
+    low_df      = df[df['_eur'] < lower_f].sort_values('_eur', ascending=True).copy()
 
     sel_key = f"{fluid}_tc_selection"
     all_ids = set(oneline['WellID'].astype(str).tolist())
     if sel_key not in st.session_state:
         st.session_state[sel_key] = all_ids.copy()
 
-    if flagged_df.empty:
+    if high_df.empty and low_df.empty:
         st.success(f"No outliers detected for {fluid}.")
         return
 
-    st.markdown(f"**{len(flagged_df)} outlier(s) detected.** Check wells to exclude from the Type Curve, then click **Update TC**.")
+    st.markdown(f"**{len(high_df) + len(low_df)} outlier(s) detected.** Check wells to "
+                "exclude from the Type Curve, then click **Update TC**.")
 
-    show_cols = [c for c in ['WellName', 'API10', 'LateralLength', eur_col] if c in flagged_df.columns]
-    display   = flagged_df[['WellID', 'Outlier Type'] + show_cols].reset_index(drop=True)
+    show_cols = [c for c in ['WellName', 'API10', 'LateralLength', 'Months History', eur_col]
+                 if c in df.columns]
     current_excluded = all_ids - st.session_state[sel_key]
-    display.insert(0, "Exclude", display['WellID'].astype(str).isin(current_excluded).tolist())
+    excl_well_ids: set = set()
 
-    col_cfg = {"Exclude": st.column_config.CheckboxColumn("Exclude", default=False)}
-    for c in ['Outlier Type'] + show_cols:
-        col_cfg[c] = st.column_config.TextColumn(c, disabled=True)
+    for _label, _flag_df, _ed_key in [
+        (f"⬆ High EUR outliers — above {upper_f:,.0f} {unit} (1.5×IQR fence)",
+         high_df, f"{fluid}_outlier_editor_high"),
+        (f"⬇ Low EUR outliers — below {lower_f:,.0f} {unit} (log-space 1.5×IQR fence)",
+         low_df, f"{fluid}_outlier_editor_low"),
+    ]:
+        st.markdown(f"**{_label}**")
+        if _flag_df.empty:
+            st.caption("None detected.")
+            continue
 
-    edited = st.data_editor(
-        display.drop(columns=['WellID']),
-        column_config=col_cfg,
-        hide_index=True,
-        use_container_width=True,
-        key=f"{fluid}_outlier_editor",
-    )
+        display = _flag_df[['WellID'] + show_cols].reset_index(drop=True)
+        display.insert(0, "Exclude", display['WellID'].astype(str).isin(current_excluded).tolist())
 
-    excl_mask    = edited['Exclude'].values.astype(bool)
-    excl_well_ids = set(display.loc[excl_mask, 'WellID'].astype(str).tolist())
-    n_excl        = int(excl_mask.sum())
+        col_cfg = {"Exclude": st.column_config.CheckboxColumn("Exclude", default=False)}
+        for c in show_cols:
+            col_cfg[c] = st.column_config.TextColumn(c, disabled=True)
+
+        edited = st.data_editor(
+            display.drop(columns=['WellID']),
+            column_config=col_cfg,
+            hide_index=True,
+            use_container_width=True,
+            key=_ed_key,
+        )
+        _mask = edited['Exclude'].values.astype(bool)
+        excl_well_ids |= set(display.loc[_mask, 'WellID'].astype(str).tolist())
+
+    n_excl = len(excl_well_ids)
 
     btn_col, reset_col = st.columns([2, 1])
     with btn_col:
@@ -700,6 +850,8 @@ st.markdown("---")
 
 # ================= Type Wells =================
 st.header("Type Wells — Summary")
+if "merged_full" in st.session_state:
+    _global_rerun_button("rerun_all_tw")
 tw_tabs = st.tabs(["Oil", "Gas", "Water"])
 
 def _render_tw(fluid, on_key, mo_key, eur_col):
@@ -1426,7 +1578,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         story.append(Spacer(1, 10))
     story.append(Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles['Normal']))
     story.append(Spacer(1, 24))
-    
+
     # Parameters section
     story.append(Paragraph("Analysis Parameters", heading_style))
     story.append(Spacer(1, 12))
@@ -1533,7 +1685,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         well_count = len(oneline)
         story.append(Paragraph(f"Wells in Type Curve: {well_count} / {len(oneline_full)}", styles['Normal']))
         story.append(Spacer(1, 12))
-        
+
         # EUR Statistics
         if eur_col in oneline.columns:
             eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
@@ -1541,43 +1693,43 @@ def generate_comprehensive_pdf(tc_name: str = ""):
             if eurs:
                 stats = compute_eur_stats(eurs)
                 unit = "Mbbl" if fluid_name != "Gas" else "MMcf"
-                
+
                 story.append(Paragraph(f"EUR Statistics ({unit})", styles['Heading2']))
                 story.append(Spacer(1, 6))
-                
+
                 # Build EUR data table with available stats
                 eur_data = [["Metric", "Value"]]
-                
+
                 # Handle different possible key formats
                 count_key = next((k for k in stats.keys() if 'count' in k.lower()), None)
                 if count_key:
                     eur_data.append(["Count", f"{stats[count_key]:.0f}"])
-                
+
                 mean_key = next((k for k in stats.keys() if 'mean' in k.lower()), None)
                 if mean_key:
                     eur_data.append(["Mean", f"{stats[mean_key]:.2f}"])
-                
+
                 # Try P50 or median
                 p50_key = next((k for k in stats.keys() if 'p50' in k.lower() or 'median' in k.lower()), None)
                 if p50_key:
                     eur_data.append(["Median (P50)", f"{stats[p50_key]:.2f}"])
-                
+
                 p10_key = next((k for k in stats.keys() if 'p10' in k.lower()), None)
                 if p10_key:
                     eur_data.append(["P10", f"{stats[p10_key]:.2f}"])
-                
+
                 p90_key = next((k for k in stats.keys() if 'p90' in k.lower()), None)
                 if p90_key:
                     eur_data.append(["P90", f"{stats[p90_key]:.2f}"])
-                
+
                 min_key = next((k for k in stats.keys() if 'min' in k.lower()), None)
                 if min_key:
                     eur_data.append(["Min", f"{stats[min_key]:.2f}"])
-                
+
                 max_key = next((k for k in stats.keys() if 'max' in k.lower()), None)
                 if max_key:
                     eur_data.append(["Max", f"{stats[max_key]:.2f}"])
-                
+
                 eur_table = Table(eur_data, colWidths=[2.5*inch, 2*inch])
                 eur_table.setStyle(TableStyle([
                     ('BACKGROUND', (0, 0), (-1, 0), _phase_color_rgb(fluid_name)),
@@ -1589,14 +1741,14 @@ def generate_comprehensive_pdf(tc_name: str = ""):
                 ]))
                 story.append(eur_table)
                 story.append(Spacer(1, 18))
-        
+
         # B-factor statistics
         if 'b' in oneline.columns:
             b_vals = pd.to_numeric(oneline['b'], errors='coerce').dropna()
             if not b_vals.empty:
                 story.append(Paragraph("B-Factor Statistics", styles['Heading2']))
                 story.append(Spacer(1, 6))
-                
+
                 b_data = [
                     ["Metric", "Value"],
                     ["Count", f"{len(b_vals):.0f}"],
@@ -1605,7 +1757,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
                     ["P10", f"{np.percentile(b_vals, 10):.3f}"],
                     ["P90", f"{np.percentile(b_vals, 90):.3f}"]
                 ]
-                
+
                 b_table = Table(b_data, colWidths=[2.5*inch, 2*inch])
                 b_table.setStyle(TableStyle([
                     ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
@@ -1616,28 +1768,28 @@ def generate_comprehensive_pdf(tc_name: str = ""):
                 ]))
                 story.append(b_table)
                 story.append(Spacer(1, 18))
-        
+
        # Add plots
         hist_png, box_png, scatter_png, _ = bfactor_analytics_figures(oneline, fluid_name, eur_col)
-        
+
         if hist_png:
             story.append(Paragraph("B-Factor Distribution", styles['Heading2']))
             story.append(Spacer(1, 6))
             story.append(Image(hist_png, width=5*inch, height=2.5*inch))
             story.append(Spacer(1, 12))
-        
+
         # Create a new page for the three plots together
         story.append(PageBreak())
         story.append(Paragraph(f"{fluid_name} Analysis Charts", heading_style))
         story.append(Spacer(1, 12))
-        
+
         # EUR vs B-Factor
         if scatter_png:
             story.append(Paragraph("EUR vs B-Factor", styles['Heading2']))
             story.append(Spacer(1, 6))
             story.append(Image(scatter_png, width=5.5*inch, height=2.6*inch))
             story.append(Spacer(1, 10))
-        
+
         # Type curves — use the same curves already computed and scaled by _render_tw
         # so the PDF plot is guaranteed to match the UI plot exactly.
         _cached_curves = st.session_state.get(f"{fluid_name}_tc_curves", pd.DataFrame())
@@ -1713,7 +1865,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
                 ]))
                 story.append(tc_table)
             story.append(Spacer(1, 10))
-        
+
         # EUR summary table + probit plot
         if eur_col in oneline.columns:
             eurs = pd.to_numeric(oneline[eur_col], errors="coerce").dropna().astype(float).tolist()
@@ -1816,7 +1968,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         # ── Outlier detection: EUR vs Lateral Length ──
         _out = _make_outlier_fig(oneline, eur_col, fluid_name)
         if _out is not None:
-            _of, _uf, _na, _nr, _nflag, _med, _unit = _out
+            _of, _uf, _lf, _na, _nr, _nh, _nl, _med, _unit = _out
             story.append(Spacer(1, 10))
             story.append(Paragraph(f"{fluid_name} — EUR Outlier Detection", styles['Heading2']))
             story.append(Spacer(1, 6))
@@ -1824,11 +1976,11 @@ def generate_comprehensive_pdf(tc_name: str = ""):
             story.append(Spacer(1, 8))
             # Summary stats bar
             _stat_data = [[
-                Paragraph("<b>Active wells</b><br/>" + str(_na),           styles['Normal']),
-                Paragraph("<b>Removed wells</b><br/>" + str(_nr),          styles['Normal']),
-                Paragraph(f"<b>Median EUR</b><br/>{_med:,.0f} {_unit}",   styles['Normal']),
-                Paragraph(f"<b>Upper fence</b><br/>{_uf:,.0f} {_unit}",   styles['Normal']),
-                Paragraph(f"<b>Flagged</b><br/>{_nflag} wells",            styles['Normal']),
+                Paragraph("<b>Active wells</b><br/>" + str(_na),                styles['Normal']),
+                Paragraph(f"<b>Flagged</b><br/>{_nh} high / {_nl} low",         styles['Normal']),
+                Paragraph(f"<b>Median EUR</b><br/>{_med:,.0f} {_unit}",        styles['Normal']),
+                Paragraph(f"<b>Upper fence</b><br/>{_uf:,.0f} {_unit}",        styles['Normal']),
+                Paragraph(f"<b>Lower fence</b><br/>{_lf:,.0f} {_unit}",        styles['Normal']),
             ]]
             _stat_tbl = Table(_stat_data, colWidths=[1.2*inch]*5)
             _stat_tbl.setStyle(TableStyle([
@@ -1843,12 +1995,12 @@ def generate_comprehensive_pdf(tc_name: str = ""):
             story.append(Spacer(1, 10))
 
         story.append(PageBreak())
-    
+
     # Add each fluid section
     add_fluid_section("Oil", "Oil_oneline", "Oil_monthly", "EUR (Mbbl)")
     add_fluid_section("Gas", "Gas_oneline", "Gas_monthly", "EUR (MMcf)")
     add_fluid_section("Water", "Water_oneline", "Water_monthly", "EUR (Mbbl water)")
-    
+
     # Build PDF
     doc.build(story)
     return tmp.name
