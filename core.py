@@ -153,6 +153,53 @@ def fill_lateral_by_geo(
 class PreprocessConfig:
     normalization_length: int = 10_000
     use_normalization: bool = True
+    # Lateral-length scaling exponent a in (production ~ L^a).
+    # 1.0 == legacy linear scaling (EUR proportional to length).
+    # SPEE Monograph 5 ("Scaling") notes EUR/ft DECREASES with increasing
+    # lateral length, i.e. production scales sub-linearly (a < 1).
+    normalization_exponent: float = 1.0
+
+
+def estimate_lateral_exponent(header_df: pd.DataFrame, prod_df: pd.DataFrame,
+                              lo: float = 0.5, hi: float = 1.0) -> float | None:
+    """Estimate the lateral-length scaling exponent a where production ~ L^a.
+
+    SPEE Monograph 5 observes that EUR per foot decreases with increasing
+    lateral length, so cumulative production scales sub-linearly with length
+    (a < 1).  We approximate a by regressing log(cumulative BOE) on
+    log(lateral length) across wells, using total historical cum as an EUR
+    proxy (BOE = oil + gas/6).
+
+    Returns the slope clipped to [lo, hi], or None when the data are too sparse
+    or show no usable length variation (caller should fall back to 1.0/linear).
+    """
+    try:
+        hd = header_df.copy()
+        pr = prod_df.copy()
+        hd['WellID'] = _make_well_id(hd)
+        pr['WellID'] = _make_well_id(pr)
+
+        for c in ['TotalOil', 'TotalGas', 'TotalWater']:
+            pr[c] = pd.to_numeric(pr.get(c), errors='coerce').fillna(0.0)
+        pr['_boe'] = pr['TotalOil'] + pr['TotalGas'] / 6.0
+        cum = pr.groupby('WellID')['_boe'].sum().rename('cum')
+
+        hd['LateralLength'] = pd.to_numeric(hd['LateralLength'], errors='coerce')
+        lat = hd.groupby('WellID')['LateralLength'].first().rename('lat')
+
+        df = pd.concat([cum, lat], axis=1).dropna()
+        df = df[(df['cum'] > 0) & (df['lat'] > 0)]
+        if len(df) < 8 or df['lat'].nunique() < 4:
+            return None
+
+        slope, _intercept, r, _p, _se = stats.linregress(
+            np.log(df['lat'].values), np.log(df['cum'].values)
+        )
+        if not np.isfinite(slope):
+            return None
+        return float(np.clip(slope, lo, hi))
+    except Exception:
+        return None
 
 def _make_well_id(df: pd.DataFrame) -> pd.Series:
     """Creates composite ID from WellName + WellNumber"""
@@ -209,7 +256,11 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
         fallback = lat_median if pd.notna(lat_median) else float(cfg.normalization_length)
         merged['LateralLength'] = merged['LateralLength'].fillna(fallback)
 
-        s = cfg.normalization_length / merged['LateralLength']
+        # Sub-linear scaling per SPEE Monograph 5: production ~ L^a, so the
+        # normalization factor is (target/L)^a.  a = 1.0 reproduces the legacy
+        # linear behaviour; a < 1 reflects EUR/ft declining with length.
+        a = float(getattr(cfg, 'normalization_exponent', 1.0) or 1.0)
+        s = (cfg.normalization_length / merged['LateralLength']) ** a
 
         for c in ['TotalOil','TotalGas','TotalWater']:
             merged[c] = pd.to_numeric(merged[c], errors='coerce').fillna(0)
@@ -506,12 +557,95 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     eur_hist = float(y_hist.sum())
     eur_fcst = float(np.sum(f_v))
 
+    # ----------------------------------------------------------------
+    # Report (b, di) that are CONSISTENT with the model that actually
+    # produced the EUR.  When Modified Arps wins, use its own fit.  When
+    # SEPD or Duong wins, derive an Arps-equivalent (b, di) by fitting
+    # Modified Arps (qi fixed) to the winning model's decline+forecast so
+    # the oneline parameters and the EUR reconcile, and the type curve
+    # rebuilt from these parameters matches the per-well forecast shape.
+    # ----------------------------------------------------------------
+    if best_model == 'Modified Arps':
+        b_out, di_out = b_a, di_a
+    else:
+        t_eq = np.arange(0, n_post + max_months, dtype=float)
+        q_eq = np.concatenate([post_fit, f_vals_all])
+        meq = q_eq > 1e-9
+        if meq.sum() >= 4:
+            def _eq_obj(p):
+                return _log_mse(modified_arps(qi_peak, p[0], p[1], d_lim, t_eq[meq]),
+                                q_eq[meq])
+            eq_params, _ = _fit_model(_eq_obj, arps_starts,
+                                      [(b_low, b_high), (d_lim, 1.0)])
+            if eq_params is not None:
+                b_out, di_out = float(eq_params[0]), float(eq_params[1])
+            else:
+                b_out, di_out = b_a, di_a
+        else:
+            b_out, di_out = b_a, di_a
+
     return dict(
-        qi=qi_peak, b=b_a, di=di_a, d_lim=d_lim,
+        qi=qi_peak, b=b_out, di=di_out, d_lim=d_lim,
+        b_arps=b_a, di_arps=di_a,
         model=best_model, bics=bics,
+        n_months=int(len(t_hist)),
         t_hist=t_hist, hist=y_hist,
         fit_hist=fit_hist, f_months=f_m, f_vals=f_v,
         EUR_total=eur_hist + eur_fcst, EUR_fcst=eur_fcst,
+    )
+
+
+def hindcast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: float,
+                      train_frac: float = 0.6, d_lim: float = D_LIM_DEFAULT,
+                      min_train: int = 6, min_test: int = 3) -> Dict[str, object] | None:
+    """Back-test a single well's forecast (SPEE Monograph 5 — Validation).
+
+    Fit the decline workflow on the first ``train_frac`` of the well's history,
+    forecast across the held-out remainder, and compare to the actual produced
+    volumes.  Returns observed/predicted arrays plus error metrics, or None when
+    the history is too short to split meaningfully.
+
+    Metrics
+    -------
+    cum_err_pct : signed error of forecast cumulative vs actual cumulative over
+                  the test window (positive = forecast over-predicts).
+    mape_pct    : mean absolute percentage error across test months.
+    """
+    com = commodity.lower()
+    col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[com]
+    wd = wd.sort_values('MonthYear').copy()
+    n = len(wd)
+    n_train = int(round(n * train_frac))
+    if n < (min_train + min_test) or n_train < min_train or (n - n_train) < min_test:
+        return None
+
+    train = wd.iloc[:n_train]
+    test = wd.iloc[n_train:]
+    y_test = test[col].values.astype(float)
+    n_test = len(y_test)
+
+    fc = forecast_one_well(train, com, b_low, b_high, max_months=n_test + 12,
+                           models={}, d_lim=d_lim)
+    # fc forecast begins at the month after the end of training history.
+    y_pred = np.asarray(fc['f_vals'], dtype=float)[:n_test]
+    if len(y_pred) < n_test:
+        y_pred = np.concatenate([y_pred, np.full(n_test - len(y_pred), np.nan)])
+
+    valid = np.isfinite(y_pred) & np.isfinite(y_test) & (y_test > 0)
+    if valid.sum() == 0:
+        return None
+    mape = float(np.mean(np.abs(y_pred[valid] - y_test[valid]) / y_test[valid]) * 100.0)
+    cum_actual = float(np.sum(y_test[np.isfinite(y_test)]))
+    cum_pred = float(np.sum(y_pred[np.isfinite(y_pred)]))
+    cum_err = float((cum_pred - cum_actual) / cum_actual * 100.0) if cum_actual > 0 else np.nan
+
+    return dict(
+        n_train=n_train, n_test=n_test,
+        t_train=np.arange(1, n_train + 1, dtype=float),
+        y_train=train[col].values.astype(float),
+        t_test=np.arange(n_train + 1, n_train + 1 + n_test, dtype=float),
+        y_test=y_test, y_pred=y_pred,
+        mape_pct=mape, cum_err_pct=cum_err, model=fc.get('model'),
     )
 
 
@@ -522,7 +656,9 @@ class ForecastConfig:
     b_high: float = 1.2
     max_months: int = 600
     d_lim: float = D_LIM_DEFAULT      # terminal nominal decline rate (Modified Arps)
-    min_months_history: int = 3       # wells with fewer months are skipped
+    # SPEE Monograph 5 stresses "sufficient history" for individual forecasts;
+    # the default minimum is raised from 3 to 6 months.
+    min_months_history: int = 6       # wells with fewer months are skipped
 
 
 def _forecast_well_job(well_id, wd: pd.DataFrame, com: str,
@@ -603,6 +739,7 @@ def forecast_all(merged: pd.DataFrame,
             'CompletionDate':     hdr.get('CompletionDate'),
             'FirstProdDate':      hdr.get('FirstProdDate'),
             'Model':              fc.get('model', 'Modified Arps'),
+            'Months History':     int(fc.get('n_months', len(wd))),
             'qi (per day)':       round(qi_day, 0),
             'b':                  round(fc['b'], 3),
             'di (per month)':     round(fc['di'], 4),
