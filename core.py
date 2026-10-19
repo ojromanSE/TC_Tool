@@ -286,7 +286,8 @@ def arps(qi: float, b: float, di: float, t: np.ndarray) -> np.ndarray:
     """Classic hyperbolic Arps decline (legacy, no terminal floor)."""
     if b == 0 or b == 1:
         return qi / (1.0 + di * t)
-    return qi / ((1.0 + b * di * t) ** (1.0 / b))
+    t = np.asarray(t, dtype=float)
+    return np.exp(np.log(max(float(qi), 1e-300)) - np.log1p(b * di * t) / b)
 
 
 def modified_arps(qi: float, b: float, di: float, d_lim: float, t: np.ndarray) -> np.ndarray:
@@ -296,6 +297,13 @@ def modified_arps(qi: float, b: float, di: float, d_lim: float, t: np.ndarray) -
     Hyperbolic phase transitions to exponential at the switch time where the
     instantaneous nominal decline D(t) = d_lim (~5 %/yr), preventing the long
     tail that causes EUR over-estimation in unconventional wells.
+
+    The hyperbolic branch is evaluated in log space: for small b the exponent
+    1/b is huge, and (1 + b*di*t)**(1/b) overflows the float range — as a
+    Python-scalar power it raises OverflowError (silently dropping
+    near-exponential wells from the fit), and on arrays it yields inf/NaN.
+    exp(log(qi) - log1p(b*di*t)/b) is stable, tends to the correct
+    qi*exp(-di*t) limit as b -> 0, and merely underflows to 0.
     """
     t = np.asarray(t, dtype=float)
     if b <= 0:
@@ -303,9 +311,12 @@ def modified_arps(qi: float, b: float, di: float, d_lim: float, t: np.ndarray) -
     if di <= d_lim:
         return qi * np.exp(-d_lim * t)
     t_sw = (di / d_lim - 1.0) / (b * di)
-    q_sw = qi / ((1.0 + b * di * t_sw) ** (1.0 / b))
-    q_hyp = qi / ((1.0 + b * di * t) ** (1.0 / b))
-    q_exp = q_sw * np.exp(-d_lim * (t - t_sw))
+    lq = np.log(max(float(qi), 1e-300))
+    q_sw  = np.exp(lq - np.log1p(b * di * t_sw) / b)
+    q_hyp = np.exp(lq - np.log1p(b * di * t) / b)
+    # q_exp is only selected where t > t_sw (negative exponent); clamp the
+    # discarded t <= t_sw side so a huge t_sw (tiny b) cannot overflow exp.
+    q_exp = q_sw * np.exp(np.minimum(-d_lim * (t - t_sw), 0.0))
     return np.where(t <= t_sw, q_hyp, q_exp)
 
 
