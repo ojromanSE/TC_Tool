@@ -282,11 +282,29 @@ def preprocess(header_df: pd.DataFrame, prod_df: pd.DataFrame, cfg: PreprocessCo
 # Industry standard for Modified Arps (Robertson 1988 / SPE-78695)
 D_LIM_DEFAULT: float = 0.00417
 
+# BIC gap below which a more complex model is not preferred over the
+# 1-parameter Exponential model (Kass & Raftery 1995: ΔBIC < 2 is
+# "not worth more than a bare mention").
+EXP_BIC_TOLERANCE: float = 2.0
+
+def exponential(qi: float, di: float, t: np.ndarray) -> np.ndarray:
+    """Exponential decline (Arps b = 0): q(t) = qi * exp(-di * t).
+
+    The classic model for boundary-dominated flow in conventional / vertical
+    wells, where the nominal decline rate is constant (SPEE M5 flow-regime
+    guidance: BDF has b < 1, tending to b -> 0 for volumetric depletion).
+    """
+    t = np.asarray(t, dtype=float)
+    return qi * np.exp(-di * t)
+
+
 def arps(qi: float, b: float, di: float, t: np.ndarray) -> np.ndarray:
     """Classic hyperbolic Arps decline (legacy, no terminal floor)."""
-    if b == 0 or b == 1:
-        return qi / (1.0 + di * t)
     t = np.asarray(t, dtype=float)
+    if b <= 0:
+        return exponential(qi, di, t)      # b = 0 is the exponential limit
+    if b == 1:
+        return qi / (1.0 + di * t)         # harmonic
     return np.exp(np.log(max(float(qi), 1e-300)) - np.log1p(b * di * t) / b)
 
 
@@ -307,7 +325,10 @@ def modified_arps(qi: float, b: float, di: float, d_lim: float, t: np.ndarray) -
     """
     t = np.asarray(t, dtype=float)
     if b <= 0:
-        return qi / (1.0 + di * t)
+        # b = 0 is exponential decline (constant nominal D = di), NOT the
+        # harmonic form this branch used to return.  Honour the terminal
+        # floor by never declining slower than d_lim.
+        return exponential(qi, max(di, d_lim), t)
     if di <= d_lim:
         return qi * np.exp(-d_lim * t)
     t_sw = (di / d_lim - 1.0) / (b * di)
@@ -407,7 +428,9 @@ def _train_rf(df: pd.DataFrame, target_col: str) -> Dict[str, RandomForestRegres
 
 def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: float,
                       max_months: int, models: Dict[str, RandomForestRegressor],
-                      d_lim: float = D_LIM_DEFAULT) -> Dict[str, object]:
+                      d_lim: float = D_LIM_DEFAULT,
+                      allow_exponential: bool = False,
+                      exclude_duong: bool = False) -> Dict[str, object]:
     commodity = commodity.lower()
     col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[commodity]
 
@@ -470,10 +493,10 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     tau0 = max(1.0, 1.0 / max(di0, 1e-6))
 
     # ================================================================
-    # Fit all three models on the post-peak decline data with qi FIXED
+    # Fit the candidate models on the post-peak decline data with qi FIXED
     # to the actual peak rate.  Fixing qi (k→k-1 free params) guarantees
     # the curve passes through the peak month and eliminates the largest
-    # source of visual misfit.  BIC uses k=2 since one param is pinned.
+    # source of visual misfit.  BIC k counts only the free params.
     # ================================================================
 
     # -- Modified Arps: free params = (b, di) --
@@ -509,33 +532,60 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     tau_s, n_s = float(sepd_params[0]), float(sepd_params[1])
 
     # -- Duong: free params = (a, m) --
-    def _duong_obj(p):
-        return _log_mse(duong(qi_peak, p[0], p[1], t_fit), y_fit)
+    # Fracture-dominated transient-flow model for multi-fractured horizontals;
+    # skipped for vertical / conventional datasets (exclude_duong).
+    a_d = m_d = None
+    if not exclude_duong:
+        def _duong_obj(p):
+            return _log_mse(duong(qi_peak, p[0], p[1], t_fit), y_fit)
 
-    duong_starts = [
-        [1.0, 1.5],
-        [0.5, 1.2],
-        [2.0, 1.8],
-        [1.0, 2.0],
-    ]
-    duong_params, _ = _fit_model(_duong_obj, duong_starts, [(0.001, 10.0), (1.01, 3.0)])
-    if duong_params is None:
-        duong_params = np.array([1.0, 1.5])
-    a_d, m_d = float(duong_params[0]), float(duong_params[1])
+        duong_starts = [
+            [1.0, 1.5],
+            [0.5, 1.2],
+            [2.0, 1.8],
+            [1.0, 2.0],
+        ]
+        duong_params, _ = _fit_model(_duong_obj, duong_starts, [(0.001, 10.0), (1.01, 3.0)])
+        if duong_params is None:
+            duong_params = np.array([1.0, 1.5])
+        a_d, m_d = float(duong_params[0]), float(duong_params[1])
+
+    # -- Exponential (Arps b = 0): free param = di only --
+    # Offered for vertical / conventional datasets.  With one fewer free
+    # parameter its BIC penalty is lower, so it wins exactly when the data
+    # show no hyperbolic curvature, i.e. a near-exponential well.
+    di_e = None
+    if allow_exponential:
+        def _exp_obj(p):
+            return _log_mse(exponential(qi_peak, p[0], t_fit), y_fit)
+
+        exp_starts = [[di0], [min(di0 * 2, 1.0)], [max(di0 * 0.5, d_lim)]]
+        exp_params, _ = _fit_model(_exp_obj, exp_starts, [(d_lim, 1.0)])
+        di_e = float(exp_params[0]) if exp_params is not None else float(di0)
 
     # ================================================================
-    # Model selection by BIC (k=2 free params, lower = better)
+    # Model selection by BIC (lower = better).  k = free params with qi
+    # pinned: 2 for Modified Arps / SEPD / Duong, 1 for Exponential.
     # ================================================================
     pred_a = modified_arps(qi_peak, b_a,   di_a,  d_lim, t_fit)
     pred_s = sepd(          qi_peak, tau_s, n_s,          t_fit)
-    pred_d = duong(         qi_peak, a_d,   m_d,          t_fit)
 
     bics = {
         'Modified Arps': _bic(y_fit, pred_a, 2),
         'SEPD':          _bic(y_fit, pred_s, 2),
-        'Duong':         _bic(y_fit, pred_d, 2),
     }
+    if a_d is not None:
+        bics['Duong'] = _bic(y_fit, duong(qi_peak, a_d, m_d, t_fit), 2)
+    if di_e is not None:
+        bics['Exponential'] = _bic(y_fit, exponential(qi_peak, di_e, t_fit), 1)
     best_model = min(bics, key=bics.get)
+    # Parsimony tie-break: on the Kass–Raftery scale a BIC gap below 2 is
+    # "not worth more than a bare mention", so a 2-parameter model that beats
+    # the 1-parameter exponential by less than that has no real support —
+    # keep the simpler exponential for near-exponential wells.
+    if ('Exponential' in bics
+            and bics['Exponential'] - bics[best_model] < EXP_BIC_TOLERANCE):
+        best_model = 'Exponential'
 
     # ================================================================
     # Build fit_hist and forecast, both using peak-relative time axis.
@@ -554,6 +604,9 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     elif best_model == 'SEPD':
         post_fit   = sepd(qi_peak,  tau_s, n_s,           t_post)
         f_vals_all = sepd(qi_peak,  tau_s, n_s,           t_fcst)
+    elif best_model == 'Exponential':
+        post_fit   = exponential(qi_peak, di_e,           t_post)
+        f_vals_all = exponential(qi_peak, di_e,           t_fcst)
     else:  # Duong
         post_fit   = duong(qi_peak, a_d,   m_d,           t_post)
         f_vals_all = duong(qi_peak, a_d,   m_d,           t_fcst)
@@ -570,14 +623,17 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
 
     # ----------------------------------------------------------------
     # Report (b, di) that are CONSISTENT with the model that actually
-    # produced the EUR.  When Modified Arps wins, use its own fit.  When
-    # SEPD or Duong wins, derive an Arps-equivalent (b, di) by fitting
-    # Modified Arps (qi fixed) to the winning model's decline+forecast so
-    # the oneline parameters and the EUR reconcile, and the type curve
-    # rebuilt from these parameters matches the per-well forecast shape.
+    # produced the EUR.  Modified Arps reports its own fit; Exponential IS
+    # Arps with b = 0.  When SEPD or Duong wins, derive an Arps-equivalent
+    # (b, di) by fitting Modified Arps (qi fixed) to the winning model's
+    # decline+forecast so the oneline parameters and the EUR reconcile, and
+    # the type curve rebuilt from these parameters matches the per-well
+    # forecast shape.
     # ----------------------------------------------------------------
     if best_model == 'Modified Arps':
         b_out, di_out = b_a, di_a
+    elif best_model == 'Exponential':
+        b_out, di_out = 0.0, di_e
     else:
         t_eq = np.arange(0, n_post + max_months, dtype=float)
         q_eq = np.concatenate([post_fit, f_vals_all])
@@ -608,7 +664,9 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
 
 def hindcast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: float,
                       train_frac: float = 0.6, d_lim: float = D_LIM_DEFAULT,
-                      min_train: int = 6, min_test: int = 3) -> Dict[str, object] | None:
+                      min_train: int = 6, min_test: int = 3,
+                      allow_exponential: bool = False,
+                      exclude_duong: bool = False) -> Dict[str, object] | None:
     """Back-test a single well's forecast (SPEE Monograph 5 — Validation).
 
     Fit the decline workflow on the first ``train_frac`` of the well's history,
@@ -636,7 +694,9 @@ def hindcast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     n_test = len(y_test)
 
     fc = forecast_one_well(train, com, b_low, b_high, max_months=n_test + 12,
-                           models={}, d_lim=d_lim)
+                           models={}, d_lim=d_lim,
+                           allow_exponential=allow_exponential,
+                           exclude_duong=exclude_duong)
     # fc forecast begins at the month after the end of training history.
     y_pred = np.asarray(fc['f_vals'], dtype=float)[:n_test]
     if len(y_pred) < n_test:
@@ -670,14 +730,22 @@ class ForecastConfig:
     # SPEE Monograph 5 stresses "sufficient history" for individual forecasts;
     # the default minimum is raised from 3 to 6 months.
     min_months_history: int = 6       # wells with fewer months are skipped
+    # Vertical / conventional datasets: offer an explicit Exponential (b = 0)
+    # candidate, and drop Duong — a fracture-dominated transient-flow model
+    # that only applies to multi-fractured horizontal wells.
+    allow_exponential: bool = False
+    exclude_duong: bool = False
 
 
 def _forecast_well_job(well_id, wd: pd.DataFrame, com: str,
                        b_low: float, b_high: float, max_months: int,
-                       models: Dict, d_lim: float):
+                       models: Dict, d_lim: float,
+                       allow_exponential: bool = False, exclude_duong: bool = False):
     """Module-level worker for joblib parallel execution."""
     try:
-        fc = forecast_one_well(wd, com, b_low, b_high, max_months, models, d_lim)
+        fc = forecast_one_well(wd, com, b_low, b_high, max_months, models, d_lim,
+                               allow_exponential=allow_exponential,
+                               exclude_duong=exclude_duong)
         return well_id, wd, fc
     except Exception:
         return None
@@ -714,7 +782,8 @@ def forecast_all(merged: pd.DataFrame,
         delayed(_forecast_well_job)(
             well_id, wd, com,
             cfg.b_low, cfg.b_high, cfg.max_months,
-            models, cfg.d_lim
+            models, cfg.d_lim,
+            cfg.allow_exponential, cfg.exclude_duong,
         )
         for well_id, wd in well_data
     )

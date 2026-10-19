@@ -77,8 +77,26 @@ with st.sidebar:
         st.caption("Note: M5 also recommends scaling for kH and proppant intensity — not "
                    "applied here; bin on those instead (see Analogous Binning below).")
     st.markdown("---")
-    b_low  = st.number_input("b-factor Low", value=0.8, step=0.1, format="%.3f")
-    b_high = st.number_input("b-factor High", value=1.2, step=0.1, format="%.3f")
+    # b-factor bounds and the model set depend on the dataset type: conventional
+    # vertical wells decline exponentially-to-mildly-hyperbolic (b ≈ 0–0.5,
+    # SPEE M5 boundary-dominated-flow guidance); unconventional horizontals
+    # b ≈ 0.8–1.2.  Each mode remembers its own values via a mode-specific key.
+    _bk = "v" if vertical_wells else "h"
+    _b_lo_def, _b_hi_def = (0.0, 0.5) if vertical_wells else (0.8, 1.2)
+    b_low  = st.number_input("b-factor Low",  min_value=0.0, value=_b_lo_def, step=0.1,
+                             format="%.3f", key=f"b_low_{_bk}")
+    b_high = st.number_input("b-factor High", min_value=0.0, value=_b_hi_def, step=0.1,
+                             format="%.3f", key=f"b_high_{_bk}")
+    allow_exp = st.checkbox(
+        "Allow exponential decline (b = 0)", value=vertical_wells, key=f"allow_exp_{_bk}",
+        help=("Adds an explicit Exponential model (q = qi·e^(−di·t), one free parameter) "
+              "to the BIC model selection. It wins only when a well shows no hyperbolic "
+              "curvature, so near-exponential wells get an exponential forecast. "
+              "On by default for vertical datasets."),
+    )
+    if vertical_wells:
+        st.caption("Vertical dataset: Duong (fracture-dominated transient flow, horizontal "
+                   "wells only) is excluded; candidates are Exponential, Modified Arps, SEPD.")
     min_hist = st.number_input(
         "Min months history per well", 1, 60, 6, step=1,
         help=("SPEE M5 stresses sufficient history for individual forecasts. Wells with "
@@ -93,6 +111,13 @@ with st.sidebar:
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
+
+def _decline_models_label() -> str:
+    """Human-readable list of the decline models in BIC selection."""
+    models = (["Exponential"] if allow_exp else []) + ["Modified Arps", "SEPD"]
+    if not vertical_wells:
+        models.append("Duong")
+    return ", ".join(models)
 
 def _fmt2(value) -> str:
     try:
@@ -396,6 +421,7 @@ def _rerun_all_phases(keep_selections: bool = True) -> list:
             commodity=fl.lower(),
             b_low=float(b_low), b_high=float(b_high), max_months=600,
             min_months_history=int(min_hist),
+            allow_exponential=bool(allow_exp), exclude_duong=bool(vertical_wells),
         )
         oneline, monthly, well_fcs = forecast_all(merged, cfg)
         st.session_state[f"{fl}_oneline"]  = oneline
@@ -621,6 +647,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             commodity=fluid_name.lower(),
             b_low=float(b_low), b_high=float(b_high), max_months=600,
             min_months_history=int(min_hist),
+            allow_exponential=bool(allow_exp), exclude_duong=bool(vertical_wells),
         )
         oneline, monthly, well_fcs = forecast_all(merged, cfg)
         st.session_state[f"{fluid_name}_oneline"] = oneline
@@ -691,7 +718,9 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             fc = st.session_state[fcs_key][pick_id]
         else:
             models = _train_rf(merged, norm_col_for_models)
-            fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models)
+            fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models,
+                                   allow_exponential=bool(allow_exp),
+                                   exclude_duong=bool(vertical_wells))
         fig = plot_one_well(wd, fc, fluid_name.lower())
         st.pyplot(fig)
 
@@ -699,7 +728,9 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         if st.checkbox(f"Show hindcast validation ({fluid_name})", key=f"{fluid_name}_hc_chk",
                        help="Fit on the first 60% of this well's history and forecast the "
                             "held-out remainder to gauge forecast reliability (M5)."):
-            hc = hindcast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high))
+            hc = hindcast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high),
+                                   allow_exponential=bool(allow_exp),
+                                   exclude_duong=bool(vertical_wells))
             if hc is None:
                 st.info("Not enough history to hindcast this well (need ≥ ~9 months).")
             else:
@@ -1152,6 +1183,7 @@ def _build_pptx_data(tc_name: str) -> dict:
             'normLengthFt':   float(norm_len),
             'bFactorRange':   f"{b_low:.3f} - {b_high:.3f}",
             'scalingExponent': float(st.session_state.get('applied_norm_exponent', 1.0)),
+            'declineModels':  _decline_models_label(),
         },
         'analogCriteria': {
             'nAnalogs':        len(prim_tc),
@@ -1431,8 +1463,9 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
         ["Normalization Length", _ff(wm['normLengthFt'])],
         ["Scaling Exponent (a)", f"{wm.get('scalingExponent', 1.0):.2f}"],
         ["B-factor Range",       wm.get('bFactorRange', '')],
-    ], 0.4, 1.18, 4.5)
-    _txt(sl, "EUR Summary", 0.4, 2.7, 9, 0.3, size=12, bold=True, color=BODY_GRAY)
+        ["Decline Models",       wm.get('declineModels', '')],
+    ], 0.4, 1.18, 4.5, rh=0.27)
+    _txt(sl, "EUR Summary", 0.4, 3.15, 9, 0.3, size=12, bold=True, color=BODY_GRAY)
 
     def _eur_row(fd):
         return [_cap(fd['fluid']),
@@ -1444,7 +1477,7 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
 
     _table(sl, ["Fluid", "TC Wells", "P90 EUR", "P50 EUR", "P10 EUR", "Mean EUR"],
            [_eur_row(oil), _eur_row(gas), _eur_row(wtr)],
-           0.4, 3.02, [1.1, 0.9, 1.65, 1.65, 1.65, 1.65])
+           0.4, 3.45, [1.1, 0.9, 1.65, 1.65, 1.65, 1.65])
 
     # ── Slides 5/8/11: Fluid stats + parameters ────────────────────────────────
     for fd, pg in [(oil, 5), (gas, 8), (wtr, 11)]:
@@ -1589,6 +1622,8 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         ["Lateral Scaling Exponent (a)", f"{st.session_state.get('applied_norm_exponent', 1.0):.2f}"],
         ["Min Months History", str(int(min_hist))],
         ["B-factor Range", f"{b_low:.3f} - {b_high:.3f}"],
+        ["Decline Models", _decline_models_label()],
+        ["Vertical Dataset", "Yes" if vertical_wells else "No"],
         ["Geographic Bin Decimals", str(bin_decimals)]
     ]
     params_table = Table(params_data, colWidths=[3*inch, 2*inch])
