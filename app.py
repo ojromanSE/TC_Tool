@@ -370,6 +370,35 @@ if "merged_full" in st.session_state:
     _well_significance_note(_n_wells)
     st.markdown("---")
 
+# ================= Editor-state helpers =================
+# Streamlit does not allow a widget's session_state entry to be changed after
+# that widget has been drawn in the current script run, so checkbox-editor
+# resets are *requested* when a selection changes and *consumed* on the next
+# run, immediately before the editor is instantiated.
+_EDITOR_KEYS = {
+    'analog':  lambda fl: (f"{fl}_analog_editor",),
+    'outlier': lambda fl: (f"{fl}_outlier_editor_high", f"{fl}_outlier_editor_low"),
+}
+
+def _request_editor_reset(fluid: str, group: str | None = None) -> None:
+    for g in (_EDITOR_KEYS if group is None else [group]):
+        st.session_state[f"{fluid}_reset_{g}_editor"] = True
+
+def _consume_editor_reset(fluid: str, group: str) -> None:
+    """Perform a deferred editor reset. Call BEFORE drawing that editor."""
+    if st.session_state.pop(f"{fluid}_reset_{group}_editor", False):
+        for k in _EDITOR_KEYS[group](fluid):
+            st.session_state.pop(k, None)
+
+def _flash(key: str, msg: str) -> None:
+    """Queue a success message that survives the st.rerun() that follows."""
+    st.session_state[key] = msg
+
+def _show_flash(key: str) -> None:
+    msg = st.session_state.pop(key, None)
+    if msg:
+        st.success(msg)
+
 # ================= Global Re-run (update all TCs) =================
 def _rerun_all_phases(keep_selections: bool = True) -> list:
     """Re-merge with the CURRENT sidebar settings (normalization length,
@@ -435,10 +464,10 @@ def _rerun_all_phases(keep_selections: bool = True) -> list:
         else:
             st.session_state.pop(sel_key, None)
         # Reset checkbox-editor widget state so stale positional edits don't
-        # misapply if the well list changed (e.g. min-history raised).
-        for _wk in (f"{fl}_analog_editor",
-                    f"{fl}_outlier_editor_high", f"{fl}_outlier_editor_low"):
-            st.session_state.pop(_wk, None)
+        # misapply if the well list changed (e.g. min-history raised).  The
+        # reset is deferred to the next run (before the editors are drawn):
+        # Streamlit forbids touching a widget's state after it is instantiated.
+        _request_editor_reset(fl)
         ran.append(fl)
     return ran
 
@@ -548,10 +577,10 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
     hist = hist.sort_values(['WellID','Date'])
     hist['t'] = hist.groupby('WellID').cumcount() + 1
     lines = []
-    for _, g in hist.groupby('WellID'):
+    for _wid, g in hist.groupby('WellID'):
         t = g['t'].to_numpy()
         y = np.clip(g[vol_col].to_numpy(), 1e-6, None)
-        lines.append((t, y))
+        lines.append((t, y, str(_wid)))
 
     # Build smooth type curves from per-well Arps parameters sorted by EUR.
     # Grouping by EUR percentile and taking median qi/b/di per group produces
@@ -617,10 +646,11 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
     return pd.DataFrame(smooth), lines
 
 def plot_type_curves(curves, lines, fluid):
+    """Static (matplotlib) type-curve chart — used for the PDF/PPTX reports."""
     color = _phase_color(fluid)
     fig, ax = plt.subplots(figsize=(9,5))
     if lines:
-        for t, y in lines:
+        for t, y, *_ in lines:
             ax.plot(t, y, color='gray', alpha=0.3, linewidth=0.5)
     if not curves.empty:
         ax.plot(curves['t'], curves['P50'], color=color, linewidth=2, label='P50')
@@ -632,6 +662,105 @@ def plot_type_curves(curves, lines, fluid):
     ax.set_yscale('log'); ax.set_ylim(bottom=1)
     ax.legend()
     return fig
+
+
+try:
+    import plotly.graph_objects as go
+    _HAS_PLOTLY = True
+except ImportError:          # chart falls back to the static matplotlib version
+    go = None
+    _HAS_PLOTLY = False
+
+
+def _selection_fingerprint(ids) -> str:
+    """Short stable digest of a well-ID set. Chart widgets are keyed by it so
+    their click-selection state resets whenever the plotted well set changes
+    (a stale selection would otherwise map onto the wrong curves)."""
+    import hashlib
+    return hashlib.md5("|".join(sorted(map(str, ids))).encode()).hexdigest()[:10]
+
+
+def plot_type_curves_interactive(curves, lines, fluid, name_map, highlight_ids=()):
+    """Interactive (plotly) type-curve chart for the UI.
+
+    Every background well trace carries its well name in the hover tooltip and
+    its WellID as per-point customdata so chart clicks can be mapped back to
+    wells.  Highlighted wells are drawn last (on top) in orange.  Returns
+    (fig, trace_well_ids) where trace_well_ids[i] is the WellID of trace i, or
+    None for the P10/P50/P90/Mean curves."""
+    color = _phase_color(fluid)
+    unit  = {"oil": "bbl/mo", "gas": "Mcf/mo", "water": "bbl/mo"}[fluid]
+    highlight_ids = set(map(str, highlight_ids))
+    fig, trace_ids, ymax = go.Figure(), [], 10.0
+    # Plain wells first, highlighted last so they render on top.
+    for t, y, wid in sorted(lines, key=lambda l: str(l[2]) in highlight_ids):
+        wid, hl = str(wid), str(wid) in highlight_ids
+        label = name_map.get(wid, wid)
+        if len(y):
+            ymax = max(ymax, float(np.nanmax(y)))
+        fig.add_trace(go.Scatter(
+            x=t, y=y, mode='lines', name=label, showlegend=False,
+            line=dict(color='#FF8C00' if hl else 'rgba(120,120,120,0.45)',
+                      width=3 if hl else 1),
+            customdata=[wid] * len(t),
+            hovertemplate=f"<b>{label}</b><br>Month %{{x}}<br>%{{y:,.0f}} {unit}<extra></extra>",
+        ))
+        trace_ids.append(wid)
+    if not curves.empty:
+        ymax = max(ymax, float(np.nanmax(curves[['P10', 'P50', 'P90']].to_numpy())))
+        for col, dash, width in (('P10', 'dash', 2), ('P50', 'solid', 3), ('P90', 'dash', 2)):
+            fig.add_trace(go.Scatter(
+                x=curves['t'], y=curves[col], mode='lines', name=col,
+                line=dict(color=color, dash=dash, width=width),
+                hovertemplate=f"<b>{col}</b><br>Month %{{x}}<br>%{{y:,.0f}} {unit}<extra></extra>",
+            ))
+            trace_ids.append(None)
+        if 'Mean' in curves.columns:
+            fig.add_trace(go.Scatter(
+                x=curves['t'], y=curves['Mean'], mode='lines', name='Mean (avg well)',
+                line=dict(color='black', dash='dot', width=1.5),
+                hovertemplate=f"<b>Mean</b><br>Month %{{x}}<br>%{{y:,.0f}} {unit}<extra></extra>",
+            ))
+            trace_ids.append(None)
+    fig.update_layout(
+        height=480, margin=dict(l=50, r=20, t=30, b=45), hovermode='closest',
+        clickmode='event+select',
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, x=0),
+        xaxis_title='Month of Production',
+        yaxis_title=f"Monthly {fluid} (norm {unit})",
+    )
+    fig.update_yaxes(type='log', range=[0, np.log10(ymax) + 0.1])
+    return fig, trace_ids
+
+
+def _chart_clicked_wells(plot_key: str, trace_ids) -> set:
+    """WellIDs of the background curves the analyst has clicked on the chart,
+    read from the chart widget's stored selection state (available before the
+    chart is drawn again, so the clicked curves can be styled)."""
+    state = st.session_state.get(plot_key)
+    points = []
+    if state is not None:
+        try:
+            points = state["selection"]["points"]
+        except Exception:
+            try:
+                points = state.selection.points
+            except Exception:
+                points = []
+    found = set()
+    for p in points or []:
+        get = p.get if isinstance(p, dict) else (lambda k, d=None: getattr(p, k, d))
+        wid = None
+        cd = get("customdata")
+        if cd is not None:
+            wid = cd[0] if isinstance(cd, (list, tuple)) and cd else cd
+        if wid is None:
+            cn = get("curve_number")
+            if cn is not None and 0 <= int(cn) < len(trace_ids):
+                wid = trace_ids[int(cn)]
+        if wid is not None:
+            found.add(str(wid))
+    return found
 
 # ================= Fluid Block =================
 def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
@@ -775,6 +904,7 @@ def _outlier_section(fluid: str, on_key: str, eur_col: str):
         st.info(f"Run {fluid} forecast first.")
         return
 
+    _show_flash(f"{fluid}_outlier_flash")
     oneline = st.session_state[on_key]
     result  = _make_outlier_fig(oneline, eur_col, fluid)
     if result is None:
@@ -817,60 +947,81 @@ def _outlier_section(fluid: str, on_key: str, eur_col: str):
         st.success(f"No outliers detected for {fluid}.")
         return
 
-    st.markdown(f"**{len(high_df) + len(low_df)} outlier(s) detected.** Check wells to "
-                "exclude from the Type Curve, then click **Update TC**.")
+    st.markdown(f"**{len(high_df) + len(low_df)} outlier(s) detected.** Tick wells to exclude, "
+                "or use a bulk button, then click **Apply** — nothing recomputes until you do.")
 
     show_cols = [c for c in ['WellName', 'API10', 'LateralLength', 'Months History', eur_col]
                  if c in df.columns]
+    _consume_editor_reset(fluid, 'outlier')
     current_excluded = all_ids - st.session_state[sel_key]
-    excl_well_ids: set = set()
+    flagged_ids = set(high_df['WellID'].astype(str)) | set(low_df['WellID'].astype(str))
+    tables = []
 
-    for _label, _flag_df, _ed_key in [
-        (f"⬆ High EUR outliers — above {upper_f:,.0f} {unit} (1.5×IQR fence)",
-         high_df, f"{fluid}_outlier_editor_high"),
-        (f"⬇ Low EUR outliers — below {lower_f:,.0f} {unit} (log-space 1.5×IQR fence)",
-         low_df, f"{fluid}_outlier_editor_low"),
-    ]:
-        st.markdown(f"**{_label}**")
-        if _flag_df.empty:
-            st.caption("None detected.")
-            continue
+    # Everything inside the form is collected without triggering a script
+    # rerun; only the submit buttons below do.
+    with st.form(key=f"{fluid}_outlier_form", border=False):
+        for _label, _flag_df, _ed_key in [
+            (f"⬆ High EUR outliers — above {upper_f:,.0f} {unit} (1.5×IQR fence)",
+             high_df, f"{fluid}_outlier_editor_high"),
+            (f"⬇ Low EUR outliers — below {lower_f:,.0f} {unit} (log-space 1.5×IQR fence)",
+             low_df, f"{fluid}_outlier_editor_low"),
+        ]:
+            st.markdown(f"**{_label}**")
+            if _flag_df.empty:
+                st.caption("None detected.")
+                continue
 
-        display = _flag_df[['WellID'] + show_cols].reset_index(drop=True)
-        display.insert(0, "Exclude", display['WellID'].astype(str).isin(current_excluded).tolist())
+            display = _flag_df[['WellID'] + show_cols].reset_index(drop=True)
+            display.insert(0, "Exclude", display['WellID'].astype(str).isin(current_excluded).tolist())
 
-        col_cfg = {"Exclude": st.column_config.CheckboxColumn("Exclude", default=False)}
-        for c in show_cols:
-            col_cfg[c] = st.column_config.TextColumn(c, disabled=True)
+            col_cfg = {"Exclude": st.column_config.CheckboxColumn("Exclude", default=False)}
+            for c in show_cols:
+                col_cfg[c] = st.column_config.TextColumn(c, disabled=True)
 
-        edited = st.data_editor(
-            display.drop(columns=['WellID']),
-            column_config=col_cfg,
-            hide_index=True,
-            use_container_width=True,
-            key=_ed_key,
-        )
-        _mask = edited['Exclude'].values.astype(bool)
-        excl_well_ids |= set(display.loc[_mask, 'WellID'].astype(str).tolist())
+            edited = st.data_editor(
+                display.drop(columns=['WellID']),
+                column_config=col_cfg,
+                hide_index=True,
+                use_container_width=True,
+                key=_ed_key,
+            )
+            tables.append((display, edited))
 
-    n_excl = len(excl_well_ids)
+        b1, b2, b3, b4 = st.columns(4)
+        apply_ticked = b1.form_submit_button("Apply ticked exclusions", type="primary",
+                                             use_container_width=True)
+        excl_high    = b2.form_submit_button(f"Exclude all {len(high_df)} high",
+                                             disabled=high_df.empty, use_container_width=True)
+        excl_low     = b3.form_submit_button(f"Exclude all {len(low_df)} low",
+                                             disabled=low_df.empty, use_container_width=True)
+        excl_all     = b4.form_submit_button(f"Exclude all {len(flagged_ids)} flagged",
+                                             use_container_width=True)
 
-    btn_col, reset_col = st.columns([2, 1])
-    with btn_col:
-        if st.button(
-            f"Update {fluid} Type Curve — remove {n_excl} outlier(s)" if n_excl else f"Select wells above to exclude",
-            disabled=(n_excl == 0),
-            type="primary",
-            key=f"{fluid}_apply_outlier",
-        ):
-            st.session_state[sel_key] = all_ids - excl_well_ids
-            st.success(f"{fluid}: {n_excl} well(s) removed from Type Curve. Scroll down to see the updated TC.")
-            st.rerun()
-    with reset_col:
-        if st.button(f"Reset {fluid} selection", key=f"{fluid}_reset_outlier"):
-            st.session_state[sel_key] = all_ids.copy()
-            st.success(f"{fluid} Type Curve restored to all {len(all_ids)} wells.")
-            st.rerun()
+    if apply_ticked or excl_high or excl_low or excl_all:
+        new_excl: set = set()
+        for display, edited in tables:
+            _mask = edited['Exclude'].values.astype(bool)
+            new_excl |= set(display.loc[_mask, 'WellID'].astype(str).tolist())
+        if excl_high or excl_all:
+            new_excl |= set(high_df['WellID'].astype(str))
+        if excl_low or excl_all:
+            new_excl |= set(low_df['WellID'].astype(str))
+        # Keep exclusions made elsewhere (analog table / chart) for wells that
+        # are not in these outlier tables.
+        other_excl = current_excluded - flagged_ids
+        st.session_state[sel_key] = all_ids - (new_excl | other_excl)
+        _request_editor_reset(fluid)
+        _flash(f"{fluid}_outlier_flash",
+               f"{fluid}: {len(new_excl)} outlier(s) excluded from the Type Curve "
+               f"({len(st.session_state[sel_key])} / {len(all_ids)} wells remain). "
+               "Scroll down to see the updated TC.")
+        st.rerun()
+
+    if st.button(f"Reset {fluid} selection (include all wells)", key=f"{fluid}_reset_outlier"):
+        st.session_state[sel_key] = all_ids.copy()
+        _request_editor_reset(fluid)
+        _flash(f"{fluid}_outlier_flash", f"{fluid} Type Curve restored to all {len(all_ids)} wells.")
+        st.rerun()
 
 _out_tabs = st.tabs(["Oil", "Gas", "Water"])
 with _out_tabs[0]: _outlier_section("Oil",   "Oil_oneline",   "EUR (Mbbl)")
@@ -890,23 +1041,32 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
         st.info(f"Run {fluid} first.")
         return
 
+    _show_flash(f"{fluid}_tw_flash")
     oneline_full = st.session_state[on_key]
 
-    # --- Analog selection table ---
+    # --- Analog selection state: set of included WellIDs ---
     sel_key = f"{fluid}_tc_selection"
+    all_ids = set(oneline_full['WellID'].astype(str).tolist())
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = all_ids.copy()
+    # Drop IDs that no longer exist (e.g. after a re-forecast changed the well list)
+    st.session_state[sel_key] = set(st.session_state[sel_key]) & all_ids
+    saved_ids = st.session_state[sel_key]
+
+    # WellID -> display name (disambiguate duplicate well names with the ID)
+    _names = oneline_full[['WellID', 'WellName']].astype(str)
+    _dup = _names['WellName'].duplicated(keep=False)
+    name_map = {}
+    for wid, nm, d in zip(_names['WellID'], _names['WellName'], _dup):
+        nm = wid if (not nm or nm == 'nan') else nm
+        name_map[wid] = f"{nm} ({wid})" if d else nm
 
     # Build display columns available in the oneline
     show_cols = [c for c in [
         'WellName', 'PrimaryFormation', 'LateralLength', eur_col
     ] if c in oneline_full.columns]
 
-    # Initialise selection state: set of all WellIDs (all selected)
-    all_ids = set(oneline_full['WellID'].astype(str).tolist())
-    if sel_key not in st.session_state:
-        st.session_state[sel_key] = all_ids
-
-    # Build editable frame: "Select" checkbox + display columns
-    saved_ids = st.session_state[sel_key]
+    _consume_editor_reset(fluid, 'analog')
     editor_df = oneline_full[show_cols].copy().reset_index(drop=True)
     editor_df.insert(0, "Select", oneline_full['WellID'].astype(str).isin(saved_ids).tolist())
 
@@ -918,20 +1078,39 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
     left_col, right_col = st.columns([1, 1])
 
     with left_col:
-        st.caption(f"**Analog Wells** — check/uncheck to include or exclude from the Type Curve ({len(oneline_full)} wells total)")
-        edited = st.data_editor(
-            editor_df,
-            column_config=col_cfg,
-            use_container_width=True,
-            hide_index=True,
-            key=f"{fluid}_analog_editor",
-        )
+        st.caption(f"**Analog Wells** — tick/untick, then **Apply selection**; nothing "
+                   f"recomputes until you do ({len(oneline_full)} wells total).")
+        # The data editor sits inside a form so ticking boxes does not rerun the app.
+        with st.form(key=f"{fluid}_analog_form", border=False):
+            edited = st.data_editor(
+                editor_df,
+                column_config=col_cfg,
+                use_container_width=True,
+                hide_index=True,
+                key=f"{fluid}_analog_editor",
+            )
+            fb1, fb2, fb3 = st.columns(3)
+            apply_sel = fb1.form_submit_button("Apply selection", type="primary",
+                                               use_container_width=True)
+            sel_all   = fb2.form_submit_button("Select all", use_container_width=True)
+            desel_all = fb3.form_submit_button("Deselect all", use_container_width=True)
+        if apply_sel or sel_all or desel_all:
+            if sel_all:
+                new_sel = all_ids.copy()
+            elif desel_all:
+                new_sel = set()
+            else:
+                _mask = edited["Select"].values.astype(bool)
+                new_sel = set(oneline_full['WellID'].astype(str).to_numpy()[_mask].tolist())
+            st.session_state[sel_key] = new_sel
+            _request_editor_reset(fluid, 'analog')
+            _flash(f"{fluid}_tw_flash", f"{fluid}: {len(new_sel)} / {len(all_ids)} wells selected "
+                                        "for the Type Curve.")
+            st.rerun()
 
-    # Persist selection as a set of WellIDs (robust across reruns/index shifts)
-    selected_mask = edited["Select"].values.astype(bool)
-    oneline_filtered = oneline_full[selected_mask].reset_index(drop=True)
-    st.session_state[sel_key] = set(oneline_filtered['WellID'].astype(str).tolist())
-    n_sel = int(selected_mask.sum())
+    sel_ids = set(st.session_state[sel_key])
+    oneline_filtered = oneline_full[oneline_full['WellID'].astype(str).isin(sel_ids)].reset_index(drop=True)
+    n_sel = len(oneline_filtered)
     n_tot = len(oneline_full)
 
     # Compute EUR stats upfront so P50 curve can be scaled to match
@@ -943,7 +1122,6 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
 
     with right_col:
         if mo_key in st.session_state and n_sel > 0:
-            sel_ids = set(oneline_filtered['WellID'].astype(str))
             monthly_filtered = st.session_state[mo_key][
                 st.session_state[mo_key]['WellID'].astype(str).isin(sel_ids)
             ]
@@ -965,7 +1143,47 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
                             curves[_pct] = curves[_pct] * (eur_stats[_stat] * 1000 / _csum)
             st.session_state[f"{fluid}_tc_curves"] = curves
             st.session_state[f"{fluid}_tc_lines"] = lines
-            st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
+
+            if _HAS_PLOTLY:
+                sel_fp = _selection_fingerprint(sel_ids)
+                # Widgets keyed by the plotted well set so stale state is dropped
+                # whenever the selection changes.
+                hl_ids = set(st.multiselect(
+                    "Highlight wells on chart",
+                    options=sorted(sel_ids, key=lambda w: name_map.get(w, w).lower()),
+                    format_func=lambda w: name_map.get(w, w),
+                    key=f"{fluid}_hl_{sel_fp}",
+                    placeholder="Pick wells to light up their curves…",
+                ))
+                plot_key = f"{fluid}_tc_plot_{sel_fp}_{_selection_fingerprint(hl_ids)}"
+                fig, trace_ids = plot_type_curves_interactive(
+                    curves, lines, fluid.lower(), name_map, hl_ids)
+                clicked = _chart_clicked_wells(plot_key, trace_ids)
+                for i, wid in enumerate(trace_ids):
+                    if wid is not None and wid in clicked:
+                        fig.data[i].line.color = '#D32F2F'
+                        fig.data[i].line.width = 3
+                st.plotly_chart(fig, use_container_width=True, key=plot_key,
+                                on_select="rerun", selection_mode="points")
+                st.caption("Hover a curve to see its well. Click a curve to select it "
+                           "(shift-click for several; double-click the background to clear), "
+                           "then exclude below.")
+                picked = clicked | hl_ids
+                if picked:
+                    st.markdown("**Selected:** " + ", ".join(
+                        name_map.get(w, w) for w in sorted(picked, key=lambda w: name_map.get(w, w))))
+                    if st.button(f"Exclude {len(picked)} selected well(s) from Type Curve",
+                                 key=f"{fluid}_excl_picked_{sel_fp}", type="primary"):
+                        st.session_state[sel_key] = sel_ids - picked
+                        _request_editor_reset(fluid, 'analog')
+                        _flash(f"{fluid}_tw_flash",
+                               f"{fluid}: excluded {len(picked)} well(s) from the Type Curve "
+                               f"({len(sel_ids - picked)} / {n_tot} remain).")
+                        st.rerun()
+            else:
+                st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
+                st.caption("Install `plotly` for an interactive chart with hover names "
+                           "and click-to-select.")
 
     # ── EUR summary below ──
     st.caption(f"**{n_sel} / {n_tot} wells selected**")
