@@ -11,6 +11,9 @@ joblib>=1.3.0
 matplotlib==3.9.2
 pillow==10.4.0
 
+# Interactive type-curve chart (hover well names, click-to-select)
+plotly>=5.18.0
+
 # App framework
 streamlit==1.39.0
 
