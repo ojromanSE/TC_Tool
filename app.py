@@ -1041,11 +1041,13 @@ def fluid_block(fluid_name: str, eur_col: str):
             else:
                 st.markdown(
                     "**Flow-regime diagnostics.** Rate–time on log-log axes with reference slopes, "
-                    "and the nominal decline D(t) and Arps b(t) estimated from the data "
-                    "(Bourdet-smoothed derivative) against the fitted model. A half slope with "
-                    "b ≈ 2 is transient linear flow; b falling below ~1 with a flattening D is "
-                    "boundary-dominated flow. The last few points use one-sided differences and "
-                    "are unreliable — read the interior, not the end."
+                    "and the nominal decline D(t) and Arps b(t) estimated from the data against the "
+                    "fitted model. D and b come from centred moving-window regressions (13- and "
+                    "19-month windows) of ln q and 1/D; the log-log slope is a Bourdet derivative. "
+                    "A half slope with b ≈ 2 is transient linear flow; b falling below ~1 with a "
+                    "flattening D is boundary-dominated flow. b is a second derivative of noisy "
+                    "monthly data, so read the trend of the interior points, not single values, and "
+                    "discount the first and last few points (truncated windows)."
                 )
                 _ol = st.session_state[on_key]
                 _dpick = st.selectbox(f"Well ({fluid_name} diagnostics)",
