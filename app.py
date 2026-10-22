@@ -371,24 +371,24 @@ if "merged_full" in st.session_state:
     st.markdown("---")
 
 # ================= Editor-state helpers =================
-# Streamlit does not allow a widget's session_state entry to be changed after
-# that widget has been drawn in the current script run, so checkbox-editor
-# resets are *requested* when a selection changes and *consumed* on the next
-# run, immediately before the editor is instantiated.
-_EDITOR_KEYS = {
-    'analog':  lambda fl: (f"{fl}_analog_editor",),
-    'outlier': lambda fl: (f"{fl}_outlier_editor_high", f"{fl}_outlier_editor_low"),
-}
+# A checkbox editor's edits live in the browser and are re-sent for as long as
+# the widget keeps the same identity; deleting its session_state entry only
+# clears the server-side copy.  The robust way to reset an editor is therefore
+# to give it a NEW key: a per-fluid generation counter is bumped whenever the
+# applied selection changes and is embedded in the editor keys.  (Streamlit
+# only forbids *assigning* a widget's state after it is drawn; bumping this
+# plain counter is allowed at any point in the run.)
+_EDITOR_GROUPS = ('analog', 'outlier')
+
+def _editor_gen(fluid: str, group: str) -> int:
+    return int(st.session_state.get(f"{fluid}_{group}_editor_gen", 0))
 
 def _request_editor_reset(fluid: str, group: str | None = None) -> None:
-    for g in (_EDITOR_KEYS if group is None else [group]):
-        st.session_state[f"{fluid}_reset_{g}_editor"] = True
+    for g in (_EDITOR_GROUPS if group is None else [group]):
+        st.session_state[f"{fluid}_{g}_editor_gen"] = _editor_gen(fluid, g) + 1
 
-def _consume_editor_reset(fluid: str, group: str) -> None:
-    """Perform a deferred editor reset. Call BEFORE drawing that editor."""
-    if st.session_state.pop(f"{fluid}_reset_{group}_editor", False):
-        for k in _EDITOR_KEYS[group](fluid):
-            st.session_state.pop(k, None)
+def _editor_key(fluid: str, group: str, name: str) -> str:
+    return f"{fluid}_{name}_g{_editor_gen(fluid, group)}"
 
 def _flash(key: str, msg: str) -> None:
     """Queue a success message that survives the st.rerun() that follows."""
@@ -463,10 +463,8 @@ def _rerun_all_phases(keep_selections: bool = True) -> list:
             st.session_state[sel_key] = kept if kept else new_ids
         else:
             st.session_state.pop(sel_key, None)
-        # Reset checkbox-editor widget state so stale positional edits don't
-        # misapply if the well list changed (e.g. min-history raised).  The
-        # reset is deferred to the next run (before the editors are drawn):
-        # Streamlit forbids touching a widget's state after it is instantiated.
+        # Reset the checkbox editors so stale edits don't misapply if the
+        # well list changed (e.g. min-history raised).
         _request_editor_reset(fl)
         ran.append(fl)
     return ran
@@ -683,25 +681,29 @@ def _selection_fingerprint(ids) -> str:
 def plot_type_curves_interactive(curves, lines, fluid, name_map, highlight_ids=()):
     """Interactive (plotly) type-curve chart for the UI.
 
-    Every background well trace carries its well name in the hover tooltip and
-    its WellID as per-point customdata so chart clicks can be mapped back to
-    wells.  Highlighted wells are drawn last (on top) in orange.  Returns
-    (fig, trace_well_ids) where trace_well_ids[i] is the WellID of trace i, or
-    None for the P10/P50/P90/Mean curves."""
+    Background well traces are drawn in the order of *lines* (never reordered,
+    so trace indices are stable), carry the well name in the hover tooltip and
+    the WellID as per-point customdata so chart clicks map back to wells.  They
+    use invisible markers because plotly only selects points on traces that
+    have markers — a lines-only trace can be hovered but never clicked.
+    Highlighted wells get an orange overlay trace appended on top.  Returns
+    (fig, trace_well_ids) where trace_well_ids[i] is the WellID of background
+    trace i and None for every other trace."""
     color = _phase_color(fluid)
     unit  = {"oil": "bbl/mo", "gas": "Mcf/mo", "water": "bbl/mo"}[fluid]
     highlight_ids = set(map(str, highlight_ids))
     fig, trace_ids, ymax = go.Figure(), [], 10.0
-    # Plain wells first, highlighted last so they render on top.
-    for t, y, wid in sorted(lines, key=lambda l: str(l[2]) in highlight_ids):
-        wid, hl = str(wid), str(wid) in highlight_ids
+    for t, y, wid in lines:
+        wid = str(wid)
         label = name_map.get(wid, wid)
         if len(y):
             ymax = max(ymax, float(np.nanmax(y)))
         fig.add_trace(go.Scatter(
-            x=t, y=y, mode='lines', name=label, showlegend=False,
-            line=dict(color='#FF8C00' if hl else 'rgba(120,120,120,0.45)',
-                      width=3 if hl else 1),
+            x=t, y=y, mode='lines+markers', name=label, showlegend=False,
+            line=dict(color='rgba(120,120,120,0.45)', width=1),
+            marker=dict(size=6, opacity=0),
+            selected=dict(marker=dict(opacity=0)),
+            unselected=dict(marker=dict(opacity=0)),
             customdata=[wid] * len(t),
             hovertemplate=f"<b>{label}</b><br>Month %{{x}}<br>%{{y:,.0f}} {unit}<extra></extra>",
         ))
@@ -720,6 +722,16 @@ def plot_type_curves_interactive(curves, lines, fluid, name_map, highlight_ids=(
                 x=curves['t'], y=curves['Mean'], mode='lines', name='Mean (avg well)',
                 line=dict(color='black', dash='dot', width=1.5),
                 hovertemplate=f"<b>Mean</b><br>Month %{{x}}<br>%{{y:,.0f}} {unit}<extra></extra>",
+            ))
+            trace_ids.append(None)
+    # Orange overlays for highlighted wells, appended last so they sit on top
+    # (the grey base trace underneath keeps providing the hover tooltip).
+    for t, y, wid in lines:
+        if str(wid) in highlight_ids:
+            fig.add_trace(go.Scatter(
+                x=t, y=y, mode='lines', name=name_map.get(str(wid), str(wid)),
+                showlegend=False, hoverinfo='skip',
+                line=dict(color='#FF8C00', width=3),
             ))
             trace_ids.append(None)
     fig.update_layout(
@@ -952,7 +964,6 @@ def _outlier_section(fluid: str, on_key: str, eur_col: str):
 
     show_cols = [c for c in ['WellName', 'API10', 'LateralLength', 'Months History', eur_col]
                  if c in df.columns]
-    _consume_editor_reset(fluid, 'outlier')
     current_excluded = all_ids - st.session_state[sel_key]
     flagged_ids = set(high_df['WellID'].astype(str)) | set(low_df['WellID'].astype(str))
     tables = []
@@ -962,9 +973,9 @@ def _outlier_section(fluid: str, on_key: str, eur_col: str):
     with st.form(key=f"{fluid}_outlier_form", border=False):
         for _label, _flag_df, _ed_key in [
             (f"⬆ High EUR outliers — above {upper_f:,.0f} {unit} (1.5×IQR fence)",
-             high_df, f"{fluid}_outlier_editor_high"),
+             high_df, _editor_key(fluid, 'outlier', 'outlier_editor_high')),
             (f"⬇ Low EUR outliers — below {lower_f:,.0f} {unit} (log-space 1.5×IQR fence)",
-             low_df, f"{fluid}_outlier_editor_low"),
+             low_df, _editor_key(fluid, 'outlier', 'outlier_editor_low')),
         ]:
             st.markdown(f"**{_label}**")
             if _flag_df.empty:
@@ -1066,7 +1077,6 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
         'WellName', 'PrimaryFormation', 'LateralLength', eur_col
     ] if c in oneline_full.columns]
 
-    _consume_editor_reset(fluid, 'analog')
     editor_df = oneline_full[show_cols].copy().reset_index(drop=True)
     editor_df.insert(0, "Select", oneline_full['WellID'].astype(str).isin(saved_ids).tolist())
 
@@ -1087,7 +1097,7 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
                 column_config=col_cfg,
                 use_container_width=True,
                 hide_index=True,
-                key=f"{fluid}_analog_editor",
+                key=_editor_key(fluid, 'analog', 'analog_editor'),
             )
             fb1, fb2, fb3 = st.columns(3)
             apply_sel = fb1.form_submit_button("Apply selection", type="primary",
@@ -1145,41 +1155,57 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
             st.session_state[f"{fluid}_tc_lines"] = lines
 
             if _HAS_PLOTLY:
-                sel_fp = _selection_fingerprint(sel_ids)
-                # Widgets keyed by the plotted well set so stale state is dropped
-                # whenever the selection changes.
+                sel_fp   = _selection_fingerprint(sel_ids)
+                hl_key   = f"{fluid}_hl_{sel_fp}"       # highlight picker = the single
+                plot_key = f"{fluid}_tc_plot_{sel_fp}"  # source of truth for picks
+                # Both widgets are keyed by the plotted well set, so their state is
+                # dropped whenever the selection changes.
+                #
+                # Curves clicked on the chart are reported by the chart widget on the
+                # following run; read them BEFORE the picker is drawn and merge them
+                # into it (assigning a widget's value is allowed before it is drawn,
+                # and the assignment is what pushes the new value to the browser).
+                # The figure depends only on the picker, never on the chart's own
+                # selection: Streamlit hashes the figure into the chart's identity,
+                # so styling from its selection would re-key the chart on every
+                # click and lose the selection.
+                if st.session_state.pop(f"{fluid}_hl_clear", False):
+                    st.session_state[hl_key] = []
+                base_trace_ids = [str(l[2]) for l in lines]
+                clicked = _chart_clicked_wells(plot_key, base_trace_ids) & sel_ids
+                cur_hl = set(st.session_state.get(hl_key, []))
+                if clicked - cur_hl:
+                    st.session_state[hl_key] = sorted(
+                        cur_hl | clicked, key=lambda w: name_map.get(w, w).lower())
                 hl_ids = set(st.multiselect(
-                    "Highlight wells on chart",
+                    "Highlighted wells (click a curve or pick a name)",
                     options=sorted(sel_ids, key=lambda w: name_map.get(w, w).lower()),
                     format_func=lambda w: name_map.get(w, w),
-                    key=f"{fluid}_hl_{sel_fp}",
-                    placeholder="Pick wells to light up their curves…",
+                    key=hl_key,
+                    placeholder="Click curves on the chart or pick wells here…",
                 ))
-                plot_key = f"{fluid}_tc_plot_{sel_fp}_{_selection_fingerprint(hl_ids)}"
-                fig, trace_ids = plot_type_curves_interactive(
-                    curves, lines, fluid.lower(), name_map, hl_ids)
-                clicked = _chart_clicked_wells(plot_key, trace_ids)
-                for i, wid in enumerate(trace_ids):
-                    if wid is not None and wid in clicked:
-                        fig.data[i].line.color = '#D32F2F'
-                        fig.data[i].line.width = 3
+                fig, _ = plot_type_curves_interactive(curves, lines, fluid.lower(), name_map, hl_ids)
                 st.plotly_chart(fig, use_container_width=True, key=plot_key,
                                 on_select="rerun", selection_mode="points")
-                st.caption("Hover a curve to see its well. Click a curve to select it "
-                           "(shift-click for several; double-click the background to clear), "
-                           "then exclude below.")
-                picked = clicked | hl_ids
-                if picked:
+                st.caption("Hover a curve to see its well; click a curve to add it to the "
+                           "highlighted set (remove one with the × in the picker above).")
+                if hl_ids:
                     st.markdown("**Selected:** " + ", ".join(
-                        name_map.get(w, w) for w in sorted(picked, key=lambda w: name_map.get(w, w))))
-                    if st.button(f"Exclude {len(picked)} selected well(s) from Type Curve",
-                                 key=f"{fluid}_excl_picked_{sel_fp}", type="primary"):
-                        st.session_state[sel_key] = sel_ids - picked
-                        _request_editor_reset(fluid, 'analog')
-                        _flash(f"{fluid}_tw_flash",
-                               f"{fluid}: excluded {len(picked)} well(s) from the Type Curve "
-                               f"({len(sel_ids - picked)} / {n_tot} remain).")
-                        st.rerun()
+                        name_map.get(w, w) for w in sorted(hl_ids, key=lambda w: name_map.get(w, w))))
+                bx1, bx2 = st.columns([2, 1])
+                if bx1.button(f"Exclude {len(hl_ids)} selected well(s) from Type Curve",
+                              key=f"{fluid}_excl_picked_{sel_fp}", type="primary",
+                              disabled=not hl_ids, use_container_width=True):
+                    st.session_state[sel_key] = sel_ids - hl_ids
+                    _request_editor_reset(fluid, 'analog')
+                    _flash(f"{fluid}_tw_flash",
+                           f"{fluid}: excluded {len(hl_ids)} well(s) from the Type Curve "
+                           f"({len(sel_ids - hl_ids)} / {n_tot} remain).")
+                    st.rerun()
+                if bx2.button("Clear highlights", key=f"{fluid}_hl_clear_btn_{sel_fp}",
+                              disabled=not hl_ids, use_container_width=True):
+                    st.session_state[f"{fluid}_hl_clear"] = True
+                    st.rerun()
             else:
                 st.pyplot(plot_type_curves(curves, lines, fluid.lower()))
                 st.caption("Install `plotly` for an interactive chart with hover names "
