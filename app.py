@@ -13,11 +13,16 @@ import streamlit as st
 from core import (
     load_header, load_production, fill_lateral_by_geo,
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
-    plot_one_well, forecast_one_well, _train_rf,
+    plot_one_well, forecast_one_well,
     compute_eur_stats, probit_plot, eur_summary_table,
-    modified_arps, D_LIM_DEFAULT,
-    estimate_lateral_exponent, hindcast_one_well
+    modified_arps, modified_arps_cum, model_volumes, D_LIM_DEFAULT, DAYS_PER_MONTH,
+    nominal_monthly_from_effective_annual, effective_annual_from_nominal_monthly,
+    estimate_lateral_exponent, hindcast_one_well, hindcast_all,
 )
+try:
+    import diagnostics as diag          # flow-regime diagnostics panel (optional module)
+except ImportError:
+    diag = None
 
 st.set_page_config(page_title="SE Tool", layout="wide")
 LOGO_PATH = pathlib.Path(__file__).parent / "static" / "logo.png"
@@ -102,6 +107,33 @@ with st.sidebar:
         help=("SPEE M5 stresses sufficient history for individual forecasts. Wells with "
               "fewer producing months are excluded from the forecast."),
     )
+    term_dec_pct = st.number_input(
+        "Terminal decline (%/yr effective)", 1.0, 30.0, 5.0, step=0.5,
+        help=("Floor on the nominal decline for EVERY model (Modified Arps, SEPD, Duong, "
+              "Exponential): once a curve's decline falls to this rate it continues as an "
+              "exponential at this rate. Quoted as an effective annual decline, as in reserves "
+              "software; 5 %/yr effective = 0.00427/month nominal."),
+    )
+    d_lim_cfg = nominal_monthly_from_effective_annual(float(term_dec_pct) / 100.0)
+    yield_mode = st.checkbox(
+        "Forecast gas & water as yields (GOR / WOR) off the oil forecast", value=False,
+        help=("Instead of independent decline fits, gas and water are forecast as a two-slope "
+              "power-law yield applied to each well's oil forecast, keeping GOR/WOR trends "
+              "physical. Requires the Oil forecast to be run first."),
+    )
+    with st.expander("Advanced fitting options"):
+        qi_cap_in = st.number_input(
+            "Peak-month volume cap (0 = none)", min_value=0.0, value=0.0, step=1000.0,
+            help=("Optional cap on the pinned peak-month volume (normalized units). The old "
+                  "hard cap of 152,000 understated large gas wells by 15-25 %; leave at 0."),
+        )
+        duong_min = st.number_input(
+            "Min post-peak months for Duong", 6, 60, 18, step=1,
+            help=("Duong's power-law tail is uncontrolled on short windows and produced 2x EUR "
+                  "blow-ups on 9-12-month wells; it only competes with at least this many "
+                  "post-peak months."),
+        )
+    qi_cap_cfg = float(qi_cap_in) if qi_cap_in and qi_cap_in > 0 else None
     st.markdown("---")
     lat_col = st.text_input("Latitude column (optional QC)", value="Latitude")
     lon_col = st.text_input("Longitude column (optional QC)", value="Longitude")
@@ -399,6 +431,26 @@ def _show_flash(key: str) -> None:
     if msg:
         st.success(msg)
 
+# ================= Forecast configuration =================
+def _make_cfg(fluid: str) -> ForecastConfig:
+    """ForecastConfig from the current sidebar settings for one fluid."""
+    fl = fluid.lower()
+    return ForecastConfig(
+        commodity=fl, b_low=float(b_low), b_high=float(b_high), max_months=600,
+        d_lim=float(d_lim_cfg), min_months_history=int(min_hist),
+        allow_exponential=bool(allow_exp), exclude_duong=bool(vertical_wells),
+        duong_min_months=int(duong_min), qi_cap=qi_cap_cfg,
+        yield_from_oil=bool(yield_mode) and fl in ('gas', 'water'),
+    )
+
+
+def _primary_fcs_for(fluid: str, oil_fcs=None):
+    """Oil forecasts that drive yield-mode gas / water forecasts (None otherwise)."""
+    if yield_mode and fluid.lower() in ('gas', 'water'):
+        return oil_fcs if oil_fcs is not None else st.session_state.get("Oil_well_fcs")
+    return None
+
+
 # ================= Global Re-run (update all TCs) =================
 def _rerun_all_phases(keep_selections: bool = True) -> list:
     """Re-merge with the CURRENT sidebar settings (normalization length,
@@ -443,16 +495,14 @@ def _rerun_all_phases(keep_selections: bool = True) -> list:
         return []
 
     ran = []
-    for fl in ["Oil", "Gas", "Water"]:
+    oil_fcs = None
+    for fl in ["Oil", "Gas", "Water"]:            # Oil first: yield mode needs its forecasts
         if f"{fl}_oneline" not in st.session_state:
             continue
-        cfg = ForecastConfig(
-            commodity=fl.lower(),
-            b_low=float(b_low), b_high=float(b_high), max_months=600,
-            min_months_history=int(min_hist),
-            allow_exponential=bool(allow_exp), exclude_duong=bool(vertical_wells),
-        )
-        oneline, monthly, well_fcs = forecast_all(merged, cfg)
+        cfg = _make_cfg(fl)
+        oneline, monthly, well_fcs = forecast_all(merged, cfg, primary_fcs=_primary_fcs_for(fl, oil_fcs))
+        if fl == "Oil":
+            oil_fcs = well_fcs
         st.session_state[f"{fl}_oneline"]  = oneline
         st.session_state[f"{fl}_monthly"]  = monthly
         st.session_state[f"{fl}_well_fcs"] = well_fcs
@@ -564,8 +614,14 @@ def _fit_arps_to_trace(t: np.ndarray, y: np.ndarray, d_lim: float = D_LIM_DEFAUL
     return tuple(res.x) if res.success else (qi0, b0, di0)
 
 
+def _tc_monthly_volumes(qi, b, di, d_lim, t_out):
+    """Exact monthly volumes N(t) - N(t-1) of a Modified Arps curve for months t_out (1-based)."""
+    t_out = np.asarray(t_out, dtype=float)
+    return modified_arps_cum(qi, b, di, d_lim, t_out) - modified_arps_cum(qi, b, di, d_lim, t_out - 1.0)
+
+
 def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: int = 1,
-                                oneline: pd.DataFrame = None):
+                                oneline: pd.DataFrame = None, d_lim: float = D_LIM_DEFAULT):
     vol_col = f"Monthly_{com}_volume"
     if monthly_df.empty or vol_col not in monthly_df.columns:
         return pd.DataFrame(columns=['t','P10','P50','P90']), []
@@ -589,7 +645,7 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
             and all(c in oneline.columns for c in ['qi (per day)', 'b', 'di (per month)'])):
         df = oneline.copy()
         df['_eur'] = pd.to_numeric(df[eur_col], errors='coerce')
-        df['_qi']  = pd.to_numeric(df['qi (per day)'], errors='coerce') * 30.4  # monthly
+        df['_qi']  = pd.to_numeric(df['qi (per day)'], errors='coerce') * DAYS_PER_MONTH  # monthly rate
         df['_b']   = pd.to_numeric(df['b'], errors='coerce')
         df['_di']  = pd.to_numeric(df['di (per month)'], errors='coerce')
         df = df.dropna(subset=['_eur', '_qi', '_b', '_di'])
@@ -613,11 +669,11 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
                 qi   = float(grp['_qi'].median())
                 b_g  = float(grp['_b'].median())
                 di_g = float(grp['_di'].median())
-                smooth[pct] = modified_arps(qi, b_g, di_g, D_LIM_DEFAULT, t_out)
+                smooth[pct] = _tc_monthly_volumes(qi, b_g, di_g, d_lim, t_out)
             # Mean ("average well", M5) curve from the full-population median shape.
-            smooth['Mean'] = modified_arps(
+            smooth['Mean'] = _tc_monthly_volumes(
                 float(df['_qi'].median()), float(df['_b'].median()),
-                float(df['_di'].median()), D_LIM_DEFAULT, t_out)
+                float(df['_di'].median()), d_lim, t_out)
             return pd.DataFrame(smooth), lines
 
     # Fallback: empirical percentiles with Arps fitting (used when oneline unavailable)
@@ -636,8 +692,8 @@ def build_type_curves_and_lines(monthly_df: pd.DataFrame, com: str, min_wells: i
     t_out = np.arange(1, int(t_emp.max()) + 1, dtype=float)
     smooth = {'t': t_out}
     for pct in ['P10', 'P50', 'P90']:
-        qi, b, di = _fit_arps_to_trace(t_emp, emp[pct].to_numpy())
-        smooth[pct] = modified_arps(qi, b, di, D_LIM_DEFAULT, t_out)
+        qi, b, di = _fit_arps_to_trace(t_emp, emp[pct].to_numpy(), d_lim=d_lim)
+        smooth[pct] = _tc_monthly_volumes(qi, b, di, d_lim, t_out)
     # No per-well params available here — use the P50 shape as the Mean proxy.
     smooth['Mean'] = smooth['P50'].copy()
 
@@ -784,13 +840,11 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             st.warning("No wells in the current binning selection — widen the Analogous "
                        "Binning filters above before running a forecast.")
             st.stop()
-        cfg = ForecastConfig(
-            commodity=fluid_name.lower(),
-            b_low=float(b_low), b_high=float(b_high), max_months=600,
-            min_months_history=int(min_hist),
-            allow_exponential=bool(allow_exp), exclude_duong=bool(vertical_wells),
-        )
-        oneline, monthly, well_fcs = forecast_all(merged, cfg)
+        cfg = _make_cfg(fluid_name)
+        if cfg.yield_from_oil and "Oil_well_fcs" not in st.session_state:
+            st.warning(f"Yield mode is on but Oil has not been forecast yet — {fluid_name} "
+                       "will be fitted independently. Run Oil first for GOR/WOR-based forecasts.")
+        oneline, monthly, well_fcs = forecast_all(merged, cfg, primary_fcs=_primary_fcs_for(fluid_name))
         st.session_state[f"{fluid_name}_oneline"] = oneline
         st.session_state[f"{fluid_name}_monthly"] = monthly
         st.session_state[f"{fluid_name}_well_fcs"] = well_fcs   # cache per-well forecasts
@@ -821,8 +875,8 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             st.warning(f"⚠️ {_immature/_nw*100:.0f}% of wells have <12 months of history — the EUR "
                        "distribution is forecast-dominated and may carry forecast bias (M5).")
 
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "Oneline", "Monthly", "B-Factor", "Probit"
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            "Oneline", "Monthly", "B-Factor", "Probit", "Validation", "Diagnostics"
         ])
         with tab1: st.dataframe(format_df_2dec(st.session_state[on_key]), use_container_width=True)
         with tab2: st.dataframe(format_df_2dec(st.session_state[mo_key]), use_container_width=True)
@@ -846,6 +900,147 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fig = probit_plot(eurs, unit, f"{fluid_name} Probit", _phase_color(fluid_name), norm_len=int(norm_len))
                 st.pyplot(fig)
 
+        with tab5:
+            # ---- Population hindcast / history-match validation (SPEE M5 "Validation") ----
+            st.markdown(
+                f"**Hindcast validation — {fluid_name}.** Every well is re-forecast from a "
+                "truncated history and compared with what it actually produced over the held-out "
+                "months. Positive cumulative error = over-forecast. Use it to judge how well this "
+                "model set and these settings predict *this* dataset before trusting the EURs."
+            )
+            _hc1, _hc2 = st.columns([1, 2])
+            with _hc1:
+                hc_mode = st.radio("Hold-out", ["Last N months", "Fraction of history"],
+                                   key=f"{fluid_name}_hc_mode")
+            with _hc2:
+                if hc_mode == "Last N months":
+                    hc_hold = int(st.number_input("Months held out", 3, 60, 12, step=1,
+                                                  key=f"{fluid_name}_hc_n"))
+                    hc_frac = 0.6
+                else:
+                    hc_hold = None
+                    hc_frac = float(st.slider("Training fraction", 0.4, 0.9, 0.6, step=0.05,
+                                              key=f"{fluid_name}_hc_frac"))
+            if st.button(f"Run {fluid_name} hindcast on all wells", key=f"{fluid_name}_hc_run",
+                         type="primary"):
+                with st.spinner("Re-forecasting every well from its truncated history…"):
+                    st.session_state[f"{fluid_name}_hindcast"] = hindcast_all(
+                        st.session_state.merged, _make_cfg(fluid_name),
+                        holdout_months=hc_hold, train_frac=hc_frac)
+            hcdf = st.session_state.get(f"{fluid_name}_hindcast")
+            if hcdf is None:
+                st.caption("Choose a hold-out and run the hindcast.")
+            elif hcdf.empty:
+                st.info("No wells have enough history for this hold-out.")
+            else:
+                ce = pd.to_numeric(hcdf['Cum error (%)'], errors='coerce')
+                mp = pd.to_numeric(hcdf['MAPE (%)'], errors='coerce')
+                k1, k2, k3, k4, k5 = st.columns(5)
+                k1.metric("Wells hindcast", len(hcdf))
+                k2.metric("Median cum error", f"{ce.median():+.1f}%",
+                          help="Bias: median signed cumulative error over the held-out window.")
+                k3.metric("P90 |cum error|", f"{ce.abs().quantile(0.9):.1f}%")
+                k4.metric("Median MAPE", f"{mp.median():.1f}%")
+                k5.metric("Within ±10% / ±25%",
+                          f"{(ce.abs() <= 10).mean()*100:.0f}% / {(ce.abs() <= 25).mean()*100:.0f}%")
+                by_model = (hcdf.groupby('Model')
+                            .agg(wells=('WellID', 'count'),
+                                 median_cum_err_pct=('Cum error (%)', 'median'),
+                                 median_mape_pct=('MAPE (%)', 'median'))
+                            .reset_index())
+                st.dataframe(format_df_2dec(by_model), use_container_width=True, hide_index=True)
+                if _HAS_PLOTLY:
+                    figh = go.Figure()
+                    figh.add_trace(go.Scatter(
+                        x=hcdf['Actual (test)'], y=hcdf['Forecast (test)'], mode='markers',
+                        text=hcdf['WellName'], customdata=hcdf['Model'], name='wells',
+                        marker=dict(color=_phase_color(fluid_name), size=8, opacity=0.75),
+                        hovertemplate="<b>%{text}</b><br>%{customdata}<br>actual %{x:,.0f}"
+                                      "<br>forecast %{y:,.0f}<extra></extra>"))
+                    lo_v = max(float(min(hcdf['Actual (test)'].min(), hcdf['Forecast (test)'].min())), 1.0)
+                    hi_v = max(float(max(hcdf['Actual (test)'].max(), hcdf['Forecast (test)'].max())), lo_v * 10)
+                    figh.add_trace(go.Scatter(x=[lo_v, hi_v], y=[lo_v, hi_v], mode='lines',
+                                              line=dict(color='black', dash='dash'), name='1:1'))
+                    figh.update_layout(height=420, xaxis_type='log', yaxis_type='log',
+                                       xaxis_title='Actual held-out volume',
+                                       yaxis_title='Forecast held-out volume',
+                                       margin=dict(l=50, r=20, t=30, b=45))
+                    st.plotly_chart(figh, use_container_width=True, key=f"{fluid_name}_hc_plot")
+                st.dataframe(format_df_2dec(hcdf), use_container_width=True, hide_index=True)
+                if yield_mode and fluid_name != "Oil":
+                    st.caption("Note: the hindcast fits each well independently; yield-mode "
+                               "(GOR/WOR) forecasts are not hindcast here.")
+
+        with tab6:
+            # ---- Flow-regime diagnostics (SPEE M5: identify the regime before trusting b) ----
+            if diag is None:
+                st.info("Flow-regime diagnostics module (diagnostics.py) is not available.")
+            elif not _HAS_PLOTLY:
+                st.info("Install `plotly` to view the diagnostics panel.")
+            else:
+                st.markdown(
+                    "**Flow-regime diagnostics.** Rate–time on log-log axes with reference slopes, "
+                    "and the nominal decline D(t) and Arps b(t) estimated from the data "
+                    "(Bourdet-smoothed derivative) against the fitted model. A half slope with "
+                    "b ≈ 2 is transient linear flow; b falling below ~1 with a flattening D is "
+                    "boundary-dominated flow. The last few points use one-sided differences and "
+                    "are unreliable — read the interior, not the end."
+                )
+                _ol = st.session_state[on_key]
+                _dpick = st.selectbox(f"Well ({fluid_name} diagnostics)",
+                                      _ol['WellID'].astype(str).tolist(), key=f"{fluid_name}_diag_pick")
+                fcd = st.session_state.get(f"{fluid_name}_well_fcs", {}).get(_dpick)
+                if fcd is None:
+                    st.info("No cached forecast for this well — re-run the forecast.")
+                else:
+                    from plotly.subplots import make_subplots
+                    pk = int(fcd['peak_idx'])
+                    qpost = np.asarray(fcd['hist'], dtype=float)[pk:]
+                    tpost = np.arange(len(qpost), dtype=float) + 0.5
+                    dd = diag.data_diagnostics(tpost, qpost)
+                    mdl = diag.model_diagnostics(fcd['model'], {'qi': fcd['qi'], **fcd['params']},
+                                                 dd['t'], fcd['d_lim'])
+                    color = _phase_color(fluid_name)
+                    figd = make_subplots(rows=2, cols=2, subplot_titles=(
+                        "Rate–time (log-log)", "Nominal decline D(t) [/month]",
+                        "Arps b(t) = d(1/D)/dt", "Log-log slope d ln q / d ln t"))
+                    figd.add_trace(go.Scatter(x=tpost, y=qpost, mode='markers', name='data',
+                                              marker=dict(color=color)), 1, 1)
+                    figd.add_trace(go.Scatter(x=tpost, y=np.asarray(fcd['fit_hist'])[pk:], mode='lines',
+                                              name=fcd['model'], line=dict(color=color)), 1, 1)
+                    t0, q0 = tpost[0], max(qpost[0], 1e-9)
+                    for slope, lab, dash in ((-0.5, 'half slope (linear flow)', 'dot'),
+                                             (-1.0, 'unit slope', 'dash')):
+                        figd.add_trace(go.Scatter(x=tpost, y=q0 * (tpost / t0) ** slope, mode='lines',
+                                                  name=lab, line=dict(color='gray', dash=dash, width=1)), 1, 1)
+                    figd.add_trace(go.Scatter(x=dd['t'], y=dd['D'], mode='markers', name='D (data)',
+                                              marker=dict(color=color)), 1, 2)
+                    figd.add_trace(go.Scatter(x=dd['t'], y=mdl['D'], mode='lines', name='D (model)',
+                                              line=dict(color=color)), 1, 2)
+                    figd.add_hline(y=fcd['d_lim'], line=dict(color='black', dash='dot'), row=1, col=2)
+                    figd.add_trace(go.Scatter(x=dd['t'], y=dd['b'], mode='markers', name='b (data)',
+                                              marker=dict(color=color)), 2, 1)
+                    figd.add_trace(go.Scatter(x=dd['t'], y=mdl['b'], mode='lines', name='b (model)',
+                                              line=dict(color=color)), 2, 1)
+                    for yv in (2.0, 1.0):
+                        figd.add_hline(y=yv, line=dict(color='gray', dash='dot'), row=2, col=1)
+                    figd.add_trace(go.Scatter(x=dd['t'], y=dd['loglog_slope'], mode='markers',
+                                              name='log-log slope', marker=dict(color=color)), 2, 2)
+                    for yv in (-0.5, -1.0):
+                        figd.add_hline(y=yv, line=dict(color='gray', dash='dot'), row=2, col=2)
+                    figd.update_xaxes(type='log', title_text='months since peak')
+                    figd.update_yaxes(type='log', row=1, col=1)
+                    figd.update_yaxes(type='log', row=1, col=2)
+                    figd.update_yaxes(range=[-0.5, 3.0], row=2, col=1)
+                    figd.update_yaxes(range=[-2.5, 0.5], row=2, col=2)
+                    figd.update_layout(height=680, legend=dict(orientation='h', y=-0.08),
+                                       margin=dict(l=40, r=20, t=40, b=40))
+                    st.plotly_chart(figd, use_container_width=True, key=f"{fluid_name}_diag_plot")
+                    _pstr = ", ".join(f"{k}={v:.3g}" for k, v in fcd['params'].items())
+                    st.caption(f"Winning model: {fcd['model']} ({_pstr}); history-match fit "
+                               f"R² (log) = {fcd.get('fit_r2_log', float('nan')):.3f}, "
+                               f"MAPE = {fcd.get('fit_mape_pct', float('nan')):.1f} %.")
+
         st.subheader(f"{fluid_name} — Per-well Plot")
         merged = st.session_state.merged
         # Use WellID for selection
@@ -858,10 +1053,10 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             # Reuse cached forecast — no RF re-training or re-optimisation
             fc = st.session_state[fcs_key][pick_id]
         else:
-            models = _train_rf(merged, norm_col_for_models)
-            fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600, models,
-                                   allow_exponential=bool(allow_exp),
-                                   exclude_duong=bool(vertical_wells))
+            fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600,
+                                   d_lim=float(d_lim_cfg), allow_exponential=bool(allow_exp),
+                                   exclude_duong=bool(vertical_wells),
+                                   duong_min_months=int(duong_min), qi_cap=qi_cap_cfg)
         fig = plot_one_well(wd, fc, fluid_name.lower())
         st.pyplot(fig)
 
@@ -870,8 +1065,10 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                        help="Fit on the first 60% of this well's history and forecast the "
                             "held-out remainder to gauge forecast reliability (M5)."):
             hc = hindcast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high),
+                                   d_lim=float(d_lim_cfg),
                                    allow_exponential=bool(allow_exp),
-                                   exclude_duong=bool(vertical_wells))
+                                   exclude_duong=bool(vertical_wells),
+                                   duong_min_months=int(duong_min), qi_cap=qi_cap_cfg)
             if hc is None:
                 st.info("Not enough history to hindcast this well (need ≥ ~9 months).")
             else:
@@ -1136,7 +1333,7 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
                 st.session_state[mo_key]['WellID'].astype(str).isin(sel_ids)
             ]
             curves, lines = build_type_curves_and_lines(
-                monthly_filtered, fluid.lower(), oneline=oneline_filtered
+                monthly_filtered, fluid.lower(), oneline=oneline_filtered, d_lim=float(d_lim_cfg)
             )
             # Scale every TC curve so its cumulative volume exactly matches
             # the corresponding EUR percentile from the stats table.
@@ -1282,7 +1479,7 @@ def _build_pptx_data(tc_name: str) -> dict:
     import json as _json
     from datetime import datetime as _dt
 
-    D_LIM = 0.00417
+    D_LIM = float(d_lim_cfg)
 
     def _get_fluid(fluid_name, oneline_key, eur_col):
         if oneline_key not in st.session_state:
@@ -1312,7 +1509,10 @@ def _build_pptx_data(tc_name: str) -> dict:
 
         lat_vals = pd.to_numeric(oneline['LateralLength'], errors='coerce').dropna() if 'LateralLength' in oneline.columns else pd.Series([], dtype=float)
         avg_lat  = float(lat_vals.mean()) if len(lat_vals) > 0 else float(norm_len)
-        def _epft(e): return (e * 1000) / avg_lat if avg_lat > 0 else 0.0
+        # Normalised EURs are already scaled to norm_len, so per-foot values must divide
+        # by norm_len (as the app's table and probit do), not by the analogs' mean lateral.
+        _ft_basis = float(norm_len) if use_norm else avg_lat
+        def _epft(e): return (e * 1000) / _ft_basis if _ft_basis > 0 else 0.0
 
         b_vals = pd.to_numeric(oneline['b'], errors='coerce').dropna() if 'b' in oneline.columns else pd.Series([], dtype=float)
         bc = len(b_vals)
@@ -1361,7 +1561,8 @@ def _build_pptx_data(tc_name: str) -> dict:
             di_mo  = float(row['di (per month)'])      if 'di (per month)'      in row and pd.notna(row['di (per month)'])      else D_LIM
             dec1   = float(row['First-Year Decline (%)']) if 'First-Year Decline (%)' in row and pd.notna(row['First-Year Decline (%)']) else 0.0
             eur_v  = float(row[eur_col])               if eur_col               in row and pd.notna(row[eur_col])               else 0.0
-            epft_v = (eur_v * 1000) / lat_ft if lat_ft > 0 else 0.0
+            _den   = _ft_basis if use_norm else lat_ft
+            epft_v = (eur_v * 1000) / _den if _den > 0 else 0.0
             analog_rows.append({
                 'api': api_v, 'wellName': wn, 'latLenFt': lat_ft,
                 'qi': qi_d, 'b': bv, 'diPerMo': di_mo,
@@ -1427,6 +1628,7 @@ def _build_pptx_data(tc_name: str) -> dict:
             'normLengthFt':   float(norm_len),
             'bFactorRange':   f"{b_low:.3f} - {b_high:.3f}",
             'scalingExponent': float(st.session_state.get('applied_norm_exponent', 1.0)),
+            'terminalDeclinePct': float(term_dec_pct),
             'declineModels':  _decline_models_label(),
         },
         'analogCriteria': {
@@ -1447,9 +1649,9 @@ def _build_pptx_data(tc_name: str) -> dict:
         'bMean': 0.0, 'bMedian': 0.0, 'bP10': 0.0, 'bP90': 0.0, 'bCount': 0, 'bValues': [],
         'p90Qi': 0.0, 'p50Qi': 0.0, 'p10Qi': 0.0, 'qiUnit': qu,
         'p90B': 1.0, 'p50B': 1.0, 'p10B': 1.0,
-        'p90Di': 0.00417, 'p50Di': 0.00417, 'p10Di': 0.00417,
+        'p90Di': D_LIM, 'p50Di': D_LIM, 'p10Di': D_LIM,
         'p90Decline1yr': 0.0, 'p50Decline1yr': 0.0, 'p10Decline1yr': 0.0,
-        'terminalDi': 0.00417, 'analogRows': [],
+        'terminalDi': D_LIM, 'analogRows': [],
     }
     data['oil']   = _get_fluid('Oil',   'Oil_oneline',   'EUR (Mbbl)')       or _blank('oil',   'Mbbl',  'Bbl/ft', 'bbl/day')
     data['gas']   = _get_fluid('Gas',   'Gas_oneline',   'EUR (MMcf)')       or _blank('gas',   'MMcf',  'Mcf/ft', 'Mcf/day')
@@ -1532,7 +1734,7 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
     BODY_GRAY = RGBColor(0x40, 0x40, 0x40)
     MARK_GRAY = RGBColor(0xAA, 0xAA, 0xAA)
     FLUID_HEX = {'oil': '#2D6E2D', 'gas': '#CC3333', 'water': '#2244AA'}
-    D_LIM     = 0.00417
+    D_LIM     = float(d_lim_cfg)
     _RECT     = 1   # MSO_AUTO_SHAPE_TYPE.RECTANGLE
     _OVAL     = 9   # MSO_AUTO_SHAPE_TYPE.OVAL
     _ALIGN    = {'left': PP_ALIGN.LEFT, 'center': PP_ALIGN.CENTER, 'right': PP_ALIGN.RIGHT}
@@ -1623,7 +1825,7 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
         except: return str(iso)
 
     def _arps(qi_d, b, di, term_di, months=600):
-        qi = qi_d * 30.4
+        qi = qi_d * DAYS_PER_MONTH
         t_sw = ((di - term_di) / (b * di * term_di)) if (b > 0 and di > term_di) else float('inf')
         q_sw = qi / (1 + b * di * t_sw) ** (1 / b) if t_sw < float('inf') else qi
         q = []
@@ -1706,9 +1908,10 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
         ["Generated",            wm['generatedDate']],
         ["Normalization Length", _ff(wm['normLengthFt'])],
         ["Scaling Exponent (a)", f"{wm.get('scalingExponent', 1.0):.2f}"],
+        ["Terminal Decline",      f"{wm.get('terminalDeclinePct', 5.0):.1f} %/yr eff."],
         ["B-factor Range",       wm.get('bFactorRange', '')],
         ["Decline Models",       wm.get('declineModels', '')],
-    ], 0.4, 1.18, 4.5, rh=0.27)
+    ], 0.4, 1.18, 4.5, rh=0.24)
     _txt(sl, "EUR Summary", 0.4, 3.15, 9, 0.3, size=12, bold=True, color=BODY_GRAY)
 
     def _eur_row(fd):
@@ -1751,7 +1954,7 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
             ["b-factor",             f"{fd['p90B']:.3f}", f"{fd['p50B']:.3f}", f"{fd['p10B']:.3f}"],
             ["Di (per month)",       f"{fd['p90Di']:.4f}", f"{fd['p50Di']:.4f}", f"{fd['p10Di']:.4f}"],
             ["1st-Year Decline",     _fp(fd['p90Decline1yr']), _fp(fd['p50Decline1yr']), _fp(fd['p10Decline1yr'])],
-            ["Terminal Di",          f"{fd['terminalDi']:.5f}/mo", f"{fd['terminalDi']:.5f}/mo", f"{fd['terminalDi']:.5f}/mo"],
+            ["Terminal Di",          *[f"{fd['terminalDi']:.5f}/mo ({effective_annual_from_nominal_monthly(fd['terminalDi'])*100:.1f}%/yr)"] * 3],
             [f"EUR ({fd['eurUnit']})", f"{fd['p90Eur']:.2f}", f"{fd['p50Eur']:.2f}", f"{fd['p10Eur']:.2f}"],
         ], 4.1, 1.17, [2.2, 1.1, 1.1, 1.2])
         _txt(sl, f"{_cap(fd['fluid'])} EURs", 4.1, 3.4, 5.6, 0.3, size=11, bold=True, color=BODY_GRAY)
@@ -1865,6 +2068,9 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         ["Apply Normalization", "Yes" if use_norm else "No"],
         ["Lateral Scaling Exponent (a)", f"{st.session_state.get('applied_norm_exponent', 1.0):.2f}"],
         ["Min Months History", str(int(min_hist))],
+        ["Terminal Decline (%/yr eff.)", f"{float(term_dec_pct):.1f}"],
+        ["Peak Volume Cap", f"{qi_cap_cfg:,.0f}" if qi_cap_cfg else "none"],
+        ["Gas/Water as Yields (GOR/WOR)", "Yes" if yield_mode else "No"],
         ["B-factor Range", f"{b_low:.3f} - {b_high:.3f}"],
         ["Decline Models", _decline_models_label()],
         ["Vertical Dataset", "Yes" if vertical_wells else "No"],
@@ -2076,7 +2282,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         if _cached_curves.empty and monthly_sel is not None:
             # Fallback: recompute if session state was cleared (e.g. page reload before PDF)
             _cached_curves, _cached_lines = build_type_curves_and_lines(
-                monthly_sel, fluid_name.lower(), oneline=oneline
+                monthly_sel, fluid_name.lower(), oneline=oneline, d_lim=float(d_lim_cfg)
             )
         if not _cached_curves.empty:
             curves = _cached_curves
@@ -2127,7 +2333,8 @@ def generate_comprehensive_pdf(tc_name: str = ""):
                         f"{np.percentile(dec, 50):.1f}%",
                         f"{np.percentile(dec, 10):.1f}%",
                     ])
-                tc_data.append(["Terminal Di (d_lim)", "0.00417/mo", "0.00417/mo", "0.00417/mo"])
+                _tdl = f"{float(d_lim_cfg):.5f}/mo ({float(term_dec_pct):.1f}%/yr eff.)"
+                tc_data.append(["Terminal Di (d_lim)", _tdl, _tdl, _tdl])
 
                 tc_table = Table(tc_data, colWidths=[2.0*inch, 1.4*inch, 1.4*inch, 1.4*inch])
                 tc_table.setStyle(TableStyle([
