@@ -15,7 +15,7 @@ from core import (
     preprocess, PreprocessConfig, forecast_all, ForecastConfig,
     plot_one_well, forecast_one_well,
     compute_eur_stats, probit_plot, eur_summary_table,
-    modified_arps, modified_arps_cum, model_volumes, D_LIM_DEFAULT, DAYS_PER_MONTH,
+    modified_arps, modified_arps_cum, model_volumes, D_LIM_DEFAULT, DAYS_PER_MONTH, MODEL_REGISTRY,
     nominal_monthly_from_effective_annual, effective_annual_from_nominal_monthly,
     estimate_lateral_exponent, hindcast_one_well, hindcast_all,
 )
@@ -451,6 +451,56 @@ def _primary_fcs_for(fluid: str, oil_fcs=None):
     return None
 
 
+def _fitted_cfg(fluid: str | None = None):
+    """The ForecastConfig a fluid's cached forecasts were actually produced with
+    (None if that fluid has not been forecast).  With fluid=None, the first
+    forecast fluid's config."""
+    fluids = [fluid] if fluid else ["Oil", "Gas", "Water"]
+    for fl in fluids:
+        cfg = st.session_state.get(f"{fl}_cfg")
+        if cfg is not None:
+            return cfg
+    return None
+
+
+def _fitted_d_lim(fluid: str | None = None) -> float:
+    """Terminal decline the cached forecasts were fitted with — reports and type
+    curves must use this, not the live sidebar value, which may have moved."""
+    cfg = _fitted_cfg(fluid)
+    return float(cfg.d_lim) if cfg is not None else float(d_lim_cfg)
+
+
+def _fitted_term_dec_pct(fluid: str | None = None) -> float:
+    return effective_annual_from_nominal_monthly(_fitted_d_lim(fluid)) * 100.0
+
+
+def _settings_mismatch_warning(fluid: str) -> None:
+    """Warn when the sidebar no longer matches the settings behind the cached forecasts."""
+    cfg = _fitted_cfg(fluid)
+    if cfg is None:
+        return
+    cur = _make_cfg(fluid)
+    diffs = [name for name, a, b in [
+        ("terminal decline", cfg.d_lim, cur.d_lim), ("b-factor bounds", (cfg.b_low, cfg.b_high), (cur.b_low, cur.b_high)),
+        ("min history", cfg.min_months_history, cur.min_months_history),
+        ("exponential model", cfg.allow_exponential, cur.allow_exponential),
+        ("Duong gate", (cfg.exclude_duong, cfg.duong_min_months), (cur.exclude_duong, cur.duong_min_months)),
+        ("peak cap", cfg.qi_cap, cur.qi_cap), ("yield mode", cfg.yield_from_oil, cur.yield_from_oil),
+    ] if a != b]
+    if diffs:
+        st.warning(f"{fluid}: the sidebar ({', '.join(diffs)}) differs from the settings these forecasts "
+                   "were made with — results and reports reflect the forecast-time settings "
+                   "(terminal decline "
+                   f"{effective_annual_from_nominal_monthly(cfg.d_lim)*100:.1f} %/yr). "
+                   "Use 'Re-run All Phases & Update TCs' to apply the new settings.")
+
+
+def _hindcast_fingerprint(fluid: str, hold, frac) -> str:
+    cfg = _make_cfg(fluid)
+    wells = sorted(st.session_state.merged['WellID'].astype(str).unique()) if "merged" in st.session_state else []
+    return _selection_fingerprint([repr(cfg), str(hold), f"{frac:.3f}"] + list(wells))
+
+
 # ================= Global Re-run (update all TCs) =================
 def _rerun_all_phases(keep_selections: bool = True) -> list:
     """Re-merge with the CURRENT sidebar settings (normalization length,
@@ -503,6 +553,8 @@ def _rerun_all_phases(keep_selections: bool = True) -> list:
         oneline, monthly, well_fcs = forecast_all(merged, cfg, primary_fcs=_primary_fcs_for(fl, oil_fcs))
         if fl == "Oil":
             oil_fcs = well_fcs
+        st.session_state[f"{fl}_cfg"] = cfg
+        st.session_state.pop(f"{fl}_hindcast", None)
         st.session_state[f"{fl}_oneline"]  = oneline
         st.session_state[f"{fl}_monthly"]  = monthly
         st.session_state[f"{fl}_well_fcs"] = well_fcs
@@ -523,9 +575,10 @@ def _rerun_all_phases(keep_selections: bool = True) -> list:
 def _global_rerun_button(key: str):
     """Render the 'update all TCs' button; on click, re-run and refresh."""
     if st.button("🔄 Re-run All Phases & Update TCs", key=key, type="primary",
-                 help="Re-applies the current b-factor bounds, normalization length and "
-                      "lateral scaling, re-runs every phase already forecast, and refreshes "
-                      "all type curves. Analog/outlier exclusions are kept."):
+                 help="Re-applies the current b-factor bounds, terminal decline, normalization "
+                      "length, lateral scaling and advanced fitting options, re-runs every phase "
+                      "already forecast, and refreshes all type curves. Analog/outlier exclusions "
+                      "are kept."):
         if not any(f"{fl}_oneline" in st.session_state for fl in ("Oil", "Gas", "Water")):
             st.warning("No phase has been forecast yet — run at least one phase forecast first.")
             return
@@ -831,7 +884,7 @@ def _chart_clicked_wells(plot_key: str, trace_ids) -> set:
     return found
 
 # ================= Fluid Block =================
-def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
+def fluid_block(fluid_name: str, eur_col: str):
     st.header(f"{fluid_name} — Run & Analyze")
     disabled = "merged" not in st.session_state
     if st.button(f"Run {fluid_name} Forecast", disabled=disabled):
@@ -845,6 +898,8 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
             st.warning(f"Yield mode is on but Oil has not been forecast yet — {fluid_name} "
                        "will be fitted independently. Run Oil first for GOR/WOR-based forecasts.")
         oneline, monthly, well_fcs = forecast_all(merged, cfg, primary_fcs=_primary_fcs_for(fluid_name))
+        st.session_state[f"{fluid_name}_cfg"] = cfg                 # settings these results reflect
+        st.session_state.pop(f"{fluid_name}_hindcast", None)      # hindcast is for the old forecast
         st.session_state[f"{fluid_name}_oneline"] = oneline
         st.session_state[f"{fluid_name}_monthly"] = monthly
         st.session_state[f"{fluid_name}_well_fcs"] = well_fcs   # cache per-well forecasts
@@ -856,6 +911,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
     mo_key = f"{fluid_name}_monthly"
 
     if on_key in st.session_state:
+        _settings_mismatch_warning(fluid_name)
         # --- M5 sample-size & maturity diagnostics ---
         _ol = st.session_state[on_key]
         _nw = len(_ol)
@@ -927,12 +983,17 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                     st.session_state[f"{fluid_name}_hindcast"] = hindcast_all(
                         st.session_state.merged, _make_cfg(fluid_name),
                         holdout_months=hc_hold, train_frac=hc_frac)
+                    st.session_state[f"{fluid_name}_hindcast_fp"] = _hindcast_fingerprint(fluid_name, hc_hold, hc_frac)
             hcdf = st.session_state.get(f"{fluid_name}_hindcast")
             if hcdf is None:
                 st.caption("Choose a hold-out and run the hindcast.")
             elif hcdf.empty:
-                st.info("No wells have enough history for this hold-out.")
+                st.info("No wells have enough history for this hold-out (each needs at least "
+                        "4 post-peak months in the training window).")
             else:
+                if st.session_state.get(f"{fluid_name}_hindcast_fp") != _hindcast_fingerprint(fluid_name, hc_hold, hc_frac):
+                    st.warning("These hindcast results were produced with different settings, hold-out "
+                               "or working set than the current ones — re-run to refresh.")
                 ce = pd.to_numeric(hcdf['Cum error (%)'], errors='coerce')
                 mp = pd.to_numeric(hcdf['MAPE (%)'], errors='coerce')
                 k1, k2, k3, k4, k5 = st.columns(5)
@@ -992,6 +1053,9 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                 fcd = st.session_state.get(f"{fluid_name}_well_fcs", {}).get(_dpick)
                 if fcd is None:
                     st.info("No cached forecast for this well — re-run the forecast.")
+                elif fcd.get('model') not in MODEL_REGISTRY:
+                    st.info("Diagnostics are shown for decline-model fits only; this well was "
+                            f"forecast as {fcd.get('model')} off the oil forecast.")
                 else:
                     from plotly.subplots import make_subplots
                     pk = int(fcd['peak_idx'])
@@ -1050,7 +1114,7 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
         wd = merged[merged['WellID'] == pick_id]
         fcs_key = f"{fluid_name}_well_fcs"
         if fcs_key in st.session_state and pick_id in st.session_state[fcs_key]:
-            # Reuse cached forecast — no RF re-training or re-optimisation
+            # Reuse cached forecast — no re-optimisation
             fc = st.session_state[fcs_key][pick_id]
         else:
             fc = forecast_one_well(wd, fluid_name.lower(), float(b_low), float(b_high), 600,
@@ -1092,11 +1156,11 @@ def fluid_block(fluid_name: str, eur_col: str, norm_col_for_models: str):
                              help="Forecast cum vs actual cum over the held-out window. + = over-forecast.")
                 mcol2.metric("Mean abs. % error", f"{hc['mape_pct']:.1f}%")
 
-fluid_block("Oil", "EUR (Mbbl)", "NormOil")
+fluid_block("Oil", "EUR (Mbbl)")
 st.markdown("---")
-fluid_block("Gas", "EUR (MMcf)", "NormGas")
+fluid_block("Gas", "EUR (MMcf)")
 st.markdown("---")
-fluid_block("Water", "EUR (Mbbl water)", "NormWater")
+fluid_block("Water", "EUR (Mbbl water)")
 st.markdown("---")
 
 # ================= Outlier Detection =================
@@ -1250,6 +1314,7 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
         return
 
     _show_flash(f"{fluid}_tw_flash")
+    _settings_mismatch_warning(fluid)
     oneline_full = st.session_state[on_key]
 
     # --- Analog selection state: set of included WellIDs ---
@@ -1333,7 +1398,7 @@ def _render_tw(fluid, on_key, mo_key, eur_col):
                 st.session_state[mo_key]['WellID'].astype(str).isin(sel_ids)
             ]
             curves, lines = build_type_curves_and_lines(
-                monthly_filtered, fluid.lower(), oneline=oneline_filtered, d_lim=float(d_lim_cfg)
+                monthly_filtered, fluid.lower(), oneline=oneline_filtered, d_lim=_fitted_d_lim(fluid)
             )
             # Scale every TC curve so its cumulative volume exactly matches
             # the corresponding EUR percentile from the stats table.
@@ -1484,6 +1549,7 @@ def _build_pptx_data(tc_name: str) -> dict:
     def _get_fluid(fluid_name, oneline_key, eur_col):
         if oneline_key not in st.session_state:
             return None
+        D_LIM = _fitted_d_lim(fluid_name)        # terminal decline these forecasts were fitted with
         oneline_full = st.session_state[oneline_key]
         sel_key = f"{fluid_name}_tc_selection"
         if sel_key in st.session_state and isinstance(st.session_state[sel_key], set):
@@ -1628,7 +1694,7 @@ def _build_pptx_data(tc_name: str) -> dict:
             'normLengthFt':   float(norm_len),
             'bFactorRange':   f"{b_low:.3f} - {b_high:.3f}",
             'scalingExponent': float(st.session_state.get('applied_norm_exponent', 1.0)),
-            'terminalDeclinePct': float(term_dec_pct),
+            'terminalDeclinePct': _fitted_term_dec_pct(prim_fl),
             'declineModels':  _decline_models_label(),
         },
         'analogCriteria': {
@@ -1954,7 +2020,8 @@ def generate_tc_pptx(pptx_data: dict, output_dir: str) -> str | None:
             ["b-factor",             f"{fd['p90B']:.3f}", f"{fd['p50B']:.3f}", f"{fd['p10B']:.3f}"],
             ["Di (per month)",       f"{fd['p90Di']:.4f}", f"{fd['p50Di']:.4f}", f"{fd['p10Di']:.4f}"],
             ["1st-Year Decline",     _fp(fd['p90Decline1yr']), _fp(fd['p50Decline1yr']), _fp(fd['p10Decline1yr'])],
-            ["Terminal Di",          *[f"{fd['terminalDi']:.5f}/mo ({effective_annual_from_nominal_monthly(fd['terminalDi'])*100:.1f}%/yr)"] * 3],
+            [f"Terminal Di ({effective_annual_from_nominal_monthly(fd['terminalDi'])*100:.1f}%/yr eff.)",
+             *[f"{fd['terminalDi']:.5f}/mo"] * 3],
             [f"EUR ({fd['eurUnit']})", f"{fd['p90Eur']:.2f}", f"{fd['p50Eur']:.2f}", f"{fd['p10Eur']:.2f}"],
         ], 4.1, 1.17, [2.2, 1.1, 1.1, 1.2])
         _txt(sl, f"{_cap(fd['fluid'])} EURs", 4.1, 3.4, 5.6, 0.3, size=11, bold=True, color=BODY_GRAY)
@@ -2068,7 +2135,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         ["Apply Normalization", "Yes" if use_norm else "No"],
         ["Lateral Scaling Exponent (a)", f"{st.session_state.get('applied_norm_exponent', 1.0):.2f}"],
         ["Min Months History", str(int(min_hist))],
-        ["Terminal Decline (%/yr eff.)", f"{float(term_dec_pct):.1f}"],
+        ["Terminal Decline (%/yr eff.)", f"{_fitted_term_dec_pct():.1f}"],
         ["Peak Volume Cap", f"{qi_cap_cfg:,.0f}" if qi_cap_cfg else "none"],
         ["Gas/Water as Yields (GOR/WOR)", "Yes" if yield_mode else "No"],
         ["B-factor Range", f"{b_low:.3f} - {b_high:.3f}"],
@@ -2282,7 +2349,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         if _cached_curves.empty and monthly_sel is not None:
             # Fallback: recompute if session state was cleared (e.g. page reload before PDF)
             _cached_curves, _cached_lines = build_type_curves_and_lines(
-                monthly_sel, fluid_name.lower(), oneline=oneline, d_lim=float(d_lim_cfg)
+                monthly_sel, fluid_name.lower(), oneline=oneline, d_lim=_fitted_d_lim(fluid_name)
             )
         if not _cached_curves.empty:
             curves = _cached_curves
@@ -2333,8 +2400,9 @@ def generate_comprehensive_pdf(tc_name: str = ""):
                         f"{np.percentile(dec, 50):.1f}%",
                         f"{np.percentile(dec, 10):.1f}%",
                     ])
-                _tdl = f"{float(d_lim_cfg):.5f}/mo ({float(term_dec_pct):.1f}%/yr eff.)"
-                tc_data.append(["Terminal Di (d_lim)", _tdl, _tdl, _tdl])
+                _dl = _fitted_d_lim(fluid_name)
+                tc_data.append([f"Terminal Di ({_fitted_term_dec_pct(fluid_name):.1f}%/yr eff.)",
+                                *[f"{_dl:.5f}/mo"] * 3])
 
                 tc_table = Table(tc_data, colWidths=[2.0*inch, 1.4*inch, 1.4*inch, 1.4*inch])
                 tc_table.setStyle(TableStyle([

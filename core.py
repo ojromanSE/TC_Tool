@@ -322,10 +322,17 @@ EXP_BIC_TOLERANCE: float = 2.0
 
 # Modified Arps is the industry reference model (the SPEE M5 baseline).  A
 # same-complexity alternative (SEPD, Duong) must beat it by at least this BIC
-# margin — Kass & Raftery's "positive evidence" threshold — to be selected:
-# smaller gaps are noise, and the flexible transient shapes that win them
-# extrapolate far worse than they fit.
-ARPS_BIC_PREFERENCE: float = 2.0
+# margin to be selected.  Kass & Raftery call ΔBIC 2-6 "positive evidence";
+# 4 sits mid-band: on planted hyperbolic truth with 5 % noise, SEPD still
+# edges Arps by ΔBIC 2-3 on ~12 % of wells and then under-forecasts ~30 %,
+# while a margin of 6 starts suppressing genuine SEPD behaviour.
+ARPS_BIC_PREFERENCE: float = 4.0
+
+# Soft peak pin: the fitted month-0 volume may deviate from the observed
+# peak-month volume by this factor range (the observed peak is a single,
+# max-selected noisy sample; a hard pin biases every model's shape).
+PEAK_SCALE_LO: float = 0.75
+PEAK_SCALE_HI: float = 1.25
 
 
 # ---- Arps segment primitives (shared by every hyperbolic-family model) ----
@@ -350,16 +357,18 @@ def _seg_cum(q0: float, b: float, D0: float, dt) -> np.ndarray:
         return q0 * dt
     if b <= 1e-10:
         return q0 / D0 * (-np.expm1(-D0 * dt))
-    if abs(b - 1.0) < 1e-12:
+    if abs(b - 1.0) < 1e-9:
         return q0 / D0 * np.log1p(D0 * dt)
-    return q0 / ((1.0 - b) * D0) * (1.0 - np.exp((1.0 - 1.0 / b) * np.log1p(b * D0 * dt)))
+    # expm1 form avoids cancellation in 1 - exp(...) as b -> 1
+    return -q0 / ((1.0 - b) * D0) * np.expm1((1.0 - 1.0 / b) * np.log1p(b * D0 * dt))
 
 
 def _trapz_cum(rate_fn, t: np.ndarray, n_grid: int = 20000) -> np.ndarray:
-    """Numerical cumulative (fallback only) on a fine grid joined with the requested times."""
+    """Numerical cumulative (fallback only) on a log-spaced grid (dense near t = 0,
+    where decline rates change fastest) joined with the requested times."""
     t = np.asarray(t, dtype=float)
-    tmax = float(np.nanmax(t)) if t.size else 0.0
-    grid = np.unique(np.concatenate([np.linspace(0.0, max(tmax, 1.0), n_grid), t]))
+    tmax = max(float(np.nanmax(t)) if t.size else 0.0, 1.0)
+    grid = np.unique(np.concatenate([[0.0], np.geomspace(1e-9, tmax, n_grid), t]))
     N = np.concatenate([[0.0], cumulative_trapezoid(rate_fn(grid), grid)])
     return np.interp(t, grid, N)
 
@@ -388,7 +397,10 @@ def arps(qi: float, b: float, di: float, t) -> np.ndarray:
 
 # ---- Modified Arps (hyperbolic -> terminal exponential) ----
 def _arps_switch(b: float, di: float, d_lim: float) -> float:
-    """Month at which the hyperbolic decline D(t) = di/(1 + b di t) reaches d_lim."""
+    """Month at which the hyperbolic decline D(t) = di/(1 + b di t) reaches d_lim
+    (inf when there is no floor, 0 when the curve starts at or below it)."""
+    if d_lim <= 0:
+        return np.inf
     if b <= 0 or di <= d_lim:
         return 0.0
     return (di / d_lim - 1.0) / (b * di)
@@ -401,9 +413,11 @@ def modified_arps(qi: float, b: float, di: float, d_lim: float, t) -> np.ndarray
     t = np.asarray(t, dtype=float)
     if b <= 0:
         return exponential(qi, max(di, d_lim), t)
-    if di <= d_lim:
-        return exponential(qi, d_lim, t)
     t_sw = _arps_switch(b, di, d_lim)
+    if not np.isfinite(t_sw):
+        return _seg_rate(qi, b, di, t)
+    if t_sw <= 0:
+        return exponential(qi, d_lim, t)
     q_sw = float(_seg_rate(qi, b, di, t_sw))
     return np.where(t <= t_sw, _seg_rate(qi, b, di, t), _seg_rate(q_sw, 0.0, d_lim, t - t_sw))
 
@@ -413,9 +427,11 @@ def modified_arps_cum(qi: float, b: float, di: float, d_lim: float, t) -> np.nda
     t = np.asarray(t, dtype=float)
     if b <= 0:
         return _seg_cum(qi, 0.0, max(di, d_lim), t)
-    if di <= d_lim:
-        return _seg_cum(qi, 0.0, d_lim, t)
     t_sw = _arps_switch(b, di, d_lim)
+    if not np.isfinite(t_sw):
+        return _seg_cum(qi, b, di, t)
+    if t_sw <= 0:
+        return _seg_cum(qi, 0.0, d_lim, t)
     q_sw = float(_seg_rate(qi, b, di, t_sw))
     return _seg_cum(qi, b, di, np.minimum(t, t_sw)) + _seg_cum(q_sw, 0.0, d_lim, t - t_sw)
 
@@ -634,10 +650,17 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     """
     commodity = commodity.lower()
     col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[commodity]
+    if not (0.0 < d_lim < 1.0):
+        raise ValueError(f"d_lim must be in (0, 1) per month, got {d_lim}")
+    if b_low > b_high:
+        raise ValueError(f"b_low ({b_low}) exceeds b_high ({b_high})")
 
     wd = wd.sort_values('MonthYear').copy()
     t_hist = np.arange(len(wd), dtype=float)
     y_hist = wd[col].values.astype(float)
+    y_hist = np.where(np.isfinite(y_hist), y_hist, 0.0)
+    if len(y_hist) == 0 or not (y_hist > 0).any():
+        raise ValueError("no positive monthly volumes to fit")
     y_s    = _smooth(y_hist, 3)
     n = len(y_hist)
 
@@ -645,9 +668,9 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     cand = int(np.nanargmax(y_s)) if n else 0
     lo, hi = max(cand - 1, 0), min(cand + 1, n - 1)
     peak_idx = lo + int(np.nanargmax(y_hist[lo:hi + 1]))
-    v_peak = float(max(y_hist[peak_idx], 1.0))
+    v_peak_obs = float(max(y_hist[peak_idx], 1.0))
     if qi_cap is not None and qi_cap > 0:
-        v_peak = min(v_peak, float(qi_cap))
+        v_peak_obs = min(v_peak_obs, float(qi_cap))
 
     # ---- Post-peak decline data (raw monthly volumes; t = 0 at the peak month) ----
     y_decline  = y_hist[peak_idx:]
@@ -655,7 +678,7 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     t_decline  = np.arange(len(y_decline), dtype=float)
 
     # Shut-in filtering: contiguous runs of >= 3 months at < 2 % of peak are excluded.
-    shutin_thresh = max(0.02 * v_peak, 1.0)
+    shutin_thresh = max(0.02 * v_peak_obs, 1.0)
     low = y_decline <= shutin_thresh
     in_shutin = np.zeros(len(y_decline), dtype=bool)
     run = 0
@@ -669,7 +692,7 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     t_fit = t_decline[active]
     y_fit = y_decline[active]
     if len(y_fit) == 0:                       # degenerate: single positive peak only
-        t_fit, y_fit = np.array([0.0]), np.array([v_peak])
+        t_fit, y_fit = np.array([0.0]), np.array([v_peak_obs])
     n_fit_pts = len(y_fit)
 
     # ---- Seeds from the smoothed series ----
@@ -697,64 +720,74 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     di0 = max(di0, d_lim)
     tau0 = max(1.0, 1.0 / max(di0, 1e-6))
 
-    # ---- Candidate fits: model monthly volumes vs observed, month-0 volume pinned ----
-    def _vol(cum_fn, params, t):
-        return model_volumes(cum_fn, params, t, v_peak)[0]
+    # ---- Candidate fits: model monthly volumes vs observed volumes ----
+    # The month-0 volume is pinned SOFTLY: a common scale s in [PEAK_SCALE_LO,
+    # PEAK_SCALE_HI] multiplies the observed peak-month volume, and the peak
+    # month is an ordinary fit point.  A hard pin to the single, max-selected
+    # peak sample biases the anchor up by its noise and forces every model to
+    # absorb that error in its shape (Arps pushed to a bound, SEPD winning on a
+    # thin tail); s is the same for every model so the BIC comparison stays fair.
+    def _vol(cum_fn, params, t, s=1.0):
+        return model_volumes(cum_fn, params, t, v_peak_obs * s)[0]
 
-    fits: Dict[str, tuple] = {}
+    s_bounds = (PEAK_SCALE_LO, PEAK_SCALE_HI)
+    fits: Dict[str, tuple] = {}          # name -> (s, params...)
 
     def _arps_obj(p):
-        return _log_mse(_vol(modified_arps_cum, (p[0], p[1], d_lim), t_fit), y_fit)
+        return _log_mse(_vol(modified_arps_cum, (p[1], p[2], d_lim), t_fit, p[0]), y_fit)
     arps_starts = [
-        [b0, di0], [b_low, di0], [b_high, min(di0 * 2.0, 0.5)],
-        [b0, max(di0 * 0.5, d_lim)], [0.5 * (b_low + b_high), max(di0 * 1.5, d_lim)],
+        [1.0, b0, di0], [1.0, b_low, di0], [1.0, b_high, min(di0 * 2.0, 0.5)],
+        [1.0, b0, max(di0 * 0.5, d_lim)], [1.0, 0.5 * (b_low + b_high), max(di0 * 1.5, d_lim)],
     ]
-    p, _ = _fit_model(_arps_obj, arps_starts, [(b_low, b_high), (d_lim, 1.0)])
+    p, _ = _fit_model(_arps_obj, arps_starts, [s_bounds, (b_low, b_high), (d_lim, 1.0)])
     if p is None:
-        p = np.array([np.clip(b0, b_low, b_high), max(di0, d_lim)])
-    b_a, di_a = float(p[0]), float(p[1])
-    fits['Modified Arps'] = (b_a, di_a, d_lim)
+        p = np.array([1.0, np.clip(b0, b_low, b_high), max(di0, d_lim)])
+    s_a, b_a, di_a = float(p[0]), float(p[1]), float(p[2])
+    fits['Modified Arps'] = (s_a, b_a, di_a, d_lim)
 
     def _sepd_obj(p):
-        return _log_mse(_vol(sepd_cum, (p[0], p[1], d_lim), t_fit), y_fit)
-    sepd_starts = [[tau0, 0.5], [tau0 * 2, 0.3], [tau0 * 0.5, 0.7], [tau0, 0.4], [tau0, 0.9]]
-    p, _ = _fit_model(_sepd_obj, sepd_starts, [(0.5, 500.0), (0.05, 1.0)])
+        return _log_mse(_vol(sepd_cum, (p[1], p[2], d_lim), t_fit, p[0]), y_fit)
+    sepd_starts = [[1.0, tau0, 0.5], [1.0, tau0 * 2, 0.3], [1.0, tau0 * 0.5, 0.7],
+                   [1.0, tau0, 0.4], [1.0, tau0, 0.9]]
+    p, _ = _fit_model(_sepd_obj, sepd_starts, [s_bounds, (0.5, 500.0), (0.05, 1.0)])
     if p is None:
-        p = np.array([tau0, 0.5])
-    fits['SEPD'] = (float(p[0]), float(p[1]), d_lim)
+        p = np.array([1.0, tau0, 0.5])
+    fits['SEPD'] = (float(p[0]), float(p[1]), float(p[2]), d_lim)
 
     if (not exclude_duong) and n_fit_pts >= duong_min_months:
         def _duong_obj(p):
-            if p[0] > p[1]:        # a > m: the rate would RISE from the pinned peak
-                return 1e6 + 1e3 * (p[0] - p[1])
-            return _log_mse(_vol(duong_cum, (p[0], p[1], d_lim), t_fit), y_fit)
-        duong_starts = [[1.0, 1.5], [0.5, 1.2], [2.0, 2.2], [1.0, 2.0], [0.8, 1.1]]
-        p, _ = _fit_model(_duong_obj, duong_starts, [(0.001, 10.0), (1.01, 3.0)])
-        if p is not None and p[0] <= p[1]:
-            fits['Duong'] = (float(p[0]), float(p[1]), d_lim)
+            if p[1] > p[2]:        # a > m: the rate would RISE from the peak
+                return 1e6 + 1e3 * (p[1] - p[2])
+            return _log_mse(_vol(duong_cum, (p[1], p[2], d_lim), t_fit, p[0]), y_fit)
+        duong_starts = [[1.0, 1.0, 1.5], [1.0, 0.5, 1.2], [1.0, 2.0, 2.2], [1.0, 1.0, 2.0], [1.0, 0.8, 1.1]]
+        p, _ = _fit_model(_duong_obj, duong_starts, [s_bounds, (0.001, 10.0), (1.01, 3.0)])
+        if p is not None and p[1] <= p[2]:
+            fits['Duong'] = (float(p[0]), float(p[1]), float(p[2]), d_lim)
 
     if allow_exponential:
         def _exp_obj(p):
-            return _log_mse(_vol(exponential_cum, (p[0],), t_fit), y_fit)
-        exp_starts = [[di0], [min(di0 * 2.0, 1.0)], [max(di0 * 0.5, d_lim)]]
-        p, _ = _fit_model(_exp_obj, exp_starts, [(d_lim, 1.0)])
-        fits['Exponential'] = (float(p[0]) if p is not None else float(di0),)
+            return _log_mse(_vol(exponential_cum, (p[1],), t_fit, p[0]), y_fit)
+        exp_starts = [[1.0, di0], [1.0, min(di0 * 2.0, 1.0)], [1.0, max(di0 * 0.5, d_lim)]]
+        p, _ = _fit_model(_exp_obj, exp_starts, [s_bounds, (d_lim, 1.0)])
+        fits['Exponential'] = (float(p[0]), float(p[1])) if p is not None else (1.0, float(di0))
 
-    # ---- Model selection by BIC (k = free params with qi pinned) ----
-    preds = {name: _vol(MODEL_REGISTRY[name][1], params, t_fit) for name, params in fits.items()}
-    bics = {name: _bic(y_fit, preds[name], MODEL_REGISTRY[name][2]) for name in fits}
+    # ---- Model selection by BIC (k = model params + the shared peak scale) ----
+    preds = {name: _vol(MODEL_REGISTRY[name][1], f[1:], t_fit, f[0]) for name, f in fits.items()}
+    bics = {name: _bic(y_fit, preds[name], MODEL_REGISTRY[name][2] + 1) for name in fits}
+    bic_min = min(bics.values())
     best_model = min(bics, key=bics.get)
     # Reference-model preference: SEPD / Duong need positive evidence (ΔBIC >= 2)
     # over Modified Arps; a smaller gap is indistinguishable from noise.
     if (best_model in ('SEPD', 'Duong') and 'Modified Arps' in bics
             and bics['Modified Arps'] - bics[best_model] < ARPS_BIC_PREFERENCE):
         best_model = 'Modified Arps'
-    # Parsimony tie-break: a 2-parameter model that beats the 1-parameter
-    # exponential by ΔBIC < 2 has no real support (Kass & Raftery).
-    if 'Exponential' in bics and bics['Exponential'] - bics[best_model] < EXP_BIC_TOLERANCE:
+    # Parsimony tie-break (against the true BIC minimum): a 2-parameter model
+    # that beats the 1-parameter exponential by ΔBIC < 2 has no real support.
+    if 'Exponential' in bics and bics['Exponential'] - bic_min < EXP_BIC_TOLERANCE:
         best_model = 'Exponential'
     rate_fn, cum_fn, _k = MODEL_REGISTRY[best_model]
-    params = fits[best_model]
+    s_best, params = fits[best_model][0], fits[best_model][1:]
+    v_peak = v_peak_obs * s_best
 
     # ---- Fit + forecast on the peak-relative axis (monthly VOLUMES) ----
     n_post = len(t_hist) - peak_idx
@@ -774,7 +807,8 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     quality = _fit_quality(y_fit, preds[best_model])
 
     # ---- Arps-equivalent (b, di) consistent with the winner, over the HISTORY
-    # window + 24 months (so it describes the observed decline, not the 50-year tail)
+    # window + 24 months (so it describes the observed decline, not the 50-year
+    # tail; it is NOT an EUR-matched equivalent for SEPD/Duong winners).
     if best_model == 'Modified Arps':
         b_out, di_out = b_a, di_a
     elif best_model == 'Exponential':
@@ -786,8 +820,9 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
         b_out, di_out = b_a, di_a
         if meq.sum() >= 4:
             def _eq_obj(p):
-                return _log_mse(_vol(modified_arps_cum, (p[0], p[1], d_lim), t_eq[meq]), v_eq[meq])
-            pe, _ = _fit_model(_eq_obj, arps_starts, [(b_low, b_high), (d_lim, 1.0)])
+                return _log_mse(model_volumes(modified_arps_cum, (p[0], p[1], d_lim), t_eq[meq], v_peak)[0],
+                                v_eq[meq])
+            pe, _ = _fit_model(_eq_obj, [st[1:] for st in arps_starts], [(b_low, b_high), (d_lim, 1.0)])
             if pe is not None:
                 b_out, di_out = float(pe[0]), float(pe[1])
     b_at_bound = bool(best_model in ('Modified Arps', 'SEPD', 'Duong')
@@ -806,7 +841,8 @@ def forecast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     }[best_model](params)
 
     return dict(
-        qi=qi_rate, v_peak=v_peak, b=b_out, di=di_out, d_lim=d_lim,
+        qi=qi_rate, v_peak=v_peak, v_peak_obs=v_peak_obs, peak_scale=s_best,
+        b=b_out, di=di_out, d_lim=d_lim,
         b_arps=b_a, di_arps=di_a, b_at_bound=b_at_bound,
         model=best_model, params=native, bics=bics, fits=fits,
         n_months=int(len(t_hist)), n_post=int(n_post), peak_idx=int(peak_idx),
@@ -824,20 +860,24 @@ def hindcast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
                       allow_exponential: bool = False,
                       exclude_duong: bool = False,
                       duong_min_months: int = 18,
-                      qi_cap: float | None = None) -> Dict[str, object] | None:
+                      qi_cap: float | None = None,
+                      min_post_train: int = 4) -> Dict[str, object] | None:
     """Back-test one well's forecast (SPEE Monograph 5 — Validation / history match).
 
     Fit the full workflow on the first part of the history (either the first
     ``train_frac`` of the months, or everything but the last ``holdout_months``),
     forecast across the held-out remainder, and compare with the actual
     volumes.  Returns observed/predicted arrays plus error metrics, or None when
-    the history is too short to split meaningfully.
+    the history is too short to split meaningfully or the training window has
+    fewer than ``min_post_train`` usable post-peak points (a "fit" to a single
+    pinned point would just return the seed parameters).
 
-    Metrics
+    Metrics (both computed over held-out months with actual production > 0, so
+    a shut-in during the hold-out is not counted as forecast error)
     -------
-    cum_err_pct : signed error of forecast cumulative vs actual cumulative over
-                  the test window (positive = forecast over-predicts).
-    mape_pct    : mean absolute percentage error across test months.
+    cum_err_pct : signed error of forecast cumulative vs actual cumulative
+                  (positive = forecast over-predicts).
+    mape_pct    : mean absolute percentage error across those months.
     """
     com = commodity.lower()
     col = {'oil': 'NormOil', 'gas': 'NormGas', 'water': 'NormWater'}[com]
@@ -858,6 +898,8 @@ def hindcast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     fc = forecast_one_well(train, com, b_low, b_high, max_months=n_test + 12, d_lim=d_lim,
                            allow_exponential=allow_exponential, exclude_duong=exclude_duong,
                            duong_min_months=duong_min_months, qi_cap=qi_cap)
+    if int(fc.get('n_fit', 0)) < min_post_train:
+        return None                            # no post-peak decline to learn from
     # fc forecast begins at the month after the end of training history.
     y_pred = np.asarray(fc['f_vals'], dtype=float)[:n_test]
     if len(y_pred) < n_test:
@@ -867,12 +909,13 @@ def hindcast_one_well(wd: pd.DataFrame, commodity: str, b_low: float, b_high: fl
     if valid.sum() == 0:
         return None
     mape = float(np.mean(np.abs(y_pred[valid] - y_test[valid]) / y_test[valid]) * 100.0)
-    cum_actual = float(np.sum(y_test[np.isfinite(y_test)]))
-    cum_pred = float(np.sum(y_pred[np.isfinite(y_pred)]))
+    cum_actual = float(np.sum(y_test[valid]))
+    cum_pred = float(np.sum(y_pred[valid]))
     cum_err = float((cum_pred - cum_actual) / cum_actual * 100.0) if cum_actual > 0 else np.nan
 
     return dict(
         n_train=n_train, n_test=n_test,
+        n_post_train=int(fc.get('n_post', 0)), n_fit_train=int(fc.get('n_fit', 0)),
         t_train=np.arange(1, n_train + 1, dtype=float),
         y_train=train[col].values.astype(float),
         t_test=np.arange(n_train + 1, n_train + 1 + n_test, dtype=float),
@@ -923,6 +966,7 @@ def _hindcast_well_job(well_id, wd: pd.DataFrame, cfg: ForecastConfig,
     try:
         hc = hindcast_one_well(wd, cfg.commodity, cfg.b_low, cfg.b_high, train_frac=train_frac,
                                d_lim=cfg.d_lim, holdout_months=holdout_months,
+                               min_train=max(6, int(cfg.min_months_history)),
                                allow_exponential=cfg.allow_exponential,
                                exclude_duong=cfg.exclude_duong,
                                duong_min_months=cfg.duong_min_months, qi_cap=cfg.qi_cap)
@@ -1143,11 +1187,13 @@ def hindcast_all(merged: pd.DataFrame, cfg: ForecastConfig,
             'WellID': str(well_id), 'WellName': hdr.get('WellName', 'N/A'),
             'API10': str(hdr.get('API10', '')),
             'Model': hc['model'], 'Train months': hc['n_train'], 'Test months': hc['n_test'],
+            'Post-peak months (train)': hc['n_post_train'], 'Fit points (train)': hc['n_fit_train'],
             'Actual (test)': round(hc['cum_actual'], 1), 'Forecast (test)': round(hc['cum_pred'], 1),
             'Cum error (%)': round(hc['cum_err_pct'], 1), 'MAPE (%)': round(hc['mape_pct'], 1),
             'Fit R² (log)': round(float(hc['fit_r2_log']), 3) if hc.get('fit_r2_log') is not None else np.nan,
         })
     cols = ['WellID', 'WellName', 'API10', 'Model', 'Train months', 'Test months',
+            'Post-peak months (train)', 'Fit points (train)',
             'Actual (test)', 'Forecast (test)', 'Cum error (%)', 'MAPE (%)', 'Fit R² (log)']
     return pd.DataFrame(rows, columns=cols)
 

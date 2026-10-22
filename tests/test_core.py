@@ -216,9 +216,47 @@ def test_duong_is_gated_on_short_histories():
 def test_qi_cap_is_optional_and_honoured():
     wd, _ = synthetic_well('Modified Arps', (1.0, 0.12, D), 24, 0.0, 3, qi=300_000.0)
     fc = core.forecast_one_well(wd, 'oil', 0.8, 1.2, 600, d_lim=D)
-    assert fc['v_peak'] > 152_000.0, "no implicit 152,000 cap any more"
+    assert fc['v_peak_obs'] > 152_000.0, "no implicit 152,000 cap any more"
     fc2 = core.forecast_one_well(wd, 'oil', 0.8, 1.2, 600, d_lim=D, qi_cap=100_000.0)
-    assert fc2['v_peak'] == pytest.approx(100_000.0)
+    assert fc2['v_peak_obs'] == pytest.approx(100_000.0)
+    assert core.PEAK_SCALE_LO <= fc2['peak_scale'] <= core.PEAK_SCALE_HI
+
+
+def test_soft_peak_pin_absorbs_peak_month_noise():
+    """A hard pin to a +12 % peak-month outlier forced the Arps fit to a bound (or
+    handed the well to SEPD); the soft pin lets the scale absorb the outlier so the
+    hyperbolic shape and EUR are recovered from the rest of the decline."""
+    wd, te = synthetic_well('Modified Arps', (1.0, 0.12, D), 48, 0.0, 5)
+    wd = wd.copy()
+    wd.loc[wd.index[1], 'NormOil'] *= 1.12          # the peak month (index 1 after the ramp)
+    fc = core.forecast_one_well(wd, 'oil', 0.8, 1.2, 600, d_lim=D)
+    assert fc['model'] == 'Modified Arps'
+    assert fc['b'] == pytest.approx(1.0, abs=0.1)
+    assert fc['peak_scale'] < 1.0                   # part of the outlier absorbed by the scale
+    assert fc['EUR_total'] == pytest.approx(te, rel=0.05)
+
+
+def test_invalid_configuration_raises():
+    wd, _ = synthetic_well('Modified Arps', (1.0, 0.12, D), 24, 0.05, 6)
+    with pytest.raises(ValueError):
+        core.forecast_one_well(wd, 'oil', 1.2, 0.8, 600, d_lim=D)
+    with pytest.raises(ValueError):
+        core.forecast_one_well(wd, 'oil', 0.8, 1.2, 600, d_lim=0.0)
+
+
+def test_hindcast_rejects_training_windows_without_decline():
+    """A hold-out that leaves only the ramp-up in training must not report seed
+    parameters as a validated forecast."""
+    rng = np.random.default_rng(8)
+    ramp = np.linspace(500, 8000, 8)
+    t = np.arange(22, dtype=float)
+    N = core.modified_arps_cum(8000.0, 1.0, 0.1, D, np.concatenate([t, t + 1]))
+    V = np.concatenate([ramp, (N[22:] - N[:22])[1:]])
+    wd = pd.DataFrame([dict(WellID='W', MonthYear=pd.Period('2018-01', 'M') + k, NormOil=v,
+                            NormGas=0.0, NormWater=0.0) for k, v in enumerate(V)])
+    assert core.hindcast_one_well(wd, 'oil', 0.8, 1.2, holdout_months=22, d_lim=D) is None
+    hc = core.hindcast_one_well(wd, 'oil', 0.8, 1.2, holdout_months=12, d_lim=D)
+    assert hc is not None and hc['n_fit_train'] >= 4
 
 
 def test_forecast_dict_is_finite_and_consistent():

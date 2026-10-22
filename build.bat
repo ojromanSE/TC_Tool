@@ -41,7 +41,6 @@ echo Building SE_Tool.exe...
     --add-data "static;static" ^
     --collect-all streamlit ^
     --collect-all altair ^
-    --collect-all sklearn ^
     --collect-all scipy ^
     --collect-all reportlab ^
     --collect-all joblib ^
