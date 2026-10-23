@@ -986,16 +986,25 @@ def _forecast_well_as_yield(wd: pd.DataFrame, com: str, pfc: dict, cfg: Forecast
     wd = wd.sort_values('MonthYear').copy()
     y_sec = wd[col].values.astype(float)
     prim_hist = np.asarray(pfc['hist'], dtype=float)
-    n = min(len(y_sec), len(prim_hist))
+    n = len(y_sec)
+    if len(prim_hist) != n:
+        # The oil forecast was made from a different merged frame (data
+        # re-loaded since): its months no longer line up with this history.
+        raise ValueError("oil forecast history length does not match the well's history")
     if n < 6:
         raise ValueError("history too short for a yield fit")
-    y_sec, prim_hist = y_sec[:n], prim_hist[:n]
+    peak_idx = int(pfc['peak_idx'])
+    if not (0 <= peak_idx < n):
+        raise ValueError("oil forecast peak index outside the history")
     t_mid = np.arange(n, dtype=float) + 0.5                  # months since first production
     params = fit_yield(t_mid, observed_ratio(prim_hist, y_sec))
     if params is None:
         raise ValueError("yield fit failed")
 
-    peak_idx = int(pfc['peak_idx'])
+    # The secondary forecast inherits the OIL forecast's terminal decline (its
+    # tail is yield x oil), so that is the floor to report and to use for the
+    # Arps-equivalent — not the gas/water sidebar setting.
+    d_lim = float(pfc.get('d_lim', cfg.d_lim))
     n_post = n - peak_idx
     prim_clean = np.where(np.isfinite(prim_hist), np.maximum(prim_hist, 0.0), 0.0)
     fit_hist = yield_curve(params, t_mid) * prim_clean       # implied secondary history match
@@ -1011,23 +1020,27 @@ def _forecast_well_as_yield(wd: pd.DataFrame, com: str, pfc: dict, cfg: Forecast
     trace = np.concatenate([fit_hist[peak_idx:], f_vals[:24]])
     t_eq = np.arange(len(trace), dtype=float)
     meq = np.isfinite(trace) & (trace > 1e-9)
-    b_out, di_out, qi = 1.0, max(cfg.d_lim, 0.05), v_peak
+    b_lo, b_hi = float(cfg.b_low), float(cfg.b_high)
+    b_mid = 0.5 * (b_lo + b_hi)
+    b_out, di_out, qi, b_at_bound = b_mid, max(d_lim, 0.05), v_peak, False
     if meq.sum() >= 4:
         def _obj(p):
-            V, _ = model_volumes(modified_arps_cum, (p[0], p[1], cfg.d_lim), t_eq[meq], v_peak)
+            V, _ = model_volumes(modified_arps_cum, (p[0], p[1], d_lim), t_eq[meq], v_peak)
             return _log_mse(V, trace[meq])
-        pe, _ = _fit_model(_obj, [[1.0, 0.1], [0.5, 0.05], [1.5, 0.2], [0.0, 0.02]],
-                           [(0.0, 2.0), (cfg.d_lim, 1.0)])
+        starts = [[b_mid, 0.1], [b_lo, 0.05], [b_hi, 0.2], [b_mid, 0.02]]
+        pe, _ = _fit_model(_obj, starts, [(b_lo, b_hi), (d_lim, 1.0)])
         if pe is not None:
             b_out, di_out = float(pe[0]), float(pe[1])
-            _, qi = model_volumes(modified_arps_cum, (b_out, di_out, cfg.d_lim), np.array([0.0]), v_peak)
-    q0  = float(modified_arps(qi, b_out, di_out, cfg.d_lim, np.array([0.0]))[0])
-    q12 = float(modified_arps(qi, b_out, di_out, cfg.d_lim, np.array([12.0]))[0])
+            b_at_bound = bool(b_hi > b_lo and (abs(b_out - b_lo) < 1e-6 or abs(b_out - b_hi) < 1e-6))
+            _, qi = model_volumes(modified_arps_cum, (b_out, di_out, d_lim), np.array([0.0]), v_peak)
+    q0  = float(modified_arps(qi, b_out, di_out, d_lim, np.array([0.0]))[0])
+    q12 = float(modified_arps(qi, b_out, di_out, d_lim, np.array([12.0]))[0])
     quality = _fit_quality(y_sec[peak_idx:], fit_hist[peak_idx:])
     return dict(
-        qi=qi, v_peak=v_peak, b=b_out, di=di_out, d_lim=cfg.d_lim, b_arps=b_out, di_arps=di_out,
-        b_at_bound=False, model='Yield (GOR)' if com == 'gas' else 'Yield (WOR)',
+        qi=qi, v_peak=v_peak, b=b_out, di=di_out, d_lim=d_lim, b_arps=b_out, di_arps=di_out,
+        b_at_bound=b_at_bound, model='Yield (GOR)' if com == 'gas' else 'Yield (WOR)',
         params={'c': params.c, 'm0': params.m0, 'm': params.m, 't0': params.t0,
+                'ymin': params.y_min if params.y_min is not None else np.nan,
                 'ymax': params.y_max if params.y_max is not None else np.nan, 'r2': params.r2},
         bics={}, fits={}, n_months=int(n), n_post=int(n_post), peak_idx=peak_idx,
         t_hist=np.arange(n, dtype=float), hist=y_sec, fit_hist=fit_hist,

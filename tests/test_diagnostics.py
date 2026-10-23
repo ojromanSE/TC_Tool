@@ -72,6 +72,30 @@ def test_bourdet_rejects_non_increasing_x_and_bad_shapes():
         DG.bourdet([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], L=-0.1)
 
 
+def test_bourdet_weighting_is_exact_for_quadratics_on_nonuniform_grid():
+    """SPE-12777 Eq. 8 weights each secant by the OPPOSITE interval, which makes
+    the 3-point estimate exact for a quadratic on any grid; swapped weights are
+    not (errors 0.5-3.8 on this grid)."""
+    x = np.array([1, 1.3, 2.1, 2.4, 4, 4.3, 7, 7.1, 11, 15.0])
+    d = DG.bourdet(x ** 2, x, L=0.0, xlog=False)              # dy/dx = 2x
+    np.testing.assert_allclose(d[1:-1], 2 * x[1:-1], atol=1e-10)
+    lx = np.log(x)
+    d2 = DG.bourdet(lx ** 2, x, L=0.0, xlog=True)             # dy/d ln x = 2 ln x
+    np.testing.assert_allclose(d2[1:-1], 2 * lx[1:-1], atol=1e-10)
+
+
+def test_bourdet_window_ties_are_symmetric():
+    """A sample exactly L cycles away is 'at least L away' on both sides."""
+    x = 10.0 ** np.arange(12)
+    y = np.log(x) ** 3
+    d = DG.bourdet(y, x, L=1.0)
+    # symmetric +/- one-decade window -> exact centred 3-point value
+    lx = np.log(x)
+    i = 5
+    sL = (y[i] - y[i - 1]) / (lx[i] - lx[i - 1]); sR = (y[i + 1] - y[i]) / (lx[i + 1] - lx[i])
+    assert d[i] == pytest.approx((sL + sR) / 2, rel=1e-12)
+
+
 def test_bourdet_too_few_points_returns_nan():
     assert np.all(np.isnan(DG.bourdet([1.0], [1.0])))
     assert np.all(np.isnan(DG.bourdet([np.nan, 2.0, np.nan], [1.0, 2.0, 3.0])))
@@ -89,13 +113,27 @@ def test_local_slope_exact_for_linear_and_skips_nan():
     np.testing.assert_allclose(s[np.isfinite(s)], -0.3, atol=1e-12)
 
 
-def test_local_slope_widens_window_to_min_points():
+def test_local_slope_widens_window_to_nearest_points():
     x = np.array([0.5, 1.5, 2.5, 30.5, 31.5, 32.5])
-    y = 2.0 * x
+    y = x ** 2                                     # slope depends on which points are used
     s = DG.local_slope(x, y, half_width=0.1, min_points=3)   # window holds only the point itself
-    np.testing.assert_allclose(s, 2.0, atol=1e-12)
+    # nearest three points: {0.5,1.5,2.5} for the first cluster (LS slope 3.0),
+    # {30.5,31.5,32.5} for the second (LS slope 63.0); never across the gap
+    np.testing.assert_allclose(s[:3], 3.0, atol=1e-9)
+    np.testing.assert_allclose(s[3:], 63.0, atol=1e-9)
     assert np.all(np.isnan(DG.local_slope([1.0], [1.0], 5.0)))
     assert np.all(np.isnan(DG.local_slope([1.0, 2.0], [np.nan, 1.0], 5.0)))
+
+
+def test_local_slope_unsorted_input_matches_sorted():
+    rng = np.random.default_rng(5)
+    x = np.arange(40) + 0.5
+    y = x ** 2
+    perm = rng.permutation(40)
+    s_sorted = DG.local_slope(x, y, 6.0)
+    s_perm = DG.local_slope(x[perm], y[perm], 6.0)
+    np.testing.assert_allclose(s_perm, s_sorted[perm], atol=1e-9)
+    np.testing.assert_allclose(s_sorted[6:-6], 2 * x[6:-6], atol=1e-9)   # exact for quadratics on symmetric windows
 
 
 def test_local_slope_averages_noise():
@@ -109,37 +147,60 @@ def test_local_slope_averages_noise():
 
 
 # ---------------------------------------------------------------- model_diagnostics
+def _core_switch(model, params, d_lim):
+    if model == 'Modified Arps' and params['b'] > 0:
+        return core._arps_switch(params['b'], params['di'], d_lim)
+    if model == 'SEPD':
+        return core._sepd_switch(params['tau'], params['n'], d_lim)
+    if model == 'Duong':
+        return core._duong_switch(params['a'], params['m'], d_lim)
+    return 0.0 if params['di'] <= d_lim else np.inf          # Exponential: floor or never
+
+
 @pytest.mark.parametrize("model,params,rate_fn", [
     ('Modified Arps', {'qi': 5000.0, 'b': 1.1, 'di': 0.15},
+     lambda p, x, dl: core.modified_arps(p['qi'], p['b'], p['di'], dl, x)),
+    ('Modified Arps', {'qi': 5000.0, 'b': 0.0, 'di': 0.03},
      lambda p, x, dl: core.modified_arps(p['qi'], p['b'], p['di'], dl, x)),
     ('Exponential', {'qi': 5000.0, 'di': 0.03},
      lambda p, x, dl: core.exponential(p['qi'], p['di'], x)),
     ('SEPD', {'qi': 5000.0, 'tau': 8.0, 'n': 0.5},
      lambda p, x, dl: core.sepd(p['qi'], p['tau'], p['n'], dl, x)),
+    ('SEPD', {'qi': 5000.0, 'tau': 30.0, 'n': 0.3},            # switch inside the grid
+     lambda p, x, dl: core.sepd(p['qi'], p['tau'], p['n'], dl, x)),
     ('Duong', {'qi': 5000.0, 'a': 1.2, 'm': 1.25},
      lambda p, x, dl: core.duong(p['qi'], p['a'], p['m'], dl, x)),
 ])
-def test_model_diagnostics_matches_core_rate_functions(model, params, rate_fn):
-    d_lim = core.D_LIM_DEFAULT
+@pytest.mark.parametrize("d_lim", [core.D_LIM_DEFAULT, 0.0])
+def test_model_diagnostics_matches_core_rate_functions(model, params, rate_fn, d_lim):
     t = np.linspace(0.5, 300.5, 601)
+    step = t[1] - t[0]
     md = DG.model_diagnostics(model, params, t, d_lim)
     h = 1e-4
     D_fd = -(np.log(rate_fn(params, t + h, d_lim)) - np.log(rate_fn(params, t - h, d_lim))) / (2 * h)
-    # Core switches to the floor exactly where D reaches d_lim; skip the one
-    # grid point that may straddle the switch.
-    straddle = np.abs(D_fd - d_lim) < 1e-3 * d_lim
-    ok = ~straddle & np.isfinite(D_fd) & (D_fd > 0)
+    t_sw = _core_switch(model, params, d_lim) if d_lim > 0 else np.inf
+    near_switch = np.abs(t - t_sw) <= step if np.isfinite(t_sw) else np.zeros(t.shape, bool)
+    ok = ~near_switch & np.isfinite(D_fd) & (D_fd > 0)
+    assert ok.sum() > 500
+    # D and 1/D agree with core everywhere, including on the floor
     np.testing.assert_allclose(md['D'][ok], D_fd[ok], rtol=1e-6)
     np.testing.assert_allclose(md['beta'][ok], 1.0 / D_fd[ok], rtol=1e-6)
     # b = d(1/D)/dt by central differences on the analytic D
     md_p = DG.model_diagnostics(model, params, t + h, d_lim)
     md_m = DG.model_diagnostics(model, params, t - h, d_lim)
     b_fd = (md_p['beta'] - md_m['beta']) / (2 * h)
-    off_floor = ok & (md['D'] > d_lim * (1 + 1e-9))
-    np.testing.assert_allclose(md['b'][off_floor], b_fd[off_floor], atol=1e-4, rtol=1e-4)
-    on_floor = md['D'] <= d_lim * (1 + 1e-12)
-    assert np.all(md['b'][on_floor] == 0.0)
-    assert np.all(md['D'] >= d_lim * (1 - 1e-12))
+    np.testing.assert_allclose(md['b'][ok], b_fd[ok], atol=1e-4, rtol=1e-4)
+    if d_lim > 0:
+        floor = t > t_sw + step
+        if t_sw < t[-1] - 20 * step:
+            assert floor.sum() > 10                     # these cases do reach the floor in-grid
+        assert floor.sum() > 10 or model == 'Exponential' or params.get('b') == 0.0 or params.get('tau') == 8.0
+        np.testing.assert_allclose(md['D'][floor], d_lim, rtol=1e-9)
+        np.testing.assert_allclose(D_fd[floor], d_lim, rtol=1e-6)
+        assert np.all(md['b'][floor] == 0.0)
+        assert np.all(md['D'] >= d_lim * (1 - 1e-12))
+    else:
+        assert np.all(md['b'][ok] != 0.0) or model == 'Exponential' or params.get('b') == 0.0
 
 
 def test_model_diagnostics_arps_b_is_constant_before_floor():
@@ -167,14 +228,27 @@ def test_model_diagnostics_sepd_b_is_decreasing_power_law():
 
 
 def test_model_diagnostics_duong_floor_applies_after_last_crossing():
-    # Duong D starts low (t' = 1: D = m - a), rises, then falls below d_lim.
-    t = np.arange(0.5, 400.5)
-    md = DG.model_diagnostics('Duong', {'qi': 1.0, 'a': 1.2, 'm': 1.25}, t, core.D_LIM_DEFAULT)
-    sw = core._duong_switch(1.2, 1.25, core.D_LIM_DEFAULT)
+    # With a = m Duong's D is exactly 0 at t = 0 (t' = 1: D = m - a), rises
+    # above d_lim, then falls below it for good: the early dip must NOT be
+    # treated as the floor (a naive D <= d_lim rule would floor it).
+    d_lim = core.D_LIM_DEFAULT
+    t = np.arange(0.0, 400.0)
+    params = {'qi': 1.0, 'a': 1.2, 'm': 1.2}
+    md = DG.model_diagnostics('Duong', params, t, d_lim)
+    raw_D0 = params['m'] / 1.0 - params['a'] * 1.0 ** (-params['m'])
+    assert raw_D0 == pytest.approx(0.0)
+    assert md['D'][0] == pytest.approx(0.0, abs=1e-12) and np.isnan(md['beta'][0])
+    assert md['D'][1] > d_lim and md['b'][1] != 0.0
+    sw = core._duong_switch(1.2, 1.2, d_lim)
     assert np.isfinite(sw) and sw > 1
-    on_floor = md['D'] <= core.D_LIM_DEFAULT * (1 + 1e-12)
+    on_floor = md['D'] <= d_lim * (1 + 1e-12)
     assert np.all(on_floor[t > sw + 1.0])
-    assert not np.any(on_floor[(t > 1.5) & (t < sw - 1.0)])
+    assert not np.any(on_floor[(t >= 1.0) & (t < sw - 1.0)])
+    # interior matches core's finite-difference D
+    h = 1e-4
+    D_fd = -(np.log(core.duong(1.0, 1.2, 1.2, d_lim, t[1:] + h)) - np.log(core.duong(1.0, 1.2, 1.2, d_lim, t[1:] - h))) / (2 * h)
+    inner = np.abs(t[1:] - sw) > 1.0
+    np.testing.assert_allclose(md['D'][1:][inner], D_fd[inner], rtol=1e-6)
 
 
 def test_model_diagnostics_unknown_model_raises():
@@ -188,8 +262,8 @@ def test_data_diagnostics_recovers_hyperbolic_D_and_b():
     t = np.arange(120) + 0.5
     q = core.arps(5000.0, b, di, t)                        # instantaneous rates, no floor
     dd = DG.data_diagnostics(t, q)
-    assert set(dd) == {'t', 'q', 'D', 'beta', 'b', 'loglog_slope'}
-    assert dd['t'].size == 120
+    assert set(dd) == {'t', 'q', 'D', 'beta', 'b', 'loglog_slope', 'n_dropped'}
+    assert dd['t'].size == 120 and dd['n_dropped'] == 0
     D_true = di / (1.0 + b * di * dd['t'])
     # D changes fastest in the first year, where a 13-month window averages
     # over it; beyond that the regression derivative is within a few percent.
@@ -244,11 +318,43 @@ def test_data_diagnostics_drops_shutins_and_garbage():
     q = core.arps(3000.0, 1.0, 0.1, t)
     q[[5, 17]] = 0.0            # shut-in months
     q[23] = np.nan
-    q[30] = 10.0                # curtailed month (< 2 % of max)
+    q[30] = 10.0                # curtailed month (~1 % of its neighbours)
     dd = DG.data_diagnostics(t, q)
-    assert dd['t'].size == 36
+    assert dd['t'].size == 36 and dd['n_dropped'] == 1
     assert not np.any(np.isin(dd['t'], t[[5, 17, 23, 30]]))
     assert np.all(np.isfinite(dd['D'][1:-1]))
+
+
+def test_data_diagnostics_keeps_legitimate_late_tail_of_steep_declines():
+    """The shut-in test is relative to the local level, not the peak: on a
+    steep decline the late months are a tiny fraction of the peak yet on trend
+    and must be kept (they are the boundary-dominated period the panel shows)."""
+    t = np.arange(120) + 0.5
+    for V in (core.model_volumes(core.modified_arps_cum, (0.5, 0.30, core.D_LIM_DEFAULT), np.arange(120), 1e4)[0],
+              core.model_volumes(core.sepd_cum, (2.0, 0.5, core.D_LIM_DEFAULT), np.arange(120), 1e4)[0],
+              core.exponential(1e4, 0.05, t)):
+        assert V[-1] / V.max() < 0.02
+        dd = DG.data_diagnostics(t, V)
+        assert dd['t'].size == 120 and dd['n_dropped'] == 0
+    # ... while a single curtailed month inside that tail is still removed
+    V = core.exponential(1e4, 0.05, t)
+    V[100] *= 0.05
+    dd = DG.data_diagnostics(t, V)
+    assert dd['t'].size == 119 and dd['n_dropped'] == 1 and 100.5 not in dd['t']
+
+
+def test_data_diagnostics_collapses_duplicate_times():
+    t = np.array([0.5, 1.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5])
+    q = core.arps(1000.0, 1.0, 0.3, t)
+    q[2] *= 1.2                                      # second sample of month 1.5
+    dd = DG.data_diagnostics(t, q)
+    assert dd['t'].size == 8
+    assert dd['q'][1] == pytest.approx((q[1] + q[2]) / 2)
+    assert np.all(np.isfinite(dd['D'])) and np.all(np.isfinite(dd['loglog_slope']))
+    # a duplicate that is a zero is filtered first and does not average in
+    q2 = q.copy(); q2[2] = 0.0
+    dd2 = DG.data_diagnostics(t, q2)
+    assert dd2['t'].size == 8 and dd2['q'][1] == pytest.approx(q[1])
 
 
 def test_data_diagnostics_handles_tiny_inputs():

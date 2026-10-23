@@ -77,8 +77,9 @@ def bourdet(y, x, L: float = 0.0, xlog: bool = True, ylog: bool = False) -> np.n
         iL = np.clip(pts - 1, 0, n - 1)
         iR = np.clip(pts + 1, 0, n - 1)
     else:
+        # nearest points at distance >= L on each side (ties handled symmetrically)
         iL = np.clip(np.searchsorted(lx, lx - L, side='right') - 1, 0, n - 1)
-        iR = np.clip(np.searchsorted(lx, lx + L, side='right'), 0, n - 1)
+        iR = np.clip(np.searchsorted(lx, lx + L, side='left'), 0, n - 1)
     iL = np.minimum(iL, np.maximum(pts - 1, 0))     # at least one point away
     iR = np.maximum(iR, np.minimum(pts + 1, n - 1))
     if xlog:
@@ -146,16 +147,18 @@ def local_slope(x, y, half_width: float, min_points: int = 3) -> np.ndarray:
 
 
 def data_diagnostics(t, q, window_D: float = 6.0, window_b: float = 9.0, L_slope: float = 0.2,
-                     min_rate_frac: float = 0.02) -> Dict[str, np.ndarray]:
+                     min_rate_frac: float = 0.2, shutin_window: float = 6.0) -> Dict[str, np.ndarray]:
     """Data-derived flow-regime diagnostics for one well.
 
     Parameters
     ----------
     t : times since peak (months, > 0; mid-month values k + 0.5 are the natural
         choice for monthly volumes).
-    q : monthly volumes (or rates).  Zero, negative, missing and very small
-        values (< min_rate_frac x max q, i.e. shut-in / curtailed months) are
-        dropped before differencing.
+    q : monthly volumes (or rates).  Zero, negative and missing values are
+        dropped, as are shut-in / curtailed months: a month producing less than
+        min_rate_frac x the median of its neighbours within +/- shutin_window
+        months.  The test is relative to the local level, not to the peak, so
+        the legitimate late-time tail of a steep decline is kept.
     window_D, window_b : half-widths (months) of the centred least-squares
         windows for D = -d ln q/dt and b = d(1/D)/dt.  b is the derivative of a
         derivative, so it is noisier and gets the wider window.  The defaults
@@ -166,7 +169,8 @@ def data_diagnostics(t, q, window_D: float = 6.0, window_b: float = 9.0, L_slope
         which lives naturally on the log time axis.
 
     Returns dict with arrays on the retained points: t, q, D (nominal decline
-    per month), beta (= 1/D), b (= d beta / dt), loglog_slope (d ln q / d ln t).
+    per month), beta (= 1/D), b (= d beta / dt), loglog_slope (d ln q / d ln t),
+    plus n_dropped (number of shut-in / curtailed months removed).
     The first and last points of each derivative use truncated, one-sided
     windows and are less reliable.
     """
@@ -174,29 +178,39 @@ def data_diagnostics(t, q, window_D: float = 6.0, window_b: float = 9.0, L_slope
     q = np.asarray(q, dtype=float)
     if t.shape != q.shape:
         raise ValueError("t and q must have the same shape")
-    qmax = np.nanmax(q) if np.any(np.isfinite(q)) else 0.0
-    keep = np.isfinite(t) & np.isfinite(q) & (t > 0) & (q > max(min_rate_frac * qmax, 0.0))
+    keep = np.isfinite(t) & np.isfinite(q) & (t > 0) & (q > 0)
     t, q = t[keep], q[keep]
     order = np.argsort(t)
     t, q = t[order], q[order]
+    n_dropped = 0
+    if t.size >= 3 and min_rate_frac > 0:
+        # Shut-in / curtailment test against the local level (median of the
+        # other producing months within +/- shutin_window).
+        local = np.empty(t.size)
+        for i in range(t.size):
+            near = (np.abs(t - t[i]) <= shutin_window)
+            near[i] = False
+            local[i] = np.median(q[near]) if near.any() else q[i]
+        good = q >= min_rate_frac * local
+        n_dropped = int((~good).sum())
+        t, q = t[good], q[good]
     # Collapse duplicate times (Bourdet needs strictly increasing x).
     if t.size and np.any(np.diff(t) <= 0):
         tu, inv = np.unique(t, return_inverse=True)
         qu = np.array([q[inv == i].mean() for i in range(tu.size)])
         t, q = tu, qu
     n = t.size
-    empty = np.array([])
     if n < 3:
-        return dict(t=t, q=q, D=np.full(n, np.nan), beta=np.full(n, np.nan),
-                    b=np.full(n, np.nan), loglog_slope=np.full(n, np.nan)) if n else \
-            dict(t=empty, q=empty, D=empty, beta=empty, b=empty, loglog_slope=empty)
+        nan = np.full(n, np.nan)
+        return dict(t=t, q=q, D=nan, beta=nan.copy(), b=nan.copy(), loglog_slope=nan.copy(),
+                    n_dropped=n_dropped)
 
     D = -local_slope(t, np.log(q), window_D)                   # -d ln q / dt
     with np.errstate(divide='ignore', invalid='ignore'):
         beta = np.where(D > 0, 1.0 / D, np.nan)               # 1/D; negative D (incline) -> NaN
     b = local_slope(t, beta, window_b)                         # d(1/D)/dt
     slope = bourdet(np.log(q), t, L=L_slope, xlog=True, ylog=False)   # d ln q / d ln t
-    return dict(t=t, q=q, D=D, beta=beta, b=b, loglog_slope=slope)
+    return dict(t=t, q=q, D=D, beta=beta, b=b, loglog_slope=slope, n_dropped=n_dropped)
 
 
 def _arps_D_b(di: float, b: float, t: np.ndarray):

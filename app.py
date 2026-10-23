@@ -1,5 +1,6 @@
 # app.py — SE Oil & Gas Autoforecasting
 
+import dataclasses
 import os
 import pathlib
 import tempfile
@@ -165,6 +166,14 @@ def format_df_2dec(df: pd.DataFrame) -> pd.DataFrame:
         out[c] = out[c].map(_fmt2)
     return out
 
+def _clear_forecast_state(fluids) -> None:
+    """Drop every cached result of the given fluids (forecast, config, hindcast,
+    type-curve selection)."""
+    for fl in fluids:
+        for suffix in ("_oneline", "_monthly", "_well_fcs", "_cfg", "_hindcast", "_tc_selection"):
+            st.session_state.pop(f"{fl}{suffix}", None)
+
+
 def _phase_color(fluid: str) -> str:
     return {'oil': 'green', 'gas': 'red', 'water': 'blue'}[fluid.lower()]
 
@@ -316,6 +325,10 @@ if st.button("Load / QC / Merge"):
                 # Keep the full merged set; binning derives the working subset.
                 st.session_state.merged_full = merged
                 st.session_state.merged = merged
+                # Forecasts made from the previous data no longer line up with
+                # these months (yield mode would silently consume stale oil
+                # forecasts) — start clean.
+                _clear_forecast_state(["Oil", "Gas", "Water"])
                 _exp_msg = (f" Scaling exponent a = {applied_exp:.2f}."
                             if use_norm and not vertical_wells else "")
                 st.success(
@@ -451,6 +464,25 @@ def _primary_fcs_for(fluid: str, oil_fcs=None):
     return None
 
 
+def _as_fitted_cfg(cfg: ForecastConfig, primary_fcs) -> ForecastConfig:
+    """The config to store with a fluid's results: yield_from_oil records what
+    actually happened (False when no oil forecasts were available and the wells
+    were fitted independently), so reports and the settings-mismatch warning
+    describe the forecasts, not the checkbox."""
+    return dataclasses.replace(cfg, yield_from_oil=bool(cfg.yield_from_oil and primary_fcs))
+
+
+def _invalidate_yield_dependents() -> None:
+    """After a new Oil forecast, Gas / Water results that were derived from the
+    previous oil forecasts (yield mode) are stale: clear them and say so."""
+    stale = [fl for fl in ("Gas", "Water")
+             if getattr(st.session_state.get(f"{fl}_cfg"), "yield_from_oil", False)]
+    if stale:
+        _clear_forecast_state(stale)
+        st.info(f"{' and '.join(stale)} forecasts were GOR/WOR yields of the previous Oil forecast "
+                "and have been cleared — re-run them to rebuild from the new Oil forecast.")
+
+
 def _fitted_cfg(fluid: str | None = None):
     """The ForecastConfig a fluid's cached forecasts were actually produced with
     (None if that fluid has not been forecast).  With fluid=None, the first
@@ -472,6 +504,17 @@ def _fitted_d_lim(fluid: str | None = None) -> float:
 
 def _fitted_term_dec_pct(fluid: str | None = None) -> float:
     return effective_annual_from_nominal_monthly(_fitted_d_lim(fluid)) * 100.0
+
+
+def _yield_mode_label() -> str:
+    """What the cached Gas / Water forecasts actually are (per fluid), falling
+    back to the sidebar setting when neither has been forecast."""
+    fitted = {fl: st.session_state.get(f"{fl}_cfg") for fl in ("Gas", "Water")}
+    fitted = {fl: cfg for fl, cfg in fitted.items() if cfg is not None}
+    if not fitted:
+        return "Yes" if yield_mode else "No"
+    parts = [f"{fl}: {'Yes' if cfg.yield_from_oil else 'No'}" for fl, cfg in fitted.items()]
+    return ", ".join(parts)
 
 
 def _settings_mismatch_warning(fluid: str) -> None:
@@ -550,10 +593,11 @@ def _rerun_all_phases(keep_selections: bool = True) -> list:
         if f"{fl}_oneline" not in st.session_state:
             continue
         cfg = _make_cfg(fl)
-        oneline, monthly, well_fcs = forecast_all(merged, cfg, primary_fcs=_primary_fcs_for(fl, oil_fcs))
+        primary = _primary_fcs_for(fl, oil_fcs)
+        oneline, monthly, well_fcs = forecast_all(merged, cfg, primary_fcs=primary)
         if fl == "Oil":
             oil_fcs = well_fcs
-        st.session_state[f"{fl}_cfg"] = cfg
+        st.session_state[f"{fl}_cfg"] = _as_fitted_cfg(cfg, primary)
         st.session_state.pop(f"{fl}_hindcast", None)
         st.session_state[f"{fl}_oneline"]  = oneline
         st.session_state[f"{fl}_monthly"]  = monthly
@@ -897,14 +941,17 @@ def fluid_block(fluid_name: str, eur_col: str):
         if cfg.yield_from_oil and "Oil_well_fcs" not in st.session_state:
             st.warning(f"Yield mode is on but Oil has not been forecast yet — {fluid_name} "
                        "will be fitted independently. Run Oil first for GOR/WOR-based forecasts.")
-        oneline, monthly, well_fcs = forecast_all(merged, cfg, primary_fcs=_primary_fcs_for(fluid_name))
-        st.session_state[f"{fluid_name}_cfg"] = cfg                 # settings these results reflect
+        primary = _primary_fcs_for(fluid_name)
+        oneline, monthly, well_fcs = forecast_all(merged, cfg, primary_fcs=primary)
+        st.session_state[f"{fluid_name}_cfg"] = _as_fitted_cfg(cfg, primary)   # settings these results reflect
         st.session_state.pop(f"{fluid_name}_hindcast", None)      # hindcast is for the old forecast
         st.session_state[f"{fluid_name}_oneline"] = oneline
         st.session_state[f"{fluid_name}_monthly"] = monthly
         st.session_state[f"{fluid_name}_well_fcs"] = well_fcs   # cache per-well forecasts
         # Reset analog selection so new forecast starts with all wells selected
         st.session_state.pop(f"{fluid_name}_tc_selection", None)
+        if fluid_name == "Oil":
+            _invalidate_yield_dependents()
         st.success(f"{fluid_name} forecast completed.")
 
     on_key = f"{fluid_name}_oneline"
@@ -2139,7 +2186,7 @@ def generate_comprehensive_pdf(tc_name: str = ""):
         ["Min Months History", str(int(min_hist))],
         ["Terminal Decline (%/yr eff.)", f"{_fitted_term_dec_pct():.1f}"],
         ["Peak Volume Cap", f"{qi_cap_cfg:,.0f}" if qi_cap_cfg else "none"],
-        ["Gas/Water as Yields (GOR/WOR)", "Yes" if yield_mode else "No"],
+        ["Gas/Water as Yields (GOR/WOR)", _yield_mode_label()],
         ["B-factor Range", f"{b_low:.3f} - {b_high:.3f}"],
         ["Decline Models", _decline_models_label()],
         ["Vertical Dataset", "Yes" if vertical_wells else "No"],

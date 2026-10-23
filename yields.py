@@ -88,15 +88,37 @@ def _ols_single(lt: np.ndarray, ly: np.ndarray) -> tuple[float, float, float]:
     return float(coef[0]), float(coef[1]), float(resid @ resid)
 
 
-def _ols_two_slope(lt: np.ndarray, ly: np.ndarray, lt0: float) -> tuple[float, float, float, float]:
+def _ols_two_slope(lt: np.ndarray, ly: np.ndarray, lt0: float,
+                   m0_fixed: Optional[float] = None, m_fixed: Optional[float] = None
+                   ) -> tuple[float, float, float, float]:
     """log y = log c + m0 (log t - lt0) [t < t0] + m (log t - lt0) [t >= t0].
-    Returns (log c, m0, m, sse)."""
+
+    Either slope may be held fixed (e.g. at its bound), in which case only the
+    remaining parameters are solved for.  Returns (log c, m0, m, sse)."""
     x = lt - lt0
-    before = x < 0
-    A = np.column_stack([np.ones_like(x), np.where(before, x, 0.0), np.where(before, 0.0, x)])
-    coef, *_ = np.linalg.lstsq(A, ly, rcond=None)
-    resid = ly - A @ coef
-    return float(coef[0]), float(coef[1]), float(coef[2]), float(resid @ resid)
+    xb = np.where(x < 0, x, 0.0)
+    xa = np.where(x < 0, 0.0, x)
+    y = ly.copy()
+    cols = [np.ones_like(x)]
+    if m0_fixed is None:
+        cols.append(xb)
+    else:
+        y = y - m0_fixed * xb
+    if m_fixed is None:
+        cols.append(xa)
+    else:
+        y = y - m_fixed * xa
+    A = np.column_stack(cols)
+    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    resid = y - A @ coef
+    k = 1
+    lc = float(coef[0])
+    if m0_fixed is None:
+        m0 = float(coef[k]); k += 1
+    else:
+        m0 = float(m0_fixed)
+    m = float(coef[k]) if m_fixed is None else float(m_fixed)
+    return lc, m0, m, float(resid @ resid)
 
 
 def fit_yield(t, ratio, min_points: int = 6, t0_grid: Optional[Sequence[float]] = None,
@@ -113,11 +135,14 @@ def fit_yield(t, ratio, min_points: int = 6, t0_grid: Optional[Sequence[float]] 
     t0_grid : candidate breakpoints; default = the observed times that leave at
         least three points on each side.  With fewer than 10 points (or no
         valid breakpoint) a single-slope power law is fitted instead.
-    cap_quantile, cap_factor : the forecast yield is clamped above at
-        cap_factor x the cap_quantile of the observed ratios, so an extrapolated
-        rising GOR / WOR cannot run away; the lower clamp is the observed minimum.
-    m0_bounds, m_bounds : slopes are clipped to these ranges after the fit
-        (the late slope |m| <= 1 keeps the secondary EUR finite relative to oil).
+    cap_quantile, cap_factor : the forecast yield is clamped to
+        [quantile(1 - cap_quantile) / cap_factor, cap_factor x quantile(cap_quantile)]
+        of the observed ratios, so an extrapolated rising or falling GOR / WOR
+        follows its trend for a while but cannot run away in either direction.
+    m0_bounds, m_bounds : slope bounds (the late slope |m| <= 1 keeps the
+        secondary EUR finite relative to oil).  When the unconstrained fit lands
+        outside a bound, the fit is redone with that slope held at the bound so
+        the breakpoint and level are re-optimised for it.
 
     Returns YieldParams or None when the data cannot support a fit.
     """
@@ -126,42 +151,56 @@ def fit_yield(t, ratio, min_points: int = 6, t0_grid: Optional[Sequence[float]] 
     ok = np.isfinite(t) & np.isfinite(r) & (t > 0) & (r > 0)
     t, r = t[ok], r[ok]
     n = int(t.size)
-    if n < max(int(min_points), 2):
+    if n < max(int(min_points), 2) or np.unique(t).size < 2:
         return None
     lt, lr = np.log(t), np.log(r)
     sst = float(np.sum((lr - lr.mean()) ** 2))
+    constant = float(np.ptp(lr)) < 1e-9          # exactly constant ratio (allocated gas)
 
     def _r2(sse: float) -> float:
-        return float(1.0 - sse / sst) if sst > 0 else (1.0 if sse <= 1e-12 else 0.0)
+        if constant or sst <= 1e-18 * n:
+            return 1.0 if sse <= 1e-9 * max(n, 1) else 0.0
+        return float(1.0 - sse / sst)
 
-    y_min = float(np.min(r))
+    y_min = float(np.quantile(r, 1.0 - cap_quantile) / cap_factor)
     y_max = float(cap_factor * np.quantile(r, cap_quantile))
     y_max = max(y_max, y_min)
+
+    def _grid_search(m0_fixed=None, m_fixed=None):
+        best = None
+        for t0 in grid:
+            lc, m0, m, sse = _ols_two_slope(lt, lr, np.log(t0), m0_fixed, m_fixed)
+            if not np.all(np.isfinite([lc, m0, m, sse])):
+                continue
+            if best is None or sse < best[-1]:
+                best = (lc, m0, m, float(t0), sse)
+        return best
 
     best = None
     if n >= 10:
         if t0_grid is None:
             order = np.sort(t)
             t0_grid = order[3:n - 2]          # >= 3 points strictly before, >= 3 at/after
-        for t0 in np.unique(np.asarray(t0_grid, dtype=float)):
-            if not (t0 > 0) or np.sum(t < t0) < 3 or np.sum(t >= t0) < 3:
-                continue
-            lc, m0, m, sse = _ols_two_slope(lt, lr, np.log(t0))
-            if not np.all(np.isfinite([lc, m0, m, sse])):
-                continue
-            if best is None or sse < best[-1]:
-                best = (lc, m0, m, float(t0), sse)
+        grid = [float(t0) for t0 in np.unique(np.asarray(t0_grid, dtype=float))
+                if t0 > 0 and np.sum(t < t0) >= 3 and np.sum(t >= t0) >= 3]
+        if grid:
+            best = _grid_search()
+            if best is not None:
+                # A slope outside its bound: hold it at the bound and re-optimise
+                # the breakpoint and the other parameters for that constraint,
+                # so the segment that drives the forecast is anchored to the data.
+                m0_fix = float(np.clip(best[1], *m0_bounds)) if not (m0_bounds[0] <= best[1] <= m0_bounds[1]) else None
+                m_fix = float(np.clip(best[2], *m_bounds)) if not (m_bounds[0] <= best[2] <= m_bounds[1]) else None
+                if m0_fix is not None or m_fix is not None:
+                    best = _grid_search(m0_fix, m_fix) or best
+                    if best is not None and (not (m0_bounds[0] <= best[1] <= m0_bounds[1])
+                                             or not (m_bounds[0] <= best[2] <= m_bounds[1])):
+                        # The other slope moved out of range too: fix both.
+                        best = _grid_search(float(np.clip(best[1], *m0_bounds)),
+                                            float(np.clip(best[2], *m_bounds))) or best
 
     if best is not None:
         lc, m0, m, t0, sse = best
-        m0 = float(np.clip(m0, *m0_bounds))
-        m = float(np.clip(m, *m_bounds))
-        if m0 != best[1] or m != best[2]:
-            # Slopes were clipped: refit the level for the clipped slopes.
-            x = lt - np.log(t0)
-            pred = np.where(x < 0, m0 * x, m * x)
-            lc = float(np.mean(lr - pred))
-            sse = float(np.sum((lr - lc - pred) ** 2))
         return YieldParams(c=float(np.exp(lc)), m0=m0, m=m, t0=t0, y_min=y_min, y_max=y_max,
                            n_points=n, r2=_r2(sse), mode='two-slope')
 
@@ -172,7 +211,7 @@ def fit_yield(t, ratio, min_points: int = 6, t0_grid: Optional[Sequence[float]] 
     m = float(np.clip(m, *m_bounds))
     t0 = float(np.median(t))
     pred = m * (lt - np.log(t0))
-    lc = float(np.mean(lr - pred))
+    lc = float(np.mean(lr - pred))                  # least-squares level for the (clipped) slope
     sse = float(np.sum((lr - lc - pred) ** 2))
     return YieldParams(c=float(np.exp(lc)), m0=m, m=m, t0=t0, y_min=y_min, y_max=y_max,
                        n_points=n, r2=_r2(sse), mode='single-slope')
