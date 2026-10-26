@@ -40,6 +40,7 @@ echo Building SE_Tool.exe...
     --add-data "core.py;." ^
     --add-data "yields.py;." ^
     --add-data "diagnostics.py;." ^
+    --add-data "se_report.py;." ^
     --add-data "static;static" ^
     --collect-all streamlit ^
     --collect-all altair ^

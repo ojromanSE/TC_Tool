@@ -61,6 +61,7 @@ cp -r "$SCRIPT_DIR/app.py"               "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/core.py"              "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/yields.py"            "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/diagnostics.py"       "$INSTALL_DIR/"
+cp -r "$SCRIPT_DIR/se_report.py"         "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/requirements.txt"     "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/__init__.py"          "$INSTALL_DIR/"
 cp -r "$SCRIPT_DIR/generate_tc_pptx.js" "$INSTALL_DIR/"
@@ -68,6 +69,8 @@ cp -r "$SCRIPT_DIR/package.json"         "$INSTALL_DIR/"
 [[ -f "$SCRIPT_DIR/package-lock.json" ]] && cp "$SCRIPT_DIR/package-lock.json" "$INSTALL_DIR/"
 mkdir -p "$INSTALL_DIR/static"
 [[ -f "$SCRIPT_DIR/static/logo.png" ]] && cp "$SCRIPT_DIR/static/logo.png" "$INSTALL_DIR/static/"
+# SE Deck Standard template and logos for the PPTX / PDF report
+[[ -d "$SCRIPT_DIR/static/se_deck" ]] && cp -r "$SCRIPT_DIR/static/se_deck" "$INSTALL_DIR/static/"
 ok "Files copied."
 
 # ── 5. Create virtual environment ───────────────────────────
