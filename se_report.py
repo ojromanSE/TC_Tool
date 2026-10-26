@@ -304,8 +304,6 @@ class FluidReport:
     lines: List[Tuple[np.ndarray, np.ndarray, str]]
     wells: pd.DataFrame                         # all forecast wells: WellID, WellName, API10, County,
                                                 # LateralLength, Months, EUR, b, in_tc
-    upper_fence: float
-    lower_fence: float
     yield_label: str = ""                       # 'Yield (GOR)' when forecast as a yield
 
     def per_ft(self, eur: float) -> float:
@@ -338,17 +336,6 @@ class ReportInput:
 # ---------------------------------------------------------------- report input from forecast tables
 _FLUID_UNITS = {"oil": ("Mbbl", "bbl/ft", "bbl/mo", "bbl/d"), "gas": ("MMcf", "Mcf/ft", "Mcf/mo", "Mcf/d"),
                 "water": ("Mbbl", "bbl/ft", "bbl/mo", "bbl/d")}
-
-
-def log_lower_fence(eur) -> float:
-    """Lower EUR outlier fence in log space (same rule as the app's outlier screen)."""
-    eur = pd.to_numeric(pd.Series(eur), errors="coerce")
-    pos = eur[(eur > 0) & np.isfinite(eur)]
-    if len(pos) < 3:
-        return 0.0
-    le = np.log(pos.astype(float))
-    lq1, lq3 = le.quantile(0.25), le.quantile(0.75)
-    return float(np.exp(lq1 - 1.5 * (lq3 - lq1)))
 
 
 def fluid_report(name: str, oneline_full: pd.DataFrame, sel_ids, eur_col: str, curves: pd.DataFrame,
@@ -410,16 +397,13 @@ def fluid_report(name: str, oneline_full: pd.DataFrame, sel_ids, eur_col: str, c
         "County": col("County", ""), "LateralLength": pd.to_numeric(col("LateralLength"), errors="coerce"),
         "Months": pd.to_numeric(col("Months History"), errors="coerce"), "EUR": ol["_eur"],
         "b": pd.to_numeric(col("b"), errors="coerce"), "in_tc": ol["in_tc"]}).reset_index(drop=True)
-    e_all = ol["_eur"].dropna()
-    q1, q3 = (e_all.quantile(0.25), e_all.quantile(0.75)) if len(e_all) else (np.nan, np.nan)
     return FluidReport(
         name=name, unit=unit, per_ft_unit=per_ft_unit, rate_unit=rate_unit, qi_unit=qi_unit,
         n_tc=int(len(tc)), n_total=int(len(ol)), stats=stats, per_ft_basis=basis, groups=groups,
         terminal_di=float(d_lim), terminal_pct=core.effective_annual_from_nominal_monthly(float(d_lim)) * 100.0,
         b_values=[float(v) for v in b_all], b_low=float(b_low), b_high=float(b_high), n_b_at_bound=at_bound,
         curves=curves if curves is not None else pd.DataFrame(), lines=list(lines or []), wells=wells,
-        upper_fence=float(q3 + 1.5 * (q3 - q1)) if len(e_all) else float("nan"),
-        lower_fence=log_lower_fence(e_all), yield_label=yield_label)
+        yield_label=yield_label)
 
 
 def analog_summary(fluids: Sequence[FluidReport], header: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
@@ -738,48 +722,24 @@ def build_deck(inp: ReportInput) -> Deck:
                   heading_block(7.91, 1.6, tw, "Decline parameters"),
                   table_block(7.91, 1.98, [1.92] + [(tw - 1.92) / len(cols)] * len(cols), prow, row_h=0.3,
                               size=9.5),
-                  caption_block(7.91, t_top + 0.1, tw, 0.62,
+                  caption_block(7.91, t_top + 0.1, tw, 0.5,
                                 "Each type well uses the median qi, b and Di of its EUR group. Groups: top 10% for "
                                 "P10, middle 10% for P50, bottom 10% for P90, all wells for the Mean. We then "
                                 "scale each curve to its EUR."),
-                  caption_block(7.91, t_top + 0.78, tw, 0.45,
+                  caption_block(7.91, t_top + 0.66, tw, 0.32,
                                 f"{fmt_int(s.get('Count', f.n_tc))} wells: EUR {fmt_vol(s.get('Min'))}{EN}"
                                 f"{fmt_vol(s.get('Max'))} {f.unit}, Mean {fmt_vol(s['Mean'])} {f.unit}, "
-                                f"P10/P90 ratio {fmt_ratio(s.get('P10/P90'))}.")]
+                                f"P10/P90 ratio {fmt_ratio(s.get('P10/P90'))}."),
+                  caption_block(7.91, t_top + 0.98, tw, 0.32, _b_summary(f))]
         content(f.name, f"{f.name} EUR Distribution and Decline Parameters",
                 "EUR per well on a log-probability scale, with the Modified Arps parameters of each type well",
                 blocks)
 
-    # ---- 5. Appendix ---------------------------------------------------------------------------
+    # ---- 5. Appendix: the analog well list -------------------------------------------------
     if fl:
         slides.append(Slide("SECTION", "Appendix", dict(
-            eyebrow="APPENDIX", title="Outlier Screen, b-Factor and Analog Wells",
-            sub="How we screened EUR outliers, the b-factor of the fits, and the wells behind each type curve")))
-        for f in fl:
-            wells = f.wells
-            col = phase_color(f.name)
-            n_high = int((wells["EUR"] > f.upper_fence).sum()) if len(wells) else 0
-            n_low = int((wells["EUR"] < f.lower_fence).sum()) if len(wells) else 0
-            items = [("Upper fence.", f"Q3 + 1.5 × IQR = {fmt_vol(f.upper_fence)} {f.unit}."),
-                     ("Lower fence.", f"The same test in log space, as EURs are near lognormal: "
-                                      f"{fmt_vol(f.lower_fence)} {f.unit}."),
-                     ("Flagged.", f"{n_high} wells above the upper fence and {n_low} below the lower fence."),
-                     ("Excluded.", f"{f.n_total - f.n_tc} of {f.n_total} wells are not in the type curve, "
-                                   "by this screen or by analog choice.")]
-            bvals = np.asarray(f.b_values, dtype=float)
-            bvals = bvals[np.isfinite(bvals)]
-            bcap = (f"{bvals.size} wells. Median {fmt_b(np.median(bvals))}, P10 {fmt_b(np.percentile(bvals, 90))}, "
-                    f"P90 {fmt_b(np.percentile(bvals, 10))}. Fitting bounds {fmt_b(f.b_low)}{EN}{fmt_b(f.b_high)}; "
-                    f"{f.n_b_at_bound} wells sit on a bound.") if bvals.size else "No b values."
-            content("Appendix", f"Outlier Screen and b-Factor — {f.name}",
-                    "EUR against lateral length for every forecast well, and the b-factor of the wells in the type curve",
-                    [chart_block(0.42, 1.55, 6.2, 5.3, "scatter",
-                                 dict(wells=wells, upper=f.upper_fence, lower=f.lower_fence, unit=f.unit,
-                                      name=f.name, color=col)),
-                     heading_block(6.91, 1.6, 5.8, "b-factor of the wells in the type curve"),
-                     chart_block(6.91, 1.98, 5.8, 2.5, "hist", dict(values=bvals.tolist(), color=col)),
-                     caption_block(6.91, 4.52, 5.8, 0.42, bcap),
-                     bullets_block(6.91, 5.05, 5.8, 1.8, "How we screen", items, size=10.5, gap=3)])
+            eyebrow="APPENDIX", title="Analog Wells",
+            sub="The wells behind each type curve, with their EUR per well")))
         slides.extend(_analog_table_slides(inp, fl, norm))
 
     footer_left = f"{COMPANY}{DOT}{name}" + (f" — {place}" if place else "")
@@ -1028,77 +988,15 @@ def _p50_cum(f: FluidReport, months: int) -> float:
     return float(np.nansum(np.asarray(c["P50"], dtype=float)[t <= months]) / 1000.0)
 
 
-def hist_bins(values: Sequence[float]) -> Tuple[List[str], List[int]]:
-    v = np.asarray(values, dtype=float)
-    v = v[np.isfinite(v)]
-    if v.size == 0:
-        return [], []
-    lo, hi = math.floor(v.min() * 20) / 20, math.ceil(v.max() * 20) / 20
-    step = 0.05 if (hi - lo) <= 1.0 else 0.1
-    if hi - lo < step:
-        hi = lo + step
-    edges = np.round(np.arange(lo, hi + step / 2, step), 3)
-    if edges.size < 2:
-        edges = np.array([lo, lo + step])
-    counts, _ = np.histogram(np.clip(v, edges[0], edges[-1]), bins=edges)
-    labels = [f"{edges[i]:.2f}" for i in range(len(counts))]
-    return labels, [int(c) for c in counts]
-
-
-def hist_figure(spec, w: float, h: float):
-    import matplotlib
-    labels, counts = hist_bins(spec["values"])
-    with matplotlib.rc_context(_mpl_rc()):
-        fig = _new_fig(w, h)
-        ax = fig.add_axes([0.04, 0.24, 0.94, 0.7])
-        x = np.arange(len(counts))
-        ax.bar(x, counts, width=0.72, color="#" + C[spec.get("color", "BLUE")])
-        for xi, c in zip(x, counts):
-            if c:
-                ax.text(xi, c, f"{c}", ha="center", va="bottom", fontsize=9, color="#" + C["INK"])
-        ax.set_xticks(x)
-        ax.set_xticklabels(labels, rotation=0 if len(labels) <= 12 else 90)
-        ax.set_yticks([]); ax.spines["left"].set_visible(False)
-        ax.set_xlabel("b-factor (bin start)")
-        ax.set_ylim(0, max(counts + [1]) * 1.18)
-    return fig
-
-
-def scatter_figure(spec, w: float, h: float):
-    import matplotlib
-    wells = spec["wells"]
-    col = "#" + C[spec.get("color", "MAROON")]
-    with matplotlib.rc_context(_mpl_rc()):
-        fig = _new_fig(w, h)
-        ax = fig.add_axes([0.13, 0.22, 0.84, 0.74])
-        inn = wells[wells["in_tc"]]
-        out = wells[~wells["in_tc"]]
-        ax.scatter(inn["LateralLength"], inn["EUR"], s=26, color=col, label="In type curve", zorder=3)
-        ax.scatter(out["LateralLength"], out["EUR"], s=26, color="#" + C["MID"], label="Not in type curve", zorder=2)
-        x0, x1 = _scatter_xrange(wells)
-        ax.plot([x0, x1], [spec["upper"]] * 2, color="#" + C["INK"], ls=_MPL_DASH["dash"], lw=1.25,
-                label=f"Upper fence {fmt_vol(spec['upper'])}")
-        if spec["lower"] > 0:
-            ax.plot([x0, x1], [spec["lower"]] * 2, color="#" + C["INK"], ls=_MPL_DASH["dot"], lw=1.25,
-                    label=f"Lower fence {fmt_vol(spec['lower'])}")
-        ax.set_xlim(x0, x1)
-        ax.set_ylim(0, max(float(wells["EUR"].max()) if len(wells) else 1, spec["upper"]) * 1.08)
-        ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
-        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}"))
-        ax.grid(True, axis="y")
-        ax.set_xlabel("Lateral length, ft")
-        ax.set_ylabel(f"EUR, {spec['unit']}")
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2)
-    return fig
-
-
-def _scatter_xrange(wells) -> Tuple[float, float]:
-    lat = pd.to_numeric(wells["LateralLength"], errors="coerce").dropna() if len(wells) else pd.Series([], dtype=float)
-    if lat.empty:
-        return 0.0, 1.0
-    lo, hi = float(lat.min()), float(lat.max())
-    pad = max((hi - lo) * 0.05, 100.0)
-    return math.floor((lo - pad) / 500) * 500, math.ceil((hi + pad) / 500) * 500
+def _b_summary(f: FluidReport) -> str:
+    """One line on the b-factor of the wells in the type curve."""
+    b = np.asarray(f.b_values, dtype=float)
+    b = b[np.isfinite(b)]
+    if not b.size:
+        return ""
+    return (f"b of the {b.size} wells: median {fmt_b(np.median(b))}, P10 {fmt_b(np.percentile(b, 90))}, "
+            f"P90 {fmt_b(np.percentile(b, 10))}; {f.n_b_at_bound} on a fitting bound "
+            f"({fmt_b(f.b_low)}{EN}{fmt_b(f.b_high)}).")
 
 
 def _nice_log_ticks(lo: float, hi: float, target: int = 6) -> List[float]:
@@ -1156,7 +1054,7 @@ def probit_figure(eurs: np.ndarray, f: FluidReport, w: float, h: float, color: s
     return fig
 
 
-CHART_FIGURES = {"tc": tc_figure, "cum": cum_figure, "hist": hist_figure, "scatter": scatter_figure}
+CHART_FIGURES = {"tc": tc_figure, "cum": cum_figure}
 
 
 # ---------------------------------------------------------------- PPTX renderer
@@ -1528,8 +1426,7 @@ def _series_line(ser, colour: str, width: float, dash: str = "solid") -> None:
 
 def _pptx_chart(slide, b: Block) -> None:
     kind, spec = b.data["kind"], b.data["spec"]
-    {"tc": _pptx_chart_tc, "cum": _pptx_chart_cum, "hist": _pptx_chart_hist,
-     "scatter": _pptx_chart_scatter}[kind](slide, b, spec)
+    {"tc": _pptx_chart_tc, "cum": _pptx_chart_cum}[kind](slide, b, spec)
 
 
 def _xy_curves(cd, series_xy, styles):
@@ -1622,81 +1519,6 @@ def _pptx_chart_cum(slide, b: Block, spec) -> None:
     _axis_style(xa, "Months on production", "0")
     # 10% of room past the last month for the end labels
     xa.minimum_scale, xa.maximum_scale, xa.major_unit = 0, xmax * 1.1, _x_major(b.w)
-
-
-def _pptx_chart_hist(slide, b: Block, spec) -> None:
-    from pptx.chart.data import CategoryChartData
-    from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION
-    from pptx.util import Inches, Pt
-    labels, counts = hist_bins(spec["values"])
-    if not counts:
-        return
-    cd = CategoryChartData()
-    cd.categories = labels
-    cd.add_series("Wells", counts)
-    gf = slide.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Inches(b.x), Inches(b.y), Inches(b.w),
-                                Inches(b.h), cd)
-    gf.name = "b-factor chart"
-    ch = gf.chart
-    _chart_common(ch, legend=False)
-    plot = ch.plots[0]
-    plot.gap_width = 40
-    ser = plot.series[0]
-    ser.format.fill.solid(); ser.format.fill.fore_color.rgb = _rgb(spec.get("color", "BLUE"))
-    plot.has_data_labels = True
-    dl = plot.data_labels
-    dl.font.size = Pt(SIZE["chartLabel"]); dl.font.color.rgb = _rgb("INK")
-    dl.number_format = '[=0]"";0'; dl.number_format_is_linked = False
-    dl.position = XL_LABEL_POSITION.OUTSIDE_END
-    va = ch.value_axis
-    va.visible = False
-    va.has_major_gridlines = False
-    va.maximum_scale = max(counts) * 1.18
-    _axis_style(ch.category_axis, "b-factor (bin start)")
-
-
-def _pptx_chart_scatter(slide, b: Block, spec) -> None:
-    from pptx.chart.data import XyChartData
-    from pptx.enum.chart import XL_CHART_TYPE, XL_MARKER_STYLE
-    from pptx.util import Inches, Pt
-    wells = spec["wells"]
-    col = spec.get("color", "MAROON")
-    cd = XyChartData()
-    inn = cd.add_series("In type curve")
-    for x, y in zip(wells.loc[wells["in_tc"], "LateralLength"], wells.loc[wells["in_tc"], "EUR"]):
-        if np.isfinite(x) and np.isfinite(y):
-            inn.add_data_point(float(x), round(float(y), 2))
-    out = cd.add_series("Not in type curve")
-    for x, y in zip(wells.loc[~wells["in_tc"], "LateralLength"], wells.loc[~wells["in_tc"], "EUR"]):
-        if np.isfinite(x) and np.isfinite(y):
-            out.add_data_point(float(x), round(float(y), 2))
-    x0, x1 = _scatter_xrange(wells)
-    up = cd.add_series(f"Upper fence {fmt_vol(spec['upper'])}")
-    up.add_data_point(x0, round(spec["upper"], 2)); up.add_data_point(x1, round(spec["upper"], 2))
-    has_low = spec["lower"] > 0
-    if has_low:
-        lw_ = cd.add_series(f"Lower fence {fmt_vol(spec['lower'])}")
-        lw_.add_data_point(x0, round(spec["lower"], 2)); lw_.add_data_point(x1, round(spec["lower"], 2))
-    gf = slide.shapes.add_chart(XL_CHART_TYPE.XY_SCATTER, Inches(b.x), Inches(b.y), Inches(b.w),
-                                Inches(b.h), cd)
-    gf.name = "outlier chart"
-    ch = gf.chart
-    _chart_common(ch)
-    sers = list(ch.plots[0].series)
-    for ser, fill in ((sers[0], col), (sers[1], "MID")):
-        ser.format.line.fill.background()
-        ser.marker.style = XL_MARKER_STYLE.CIRCLE
-        ser.marker.size = 6
-        ser.marker.format.fill.solid(); ser.marker.format.fill.fore_color.rgb = _rgb(fill)
-        ser.marker.format.line.color.rgb = _rgb(fill); ser.marker.format.line.width = Pt(1)
-    _series_line(sers[2], "INK", 1.25, "dash")
-    if has_low:
-        _series_line(sers[3], "INK", 1.25, "dot")
-    va, xa = ch.value_axis, ch.category_axis
-    _axis_style(va, f"EUR, {spec['unit']}", "#,##0", gridlines=True)
-    va.minimum_scale = 0
-    _axis_style(xa, "Lateral length, ft", "#,##0")
-    xa.minimum_scale, xa.maximum_scale = x0, x1
 
 
 def _pptx_image(slide, b: Block) -> None:
