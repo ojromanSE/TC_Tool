@@ -79,16 +79,16 @@ def test_lookup_rows_layout():
 def test_economic_lines_follow_the_lookup_template():
     groups = {"P50": dict(qi=400.0, b=1.1, di=0.12)}
     text = A.economic_lines({"Oil": groups, "Gas": groups}, {"Oil": D_LIM, "Gas": D_LIM}, "P50")
-    lines = text.split("\n")
-    assert len(lines) == 4
-    kw, expr = lines[0].split("\t")
-    assert kw == "OIL" and expr.split()[1:4] == ["X", "B/M", expr.split()[3]] and expr.split()[4] == "MOS"
-    assert expr.split()[5] == "B/1.1"
-    kw2, expr2 = lines[1].split("\t")
-    assert kw2 == '"' and expr2.split()[:3] == ["X", "X", "B/M"] and expr2.split()[5] == "EXP"
-    assert lines[2].startswith("GAS\t") and " M/M " in lines[2]
-    sw, tail = float(expr.split()[3]), float(expr2.split()[3])
-    assert sw + tail == pytest.approx(600.0)
+    lines = [l.split("\t") for l in text.split("\n")]
+    # one cell per ARIES grid column, so a paste fills Keyword .. Rate Value
+    assert len(lines) == 4 and all(len(l) == len(A.ECONOMIC_COLUMNS) == 8 for l in lines)
+    assert all(c == c.strip() and c for l in lines for c in l)
+    oil, tail_line, gas, _ = lines
+    cells = A.segments(400.0, 1.1, 0.12, D_LIM).fields()
+    assert oil == ["OIL", cells[0], "X", "B/M", cells[1], "MOS", "B/1.1", cells[3]]
+    assert tail_line == ['"', "X", "X", "B/M", cells[4], "MOS", "EXP", cells[5]]
+    assert gas[0] == "GAS" and gas[3] == "M/M"
+    assert float(oil[4]) + float(tail_line[4]) == pytest.approx(600.0)
 
 
 def test_rows_from_the_report_type_wells_reproduce_the_eurs():

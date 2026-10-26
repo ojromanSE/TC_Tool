@@ -14,7 +14,9 @@ Two copy-ready forms:
       "    X   X  B/M  TAIL    MOS  EXP  DMIN       (exponential tail)
       GAS  ...  M/M ...
 
-* **Economic lines** in that same form, to paste into a case directly.
+* **Economic lines** in that same form, to paste into a case directly — one
+  tab-separated cell per column of the ARIES grid (Keyword, Initial Value,
+  Final Value, Units, Forecast Until, Forecast Units, Rate Method, Rate Value).
 
 Conventions (checked against the SE lookup: B/1.2 with DI_SEC 78.47 and
 DMIN 4.88 switches after 197.6 months):
@@ -171,13 +173,18 @@ def to_tsv(rows: Iterable[Sequence[str]], with_header: bool = False, water: bool
     return "\n".join(lines)
 
 
-def economic_lines(phases: Dict[str, Dict[str, Dict[str, float]]], d_lims: Dict[str, float], pct: str,
-                   order: Sequence[str] = ("Oil", "Gas", "Water")) -> str:
-    """The economic lines of one type well (keyword, tab, expression), as the
-    SE lookup template expands them:
+# The columns of the ARIES economic-data grid, from the Keyword column on.
+ECONOMIC_COLUMNS = ["Keyword", "Initial Value", "Final Value", "Units", "Forecast Until",
+                    "Forecast Units", "Rate Method", "Rate Value"]
 
-        OIL  29664.4 X B/M 197.6 MOS B/1.2 78.47
-        "    X X B/M 402.4 MOS EXP 4.88
+
+def economic_cells(phases: Dict[str, Dict[str, Dict[str, float]]], d_lims: Dict[str, float], pct: str,
+                   order: Sequence[str] = ("Oil", "Gas", "Water")) -> List[List[str]]:
+    """The economic lines of one type well, one cell per ARIES grid column
+    (ECONOMIC_COLUMNS), as the SE lookup template expands them:
+
+        OIL  29664.4  X  B/M  197.6  MOS  B/1.2  78.47
+        "    X        X  B/M  402.4  MOS  EXP    4.88
     """
     out = []
     for ph in order:
@@ -186,7 +193,14 @@ def economic_lines(phases: Dict[str, Dict[str, Dict[str, float]]], d_lims: Dict[
             continue
         kw, _, unit = PHASE_KEYS[ph]
         qi, sw, method, di, tail, dmin = segments(g["qi"], g["b"], g["di"], d_lims[ph]).fields()
-        out.append(f"{kw}\t{qi} X {unit} {sw} MOS {method} {di}")
+        out.append([kw, qi, "X", unit, sw, "MOS", method, di])
         if float(tail) > 0:
-            out.append(f'"\tX X {unit} {tail} MOS EXP {dmin}')
-    return "\n".join(out)
+            out.append(['"', "X", "X", unit, tail, "MOS", "EXP", dmin])
+    return out
+
+
+def economic_lines(phases: Dict[str, Dict[str, Dict[str, float]]], d_lims: Dict[str, float], pct: str,
+                   order: Sequence[str] = ("Oil", "Gas", "Water")) -> str:
+    """economic_cells as tab-separated text: pasted on the Keyword cell of an
+    ARIES economic-data grid, every value lands in its own column."""
+    return "\n".join("\t".join(r) for r in economic_cells(phases, d_lims, pct, order))
