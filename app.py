@@ -2,6 +2,7 @@
 
 import dataclasses
 import os
+import re
 from functools import partial
 import pathlib
 import tempfile
@@ -1793,6 +1794,111 @@ def _all_tc_excel(oil_c, gas_c, water_c) -> bytes | None:
     return _xls_buf.getvalue()
 
 
+def _aries_phase_groups(fluid: str, eur_col: str):
+    """Type wells (P10 / P50 / P90 / Mean: qi per day, b, Di) of one phase for
+    the current type-curve selection — the same parameters the charts and the
+    report use — plus the EUR stats, or None when the phase was not forecast."""
+    import se_report
+    ol = st.session_state.get(f"{fluid}_oneline")
+    if ol is None or ol.empty:
+        return None
+    cfg = _fitted_cfg(fluid)
+    b_lo, b_hi = (cfg.b_low, cfg.b_high) if cfg is not None else (float(b_low), float(b_high))
+    sel = st.session_state.get(f"{fluid}_tc_selection")
+    fr = se_report.fluid_report(fluid, ol, sel if isinstance(sel, set) else None, eur_col, None, None,
+                                _fitted_d_lim(fluid), float(norm_len), bool(use_norm), b_lo, b_hi)
+    return fr if (fr is not None and fr.n_tc > 0 and fr.groups) else None
+
+
+def _render_aries_export():
+    """Copy-ready ARIES lines: rows for the SE_TYPECURVES lookup and the
+    economic lines they expand to."""
+    import aries_export as AX
+    fluids = (("Oil", "EUR (Mbbl)"), ("Gas", "EUR (MMcf)"), ("Water", "EUR (Mbbl water)"))
+    if not any(f"{fl}_oneline" in st.session_state for fl, _ in fluids):
+        return
+    st.markdown("**ARIES export** — type curves as rows for the `SE_TYPECURVES` lookup "
+                "(TC_ID, LL_EFF, then the oil and gas segments) or as economic lines.")
+    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+    tc_id = c1.text_input("TC_ID", value=(st.session_state.get("_pdf_tc_name") or "TC").strip() or "TC",
+                          key="_aries_tc_id")
+    pcts = c2.multiselect("Type wells", ["P10", "P50", "P90", "Mean"], default=["P50"], key="_aries_pcts",
+                          help="One lookup row per type well. With more than one, TC_ID gets a -P50 / -P10 "
+                               "... suffix.")
+    with_header = c3.checkbox("Column names", value=False, key="_aries_header",
+                              help="Add the lookup's column names as the first line.")
+    with_water = c4.checkbox("Water columns", value=False, key="_aries_water",
+                             help="Append WTR_QI_BPM ... WTR_DMIN_PCT after the gas columns.")
+    if st.button("Export ARIES lines", type="primary", key="_aries_btn"):
+        st.session_state["_aries_show"] = True
+    if not st.session_state.get("_aries_show"):
+        return
+    if not pcts:
+        st.warning("Pick at least one type well (P10, P50, P90 or Mean).")
+        return
+    reports = {fl: _aries_phase_groups(fl, ec) for fl, ec in fluids}
+    reports = {fl: r for fl, r in reports.items() if r is not None}
+    if not reports:
+        st.warning("No type curve to export — select at least one well in a type curve.")
+        return
+    phases = {fl: r.groups for fl, r in reports.items()}
+    d_lims = {fl: r.terminal_di for fl, r in reports.items()}
+    prim = next(iter(reports.values()))
+    if use_norm:
+        ll_eff = float(norm_len)
+    else:
+        lat = pd.to_numeric(prim.wells.loc[prim.wells["in_tc"], "LateralLength"], errors="coerce").dropna()
+        ll_eff = float(round(lat.mean(), -1)) if len(lat) else float(norm_len)
+    tc_id = tc_id.strip() or "TC"
+    rows = AX.lookup_rows(tc_id, ll_eff, phases, d_lims, pcts, water=with_water)
+    tsv = AX.to_tsv(rows, with_header=with_header, water=with_water)
+
+    tab_rows, tab_lines = st.tabs(["Lookup rows (SE_TYPECURVES)", "Economic lines"])
+    with tab_rows:
+        st.code(tsv, language=None)
+        st.caption("Copy with the button at the top right of the box and paste into the lookup's data "
+                   "grid: cells are tab-separated in the lookup's column order. Rates are per month; "
+                   "DI_SEC_PCT is the secant-effective initial decline, DMIN_PCT the tangent-effective "
+                   "terminal decline, and SWITCH_MOS + TAIL_MOS is the 50-year (600-month) forecast.")
+        st.download_button("⬇ Download ARIES lookup rows (.txt)", tsv.encode(),
+                           file_name=f"{re.sub(r'[^A-Za-z0-9_-]+', '_', tc_id)}_ARIES_lookup.txt",
+                           mime="text/plain", key="_aries_dl")
+    with tab_lines:
+        for pct in pcts:
+            st.markdown(f"**{tc_id if len(pcts) == 1 else f'{tc_id}-{pct.upper()}'}** ({pct})")
+            st.code(AX.economic_lines(phases, d_lims, pct), language=None)
+        st.caption("Keyword, a tab, then the expression — paste into a case's economic lines and "
+                   "add the START date. Rates are per month (B/M, M/M), per well at "
+                   f"{int(ll_eff):,} ft.")
+
+    # Check: the volume ARIES computes from the exported (rounded) cells against the app's EUR.
+    check = []
+    for fl, r in reports.items():
+        if fl == "Water" and not with_water:
+            continue
+        for pct in pcts:
+            g = r.groups.get(pct)
+            if g is None:
+                continue
+            cells = AX.segments(g["qi"], g["b"], g["di"], r.terminal_di).fields()
+            vol = AX.segments_volume(cells) / 1000.0
+            check.append({"Type well": pct, "Phase": fl, "EUR in the app": round(g["eur"], 2),
+                          "EUR from the ARIES lines": round(vol, 2),
+                          "Difference (%)": round((vol / g["eur"] - 1) * 100, 3) if g["eur"] else np.nan,
+                          "Unit": r.unit})
+    if check:
+        st.dataframe(pd.DataFrame(check), hide_index=True, use_container_width=True)
+    exp_a = float(st.session_state.get("applied_norm_exponent", 1.0))
+    if use_norm and abs(exp_a - 1.0) > 1e-6:
+        st.info(f"These type curves were normalized with EUR ∝ L^{exp_a:.2f}, but the lookup's LL_EFF ratio "
+                "scales rates linearly with lateral length, so ARIES will scale them differently.")
+    if not use_norm:
+        st.info(f"Normalization is off: LL_EFF is the mean lateral of the type-curve wells ({int(ll_eff):,} ft).")
+    missing = [fl for fl in ("Oil", "Gas") if fl not in reports]
+    if missing:
+        st.caption(f"No {' or '.join(missing).lower()} type curve: those cells are left empty.")
+
+
 @st.fragment
 def _type_wells_section():
     """Everything that depends on the type-curve well sets.  As a fragment, a
@@ -1815,6 +1921,10 @@ def _type_wells_section():
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="all_tc_download",
         )
+
+    # ── ARIES export (same type wells as the charts above) ──
+    st.markdown("---")
+    _render_aries_export()
 
 
 _type_wells_section()
