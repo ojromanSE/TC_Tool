@@ -1867,9 +1867,11 @@ def _render_aries_export():
         for pct in pcts:
             st.markdown(f"**{tc_id if len(pcts) == 1 else f'{tc_id}-{pct.upper()}'}** ({pct})")
             st.code(AX.economic_lines(phases, d_lims, pct), language=None)
-        st.caption("Keyword, a tab, then the expression — paste into a case's economic lines and "
-                   "add the START date. Rates are per month (B/M, M/M), per well at "
-                   f"{int(ll_eff):,} ft.")
+        st.caption("Each value is its own tab-separated cell, in the order of the ARIES grid: "
+                   "Keyword, Initial Value, Final Value, Units, Forecast Until, Forecast Units, "
+                   "Rate Method, Rate Value. Copy with the button at the top right of the box, click "
+                   "the Keyword cell of the first empty line in the Production section and paste. "
+                   f"Rates are per month (B/M, M/M), per well at {int(ll_eff):,} ft.")
 
     # Check: the volume ARIES computes from the exported (rounded) cells against the app's EUR.
     check = []
