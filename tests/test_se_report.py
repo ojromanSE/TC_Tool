@@ -117,14 +117,6 @@ def test_formation_phrase_merges_shared_names(three_phase):
     assert R._formation_phrase(three_phase) == "Wolfcamp A and B"
 
 
-def test_log_lower_fence_matches_log_space_iqr():
-    e = pd.Series([100, 200, 300, 400, 500, 600, 5000.0])
-    le = np.log(e)
-    q1, q3 = le.quantile(0.25), le.quantile(0.75)
-    assert R.log_lower_fence(e) == pytest.approx(np.exp(q1 - 1.5 * (q3 - q1)))
-    assert R.log_lower_fence(pd.Series([1.0, 2.0])) == 0.0
-
-
 # ---------------------------------------------------------------- report data
 def test_fluid_report_type_wells_reproduce_their_eur():
     f, ol = _fluid()
@@ -139,9 +131,6 @@ def test_fluid_report_type_wells_reproduce_their_eur():
     assert f.groups["Mean"]["n"] == 29
     assert f.groups["P10"]["n"] == 2 and f.groups["P90"]["n"] == 3
     assert f.per_ft(f.stats["P50"]) == pytest.approx(f.stats["P50"] * 1000 / 10000)
-    eur = pd.to_numeric(ol["EUR (Mbbl)"])
-    q1, q3 = eur.quantile(0.25), eur.quantile(0.75)
-    assert f.upper_fence == pytest.approx(q3 + 1.5 * (q3 - q1))
     assert f.n_b_at_bound == int(ol.loc[ol["WellID"] != "W00_1H", "b at bound"].sum())
     assert bool(f.wells.loc[f.wells["WellID"] == "W00_1H", "in_tc"].iloc[0]) is False
 
@@ -158,31 +147,37 @@ def test_deck_flow_and_sections(three_phase):
     deck = R.build_deck(three_phase)
     titles = [s.fields.get("title") for s in deck.slides]
     assert deck.slides[0].layout == "COVER" and titles[0] == "Wolfcamp Martin 2017-21 Type Curve"
-    assert titles[1:5] == ["Disclaimer", "Type Curve at a Glance", "Analog Set and Method", "EUR Summary by Phase"]
+    assert titles[1:3] == ["Disclaimer", "EUR Summary by Phase"]
+    assert deck.slides[1].fields["sub"] == ""                    # disclaimer has no subtitle
+    assert "Type Curve at a Glance" not in titles and "Analog Set and Method" not in titles
     for fl in ("Oil", "Gas", "Water"):
-        assert [f"{fl} Type Curve", f"{fl} Type Curve Parameters", f"{fl} EUR Distribution"] == \
+        assert [f"{fl} Type Curve", f"{fl} EUR Distribution and Decline Parameters"] == \
                [t for t in titles if t and t.startswith(fl)]
+        assert not any(t and t.startswith("Outlier") for t in titles)
+    assert titles[3:9] == ["Oil Type Curve", "Oil EUR Distribution and Decline Parameters",
+                           "Gas Type Curve", "Gas EUR Distribution and Decline Parameters",
+                           "Water Type Curve", "Water EUR Distribution and Decline Parameters"]
     assert [s.layout for s in deck.slides].count("SECTION") == 1
     sections = []
     for s in deck.slides:
         if not sections or sections[-1] != s.section:
             sections.append(s.section)
     assert sections == ["Overview", "Oil", "Gas", "Water", "Appendix"]
-    assert 15 <= len(deck.slides) <= 22
+    assert len(deck.slides) == 12
+    assert titles[9:] == ["Analog Wells", "Analog Wells (1 of 2)", "Analog Wells (2 of 2)"]
+    assert deck.slides[9].layout == "SECTION"
     assert deck.file_stem == "Wolfcamp_Martin_2017_21_Type_Curve_Oct2026_v1"
     assert deck.footer_left.startswith("Schaper Energy Consulting")
     assert deck.footer_right == "Production data through Sep 2025"
 
 
 def test_one_number_one_value(three_phase):
-    """SE QA: the P50 on the cover, the glance cards, the summary table and the
-    phase slide are written the same way."""
+    """SE QA: the P50 on the cover, the summary table and the phase slide
+    are written the same way."""
     deck = R.build_deck(three_phase)
     for f in three_phase.fluids:
         p50 = f"{R.fmt_vol(f.stats['P50'])} {f.unit}"
         assert p50 in deck.slides[0].fields["stats"]
-        glance = next(s for s in deck.slides if s.fields.get("title") == "Type Curve at a Glance")
-        assert any(b.kind == "card" and b.data["value"] == p50 for b in glance.blocks)
         summ = next(s for s in deck.slides if s.fields.get("title") == "EUR Summary by Phase")
         table = next(b for b in summ.blocks if b.kind == "table")
         row = next(r for r in table.data["rows"] if r[0] == f.name)
@@ -259,8 +254,8 @@ def test_pptx_native_charts_and_sections(rendered):
     prs = Presentation(pptx)
     charts = [sh for s in prs.slides for sh in s.shapes if sh.has_chart]
     names = [c.name for c in charts]
-    assert names.count("type curve chart") == 3 and names.count("b-factor chart") == 3
-    assert names.count("outlier chart") == 3
+    assert names.count("type curve chart") == 3 and names.count("cumulative chart") == 3
+    assert len(names) == 6                     # two charts per phase, nothing else
     z = zipfile.ZipFile(pptx)
     xml = z.read("ppt/presentation.xml").decode()
     assert re.findall(r'<p14:section name="([^"]+)"', xml) == ["Overview", "Oil", "Gas", "Water", "Appendix"]
@@ -312,7 +307,81 @@ def test_pdf_is_the_same_deck(rendered):
     assert "Production data through Sep 2025" in txt3 and "Schaper Energy Consulting" in txt3
 
 
-def test_hist_bins_cover_all_values():
-    labels, counts = R.hist_bins([0.8, 0.81, 0.95, 1.2, 1.2, 1.19])
-    assert sum(counts) == 6 and labels[0] == "0.80"
-    assert R.hist_bins([]) == ([], [])
+# ---------------------------------------------------------------- phase colours and cumulative
+def test_phase_colours():
+    assert R.phase_color("Oil") == "GREEN" and R.phase_color("gas") == "RED" and R.phase_color("Water") == "BLUE"
+    styles = {n: (c, d) for n, c, d, _ in R.tc_series("GREEN")}
+    assert styles["P50"] == ("GREEN", "solid") and styles["P10"][0] == "GREEN" and styles["P90"][0] == "GREEN"
+    assert len({styles["P10"][1], styles["P50"][1], styles["P90"][1]}) == 3      # told apart by line style
+
+
+def test_pptx_type_curves_use_the_phase_colour(rendered):
+    from pptx import Presentation
+    _, pptx, _ = rendered
+    prs = Presentation(pptx)
+    want = {"Oil": R.C["GREEN"], "Gas": R.C["RED"], "Water": R.C["BLUE"]}
+    for s in prs.slides:
+        if s.slide_layout.name != "CONTENT":
+            continue
+        title = s.placeholders[101].text_frame.text
+        phase = title.split(" ")[0]
+        if not title.endswith("Type Curve") or phase not in want:
+            continue
+        charts = {sh.name: sh.chart for sh in s.shapes if sh.has_chart}
+        assert set(charts) == {"type curve chart", "cumulative chart"}
+        for ch in charts.values():
+            sers = {ser.name: ser for ser in ch.plots[0].series}
+            assert str(sers["P50"].format.line.color.rgb) == want[phase]
+            assert str(sers["P10"].format.line.color.rgb) == want[phase]
+            assert str(sers["Mean (average well)"].format.line.color.rgb) == R.C["INK"]
+
+
+def _colour_share(fig, hexcol):
+    import io
+    from PIL import Image
+    im = np.asarray(Image.open(io.BytesIO(R.figure_png(fig, dpi=60))).convert("RGB")).reshape(-1, 3).astype(int)
+    target = np.array([int(hexcol[i:i + 2], 16) for i in (0, 2, 4)])
+    return float(np.mean(np.abs(im - target).sum(axis=1) < 40))
+
+
+def test_pdf_figures_use_the_phase_colour(three_phase):
+    for f in three_phase.fluids:
+        col = R.phase_color(f.name)
+        eurs = f.wells.loc[f.wells["in_tc"], "EUR"].to_numpy(dtype=float)
+        probit = R.probit_figure(eurs, f, 7.2, 4.8, col)
+        assert _colour_share(probit, R.C[col]) > 0.0005
+        assert _colour_share(probit, R.C["MAROON"]) < 0.0001
+        spec = dict(curves=f.curves, lines=f.lines, name=f.name, n_wells=f.n_tc, color=col, unit=f.unit, title="t")
+        assert _colour_share(R.tc_figure(spec, 4.0, 5.3), R.C[col]) > 0.001
+        assert _colour_share(R.cum_figure(spec, 4.0, 5.3), R.C[col]) > 0.001
+
+
+def test_cumulative_ends_at_the_eur(three_phase):
+    for f in three_phase.fluids:
+        cums, hist = R.cum_series(dict(curves=f.curves, lines=f.lines))
+        for k in ("P90", "P50", "P10", "Mean"):
+            assert cums[k][1][-1] == pytest.approx(f.stats[k], rel=1e-9)
+            assert np.all(np.diff(cums[k][1]) >= 0)
+        assert len(hist) == len(f.lines)
+        assert R._p50_cum(f, 12) == pytest.approx(f.curves["P50"].to_numpy()[:12].sum() / 1000.0)
+        assert R._p50_cum(f, 600) == pytest.approx(f.stats["P50"], rel=1e-9)
+
+
+def test_pptx_disclaimer_has_no_subtitle(rendered):
+    from pptx import Presentation
+    _, pptx, _ = rendered
+    s = Presentation(pptx).slides[1]
+    assert s.placeholders[101].text_frame.text == "Disclaimer"
+    assert 102 not in [ph.placeholder_format.idx for ph in s.placeholders]
+    assert "Read this before" not in "".join(sh.text_frame.text for sh in s.shapes if sh.has_text_frame)
+
+
+def test_two_slides_per_phase_with_b_summary(three_phase):
+    deck = R.build_deck(three_phase)
+    for f in three_phase.fluids:
+        assert sum(1 for sd in deck.slides if sd.section == f.name) == 2
+        dec = next(sd for sd in deck.slides if sd.fields.get("title") == f"{f.name} EUR Distribution and Decline Parameters")
+        caps = [b for b in dec.blocks if b.kind == "text" and b.data["name"] == "caption"]
+        text = " ".join("".join(t for t, _ in p) for b in caps for p in b.data["paras"]).replace("\u00a0", " ")
+        assert f"b of the {len(f.b_values)} wells: median" in text
+        assert all(b.y + b.h <= 6.9 for b in dec.blocks)          # nothing runs onto the footer
