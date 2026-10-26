@@ -38,10 +38,11 @@ echo Building SE_Tool.exe...
     --icon "%~dp0icon.ico" ^
     --add-data "app.py;." ^
     --add-data "core.py;." ^
+    --add-data "yields.py;." ^
+    --add-data "diagnostics.py;." ^
     --add-data "static;static" ^
     --collect-all streamlit ^
     --collect-all altair ^
-    --collect-all sklearn ^
     --collect-all scipy ^
     --collect-all reportlab ^
     --collect-all joblib ^

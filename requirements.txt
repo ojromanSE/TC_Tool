@@ -3,8 +3,7 @@ numpy==2.1.2
 pandas==2.2.3
 scipy==1.13.1
 
-# ML — scikit-learn for RandomForest; joblib for parallel forecasting
-scikit-learn==1.5.2
+# Parallel per-well forecasting
 joblib>=1.3.0
 
 # Plotting
